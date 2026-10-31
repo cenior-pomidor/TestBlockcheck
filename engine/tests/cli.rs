@@ -7,11 +7,11 @@ use std::process::{Command, Stdio};
 
 /// Запустить blockcheckw с аргументами, вернуть (stdout + stderr, успех).
 fn run(args: &[&str]) -> (String, bool) {
-    let out = Command::new(env!("CARGO_BIN_EXE_blockcheckw"))
+    let out = Command::new(env!("CARGO_BIN_EXE_bcw"))
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .expect("не удалось запустить blockcheckw");
+        .expect("не удалось запустить bcw");
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&out.stderr));
     (combined, out.status.success())
@@ -50,4 +50,16 @@ fn help_points_to_per_command_flags() {
         output.contains("<command> --help"),
         "справка должна указывать, где искать флаги команд:\n{output}"
     );
+}
+
+/// Встроенный режим на Android включён всегда — ключа больше нет.
+#[test]
+fn embedded_flag_is_gone() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bcw"))
+        .args(["--embedded", "status", "--domain-list", "x"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("не удалось запустить bcw");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--embedded"));
 }

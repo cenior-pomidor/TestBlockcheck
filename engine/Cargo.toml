@@ -4,6 +4,10 @@ version = "0.12.1"
 edition = "2021"
 description = "blockcheck.sh wrapper for better scanning speed"
 
+[[bin]]
+name = "bcw"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "signal", "macros", "net", "io-util"] }
 hyper = { version = "1", features = ["client", "http1"] }

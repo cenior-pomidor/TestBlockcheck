@@ -1,50 +1,10 @@
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-
-/// Check if running as root; if not, re-exec via sudo or su.
-/// Mirrors `require_root()` from vanilla `elevate.sh`.
+/// Проверить, что мы root. На Android переподнимать права нечем (`sudo` нет, у `su`
+/// KernelSU/Magisk другие ключи), поэтому без root — понятный отказ.
 pub fn require_root() {
-    // Already root
     if nix::unistd::getuid().is_root() {
         return;
     }
-
-    eprintln!("* checking privileges");
-    eprintln!("root is required");
-
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .or_else(|| std::env::args().next())
-        .expect("cannot determine executable path");
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Try sudo
-    if has_command("sudo") {
-        eprintln!("elevating with sudo");
-        let err = Command::new("sudo").arg("-E").arg(&exe).args(&args).exec();
-        eprintln!("exec sudo failed: {err}");
-        std::process::exit(2);
-    }
-
-    // Try su
-    if has_command("su") {
-        eprintln!("elevating with su");
-        let mut shell_cmd = shell_escape(&exe);
-        for arg in &args {
-            shell_cmd.push(' ');
-            shell_cmd.push_str(&shell_escape(arg));
-        }
-        let err = Command::new("su")
-            .args(["--preserve-environment", "root", "-c"])
-            .arg(&shell_cmd)
-            .exec();
-        eprintln!("exec su failed: {err}");
-        std::process::exit(2);
-    }
-
-    eprintln!("sudo or su not found");
+    eprintln!("bcw требует root: запустите через su -c");
     std::process::exit(2);
 }
 
@@ -87,25 +47,5 @@ pub fn chown_to_caller(path: &str) {
         Some(nix::unistd::Gid::from_raw(gid)),
     ) {
         tracing::warn!("failed to chown {path} to {uid}:{gid}: {e}");
-    }
-}
-
-fn has_command(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }

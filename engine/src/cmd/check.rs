@@ -317,10 +317,9 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
     // Output JSON — file first (stdout may break on pipe), then stdout
     let json = serde_json::to_string_pretty(&report).expect("report serialization");
 
-    let path = output.map(String::from).unwrap_or_else(|| {
-        let prefix = super::chrono_local_prefix();
-        format!("{prefix}_check.json")
-    });
+    let path = output
+        .map(String::from)
+        .unwrap_or_else(|| super::default_report_path("check.json"));
 
     // Атомарно: отчёт читает ЧУЖОЙ процесс, и половина файла даёт ему `Unreadable` —
     // суждения о цели из этого не выходит, человек просто ждёт.
@@ -386,10 +385,9 @@ fn fail_with(
         inconclusive: false,
     };
     let json = serde_json::to_string_pretty(&report).expect("report serialization");
-    let path = output.map(String::from).unwrap_or_else(|| {
-        let prefix = super::chrono_local_prefix();
-        format!("{prefix}_check.json")
-    });
+    let path = output
+        .map(String::from)
+        .unwrap_or_else(|| super::default_report_path("check.json"));
     if let Err(e) = blockcheckw::system::atomic::write_atomic(std::path::Path::new(&path), &json) {
         screen.error(&format!(
             "не удалось записать отчёт об отказе в {path}: {e}"

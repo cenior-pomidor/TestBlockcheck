@@ -366,7 +366,7 @@ mod tests {
                 "провенанс обязан нести {field}: замер без своих условий — половина замера"
             );
         }
-        assert_eq!(v["run"]["qnum"], 200);
+        assert_eq!(v["run"]["qnum"], 777);
         assert_eq!(v["run"]["profile_mask"], "0x3FC00000");
         assert_eq!(v["run"]["control_mark"], "0x3FC00000");
         assert_eq!(v["run"]["desync_mark"], "0x00200000");

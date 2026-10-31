@@ -16,8 +16,6 @@ use blockcheckw::pipeline::test_report::chrono_like_timestamp;
 use blockcheckw::ui;
 use blockcheckw::ui::{CHECKMARK, CROSS};
 
-use super::chrono_local_prefix;
-
 pub struct StatusParams<'a> {
     pub domain_list: &'a str,
     pub dns_mode: DnsMode,
@@ -422,7 +420,7 @@ pub async fn run_status_cmd(params: StatusParams<'_>) {
 
     let path = output
         .map(|p| p.to_string())
-        .unwrap_or_else(|| format!("{}_status.json", chrono_local_prefix()));
+        .unwrap_or_else(|| super::default_report_path("status.json"));
 
     match std::fs::write(&path, &json) {
         Ok(()) => {

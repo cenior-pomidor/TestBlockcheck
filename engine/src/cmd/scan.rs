@@ -24,8 +24,8 @@ use blockcheckw::ui;
 use tracing::{info_span, Instrument};
 
 use super::{
-    chrono_local_prefix, handle_bypass_conflicts, restore_service, set_scan_progress,
-    set_stopped_service, spawn_cleanup_handler, ScanProgress,
+    handle_bypass_conflicts, restore_service, set_scan_progress, set_stopped_service,
+    spawn_cleanup_handler, ScanProgress,
 };
 
 /// Timeout for the throttle data probe. Generous so a slow-but-honest link
@@ -177,7 +177,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
                 outcome,
                 run: RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
             });
-            let _ = write_report(&format!("{}_scan.json", chrono_local_prefix()), &json);
+            let _ = write_report(&super::default_report_path("scan.json"), &json);
             // TODO(BL-041): process::exit минует force_flush в main → span'ы сбоя теряются.
             std::process::exit(code);
         }
@@ -549,10 +549,9 @@ pub async fn run_scan(params: ScanParams<'_>) {
     }
 
     // 6. Write reports (always) — before stdout, which may break on pipe
-    let now = chrono_local_prefix();
 
     let (content, count) = report::build_vanilla_report(domain, &summary);
-    let vanilla_path = format!("{now}_report_vanilla.txt");
+    let vanilla_path = super::default_report_path("report_vanilla.txt");
     match write_report(&vanilla_path, &content) {
         Ok(()) => screen.println(&format!(
             "  {} vanilla report: {} strategies → {}",
@@ -577,7 +576,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
         outcome: outcome.clone(),
         run: RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
     });
-    let scan_path = format!("{now}_scan.json");
+    let scan_path = super::default_report_path("scan.json");
     match write_report(&scan_path, &content) {
         Ok(()) => screen.println(&format!(
             "  {} scan report: {} strategies → {}",
@@ -680,15 +679,13 @@ pub(crate) fn write_scan_reports(
     blocked: &[blockcheckw::config::Protocol],
     summary: &[ProtocolSummary],
 ) -> std::io::Result<WrittenReports> {
-    let now = chrono_local_prefix();
-
     if let Some(path) = output {
         let (content, _) = report::build_strategies_file(domain, summary);
         write_report(path, &content)?;
     }
 
     let (content, _) = report::build_vanilla_report(domain, summary);
-    write_report(&format!("{now}_report_vanilla.txt"), &content)?;
+    write_report(&super::default_report_path("report_vanilla.txt"), &content)?;
 
     // Прогон оборван сигналом — это ЦЕНЗУРА замера, а не суждение о мире: найденное
     // сохраняем, но утверждать «ничего нет» не вправе.
@@ -713,7 +710,7 @@ pub(crate) fn write_scan_reports(
             mark::is_embedded(),
         ),
     });
-    let scan_path = format!("{now}_scan.json");
+    let scan_path = super::default_report_path("scan.json");
     write_report(&scan_path, &content)?;
 
     Ok(WrittenReports { scan_path, count })

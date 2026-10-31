@@ -1,4 +1,54 @@
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::RwLock;
+
+/// nfqws2 по умолчанию — из установленного модуля nfqws2-android (собран из zapret2 v1.0.5.2,
+/// `--filter-mark` в нём есть).
+pub const DEFAULT_NFQWS2: &str = "/data/adb/modules/nfqws2-android/bin/nfqws2";
+
+/// Lua-библиотеки движка по умолчанию — оттуда же.
+pub const DEFAULT_LUA_DIR: &str = "/data/adb/modules/nfqws2-android/lua";
+
+/// Рабочий каталог: замок, отчёты прогонов. На Android нет `/var/run` и `/tmp` у root-shell.
+pub const DEFAULT_WORK_DIR: &str = "/data/adb/bcw";
+
+/// Боевая очередь по умолчанию: не 200 (magisk-zapret2) и не 300 (nfqws2-android).
+pub const DEFAULT_QNUM: u16 = 777;
+
+/// Пути процесса. Ставятся один раз разбором командной строки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paths {
+    pub nfqws2: PathBuf,
+    pub lua_dir: PathBuf,
+    pub work_dir: PathBuf,
+}
+
+impl Default for Paths {
+    fn default() -> Self {
+        Paths {
+            nfqws2: DEFAULT_NFQWS2.into(),
+            lua_dir: DEFAULT_LUA_DIR.into(),
+            work_dir: DEFAULT_WORK_DIR.into(),
+        }
+    }
+}
+
+static PATHS: RwLock<Option<Paths>> = RwLock::new(None);
+
+/// Объявить пути процесса (до всякой работы с файлами).
+pub fn set_paths(paths: Paths) {
+    if let Ok(mut slot) = PATHS.write() {
+        *slot = Some(paths);
+    }
+}
+
+/// Пути процесса; не заданы — умолчания.
+pub fn paths() -> Paths {
+    match PATHS.read() {
+        Ok(slot) => slot.clone().unwrap_or_default(),
+        Err(_) => Paths::default(),
+    }
+}
 
 /// Префикс наших цепочек iptables (`bcw_raw`, `bcw_out`, …). Не должен совпадать с чужими:
 /// nfqws2-android использует `nfqws_*`, иначе их цепочки попали бы под нашу уборку.
@@ -45,7 +95,7 @@ mod kernel_keys {
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::RwLock;
 
-    pub(super) static QNUM: AtomicU16 = AtomicU16::new(200);
+    pub(super) static QNUM: AtomicU16 = AtomicU16::new(super::DEFAULT_QNUM);
     pub(super) static SMOKE_BASE: AtomicU16 = AtomicU16::new(65_526);
     pub(super) static TABLE: RwLock<String> = RwLock::new(String::new());
 
@@ -108,8 +158,8 @@ pub struct CoreConfig {
     pub base_qnum: u16,
     pub chain_prefix: String,
     pub nfqws2_path: String,
+    pub lua_dir: PathBuf,
     pub request_timeout: u64,
-    pub zapret_base: String,
     pub nfqws2_uid: u32,
     pub nfqws2_gid: u32,
 }
@@ -121,12 +171,12 @@ impl Default for CoreConfig {
             profiles_per_instance: MAX_PROFILES_PER_INSTANCE,
             base_qnum: qnum(),
             chain_prefix: chain_prefix(),
-            nfqws2_path: nfqws2_path("/opt/zapret2"),
+            nfqws2_path: paths().nfqws2.to_string_lossy().into_owned(),
+            lua_dir: paths().lua_dir,
             request_timeout: 2,
-            // FIXME: zapret_base is hardcoded; add CLI option to override
-            zapret_base: "/opt/zapret2".to_string(),
-            nfqws2_uid: detect_nobody_uid(),
-            nfqws2_gid: detect_nobody_gid(),
+            // На Android нет `nobody` в /etc/passwd; nfqws2-android тоже запускает движок от root.
+            nfqws2_uid: 0,
+            nfqws2_gid: 0,
         }
     }
 }
@@ -216,8 +266,8 @@ impl CoreConfig {
         crate::nfqws2::plan::Env {
             binary: self.nfqws2_path.clone().into(),
             lua: vec![
-                format!("{}/lua/zapret-lib.lua", self.zapret_base).into(),
-                format!("{}/lua/zapret-antidpi.lua", self.zapret_base).into(),
+                self.lua_dir.join("zapret-lib.lua"),
+                self.lua_dir.join("zapret-antidpi.lua"),
             ],
             uid: self.nfqws2_uid,
             gid: self.nfqws2_gid,
@@ -263,34 +313,6 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// Detect uid for "nobody" user. Falls back to 65534 (standard on most Linux distros).
-fn detect_nobody_uid() -> u32 {
-    nix::unistd::User::from_name("nobody")
-        .ok()
-        .flatten()
-        .map(|u| u.uid.as_raw())
-        .unwrap_or(65534)
-}
-
-/// Detect gid for "nobody" user. Falls back to 65534.
-fn detect_nobody_gid() -> u32 {
-    nix::unistd::User::from_name("nobody")
-        .ok()
-        .flatten()
-        .map(|u| u.gid.as_raw())
-        .unwrap_or(65534)
-}
-
-/// Путь к движку внутри zapret2 (#68).
-///
-/// Архитектуру выбирает install_bin.sh: он кладёт в `nfq2/` ссылку на
-/// подходящий `binaries/<arch>/nfqws2` (или на `binaries/my`), а самосборка
-/// оставляет бинарь прямо там. Свой перебор `binaries/linux-*` промахивался
-/// мимо всего, что не релиз, — поэтому не выбираем, а берём выбранное.
-pub fn nfqws2_path(zapret_base: &str) -> String {
-    format!("{zapret_base}/nfq2/nfqws2")
-}
-
 pub fn parse_protocols(s: &str) -> Result<Vec<Protocol>, String> {
     let mut protocols = Vec::new();
     for token in s.split(',') {
@@ -316,6 +338,34 @@ pub fn parse_protocols(s: &str) -> Result<Vec<Protocol>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_defaults() {
+        let c = CoreConfig::default();
+        assert_eq!(c.nfqws2_path, DEFAULT_NFQWS2);
+        assert_eq!(
+            (
+                c.nfqws2_uid,
+                c.nfqws2_gid,
+                c.base_qnum,
+                c.profiles_per_instance
+            ),
+            (0, 0, 777, 254)
+        );
+        assert_eq!(c.chain_prefix, "bcw");
+    }
+
+    #[test]
+    fn nfqws2_env_uses_lua_dir() {
+        let env = CoreConfig::default().nfqws2_env();
+        let lua = std::path::Path::new(DEFAULT_LUA_DIR);
+        assert_eq!(
+            env.lua,
+            [lua.join("zapret-lib.lua"), lua.join("zapret-antidpi.lua")]
+        );
+        assert_eq!((env.uid, env.gid), (0, 0));
+        assert_eq!(env.binary, std::path::Path::new(DEFAULT_NFQWS2));
+    }
 
     #[test]
     fn default_chain_prefix_does_not_collide_with_foreign_ones() {
@@ -401,17 +451,5 @@ mod tests {
         );
         assert_eq!(env.uid, config.nfqws2_uid);
         assert_eq!(env.gid, config.nfqws2_gid);
-    }
-}
-
-#[cfg(test)]
-mod nfqws2_path_tests {
-    use super::nfqws2_path;
-
-    /// #68: движок берётся из `nfq2/`, где его оставил install_bin.sh, — не из
-    /// `binaries/linux-*`, куда не попадает самосборка.
-    #[test]
-    fn engine_is_taken_from_nfq2() {
-        assert_eq!(nfqws2_path("/opt/zapret2"), "/opt/zapret2/nfq2/nfqws2");
     }
 }

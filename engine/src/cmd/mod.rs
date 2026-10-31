@@ -553,7 +553,37 @@ pub async fn restore_service(mgr: &ServiceManager, con: &blockcheckw::ui::Consol
 
 // ── Instance lock ───────────────────────────────────────────────────────────
 
-const LOCK_PATH: &str = "/var/run/blockcheckw.lock";
+/// Замок экземпляра в рабочем каталоге: на Android нет `/var/run`.
+pub fn lock_path(work_dir: &std::path::Path) -> std::path::PathBuf {
+    work_dir.join("bcw.lock")
+}
+
+/// Создать рабочий каталог (вместе с родителями), только для root.
+pub fn ensure_work_dir(work_dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(work_dir)?;
+    std::fs::set_permissions(work_dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Каталог отчётов этого прогона: `<work_dir>/runs/<дата-время>/`, один на процесс.
+pub fn run_dir() -> std::path::PathBuf {
+    static RUN_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    RUN_DIR
+        .get_or_init(|| {
+            let dir = blockcheckw::config::paths()
+                .work_dir
+                .join("runs")
+                .join(chrono_local_prefix());
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+        .clone()
+}
+
+/// Путь отчёта по умолчанию в каталоге этого прогона.
+pub fn default_report_path(name: &str) -> String {
+    run_dir().join(name).to_string_lossy().into_owned()
+}
 
 /// Acquire an exclusive lock to prevent parallel blockcheckw execution.
 /// Opaque lock handle — keeps the flock alive until dropped.
@@ -565,13 +595,15 @@ pub fn acquire_instance_lock() -> InstanceLock {
     use nix::fcntl::{Flock, FlockArg};
     use std::io::Write;
 
+    let lock_file = lock_path(&blockcheckw::config::paths().work_dir);
+
     // No truncate before flock — truncate would create a new file description
     // and bypass the existing lock held by another process
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(LOCK_PATH);
+        .open(&lock_file);
 
     let file = match file {
         Ok(f) => f,
@@ -579,7 +611,7 @@ pub fn acquire_instance_lock() -> InstanceLock {
             eprintln!(
                 "  {} cannot create lock file {}: {e}",
                 style("ERROR:").red().bold(),
-                LOCK_PATH,
+                lock_file.display(),
             );
             std::process::exit(1);
         }
@@ -590,10 +622,10 @@ pub fn acquire_instance_lock() -> InstanceLock {
         Ok(lock) => lock,
         Err((inner_file, _err)) => {
             // Lock held by another instance — wait (supports pipe: universal | check)
-            let held_pid = std::fs::read_to_string(LOCK_PATH).unwrap_or_default();
+            let held_pid = std::fs::read_to_string(&lock_file).unwrap_or_default();
             let held_pid = held_pid.trim();
             eprintln!(
-                "  {} waiting for another blockcheckw instance (PID {held_pid}) to finish...",
+                "  {} waiting for another bcw instance (PID {held_pid}) to finish...",
                 style("WAIT:").yellow().bold(),
             );
             match Flock::lock(inner_file, FlockArg::LockExclusive) {
@@ -877,5 +909,33 @@ mod conflict_tests {
         assert!(!pgrep_has_matches(0, "\n"));
         assert!(!pgrep_has_matches(1, ""));
         assert!(!pgrep_has_matches(1, "unexpected output\n"));
+    }
+}
+
+#[cfg(test)]
+mod work_dir_tests {
+    use super::{ensure_work_dir, lock_path};
+    use std::path::Path;
+
+    #[test]
+    fn lock_path_is_inside_work_dir() {
+        assert_eq!(lock_path(Path::new("/w")), Path::new("/w/bcw.lock"));
+    }
+
+    #[test]
+    fn work_dir_is_created_on_demand() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bcw-wd-{}-{stamp}", std::process::id()));
+        let dir = root.join("a").join("b");
+        assert!(!dir.exists());
+        ensure_work_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

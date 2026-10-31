@@ -33,20 +33,20 @@ const fn help_styles() -> clap::builder::styling::Styles {
 /// число проходов задаются флагами конкретной команды (#66).
 const AFTER_HELP: &str = "\
 Examples:
-  blockcheckw scan -d rutracker.org                скан домена на работающие страты
-  blockcheckw scan -d example.com -p tls12         проверка только TLS 1.2
-  blockcheckw scan -d example.com -o report.json   сохранить отчёт в файл
-  blockcheckw check --from-file report.json        проверка найденных страт
-  blockcheckw universal --domain-list domains.txt  подбор пересекающихся страт для разных доменов
-  blockcheckw status --domain-list domains.txt     оценка эффективности работающего zapret2
+  bcw scan -d rutracker.org                скан домена на работающие страты
+  bcw scan -d example.com -p tls12         проверка только TLS 1.2
+  bcw scan -d example.com -o report.json   сохранить отчёт в файл
+  bcw check --from-file report.json        проверка найденных страт
+  bcw universal --domain-list domains.txt  подбор пересекающихся страт для разных доменов
+  bcw status --domain-list domains.txt     оценка эффективности работающего zapret2
 
 Per-command flags (timeouts, DNS mode, passes, worker count):
-  blockcheckw <command> --help";
+  bcw <command> --help";
 
 #[derive(Parser)]
 #[command(
-    name = "blockcheckw",
-    about = "Parallel DPI bypass strategy scanner",
+    name = "bcw",
+    about = "Parallel DPI bypass strategy scanner (Android)",
     after_help = AFTER_HELP,
     styles = help_styles(),
 )]
@@ -71,17 +71,19 @@ struct Cli {
     #[arg(long, global = true)]
     via: Option<String>,
 
-    /// ВСТРОЕННЫЙ РЕЖИМ: подбор поднят продуктом, а не человеком.
-    ///
-    /// Включает разом всё, что из этого следует: чужое ядро не трогается (как
-    /// --no-conflict-cleanup), пробы без десинка несут собственную марку процесса, вопросов
-    /// человеку не задаётся, подбор уходит в свою группу процессов и снимает свои остатки при
-    /// входе, а память прошлых запусков (~/.config/blockcheckw/config.json) НЕ ЧИТАЕТСЯ И НЕ
-    /// ПИШЕТСЯ — унаследованное умолчание ломало подбор молча.
-    #[arg(long, global = true)]
-    embedded: bool,
+    /// Путь к nfqws2 (умолчание /data/adb/modules/nfqws2-android/bin/nfqws2).
+    #[arg(long, global = true, value_name = "PATH")]
+    nfqws2: Option<std::path::PathBuf>,
 
-    /// Номер боевой очереди NFQUEUE (умолчание 200).
+    /// Каталог Lua-библиотек движка (умолчание /data/adb/modules/nfqws2-android/lua).
+    #[arg(long, global = true, value_name = "PATH")]
+    lua_dir: Option<std::path::PathBuf>,
+
+    /// Рабочий каталог: замок и отчёты прогонов (умолчание /data/adb/bcw).
+    #[arg(long, global = true, value_name = "PATH")]
+    work_dir: Option<std::path::PathBuf>,
+
+    /// Номер боевой очереди NFQUEUE (умолчание 777).
     #[arg(long, value_name = "N")]
     qnum: Option<u16>,
 
@@ -466,13 +468,19 @@ async fn main() {
         return;
     }
 
-    // ДВА КЛЮЧА, ДВА СМЫСЛА. Прежде оба висели на `--no-conflict-cleanup`, и разъехались бы
-    // молча у первого, кому понадобился один без другого: «не трогай чужие таблицы» — это про
-    // уборку, «я поднят продуктом» — про марку проб, группу процессов, память и вопросы человеку.
-    let embedded = cli.embedded;
-    // Пробы без десинка несут собственную марку процесса, чтобы хозяин ядра отличил наш трафик
-    // от трафика человека и не увёл его вместе с ним в карантин.
+    // НА ANDROID ВСТРОЕННЫЙ РЕЖИМ ВСЕГДА: обходом владеет пользователь, чужие правила и
+    // процессы не трогаются, контроль несёт собственную метку, вопросов нет, своя группа
+    // процессов, свои остатки снимаются при входе, памяти прошлых запусков нет.
+    let embedded = true;
     blockcheckw::nfqws2::mark::set_embedded(embedded);
+    {
+        let defaults = blockcheckw::config::Paths::default();
+        blockcheckw::config::set_paths(blockcheckw::config::Paths {
+            nfqws2: cli.nfqws2.clone().unwrap_or(defaults.nfqws2),
+            lua_dir: cli.lua_dir.clone().unwrap_or(defaults.lua_dir),
+            work_dir: cli.work_dir.clone().unwrap_or(defaults.work_dir),
+        });
+    }
     blockcheckw::machine::set_stream(cli.stream);
     blockcheckw::machine::set_progress(cli.progress);
 
@@ -501,7 +509,7 @@ async fn main() {
     mark_space::set_space(mark_space);
 
     blockcheckw::config::set_kernel_keys(
-        cli.qnum.unwrap_or(200),
+        cli.qnum.unwrap_or(blockcheckw::config::DEFAULT_QNUM),
         cli.chain_prefix
             .as_deref()
             .unwrap_or(blockcheckw::config::DEFAULT_CHAIN_PREFIX),
@@ -533,6 +541,14 @@ async fn main() {
 
     blockcheckw::system::elevate::require_root();
     blockcheckw::system::elevate::raise_nofile_limit();
+    let work_dir = blockcheckw::config::paths().work_dir;
+    if let Err(e) = cmd::ensure_work_dir(&work_dir) {
+        eprintln!(
+            "ERROR: не удалось создать рабочий каталог {}: {e}",
+            work_dir.display()
+        );
+        std::process::exit(2);
+    }
 
     // `--workers` is global, but `check` verifies strategies sequentially by design —
     // warn (once, post-elevation) so users don't expect it to change `check` throughput (#33).
