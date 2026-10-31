@@ -39,10 +39,14 @@ jobs:
         with:
           submodules: true
       - name: Load kernel modules
+        # По одному и без падения: имя цели CONNMARK живёт в модуле xt_connmark, а часть
+        # модулей бывает встроена в ядро раннера. Недостающее ядро догрузит само по
+        # первому правилу; провал здесь — предупреждение, а не отказ job.
         run: |
-          sudo modprobe -a nfnetlink_queue ip_tables iptable_mangle iptable_raw \
-            xt_NFQUEUE xt_connbytes xt_connmark xt_CONNMARK xt_CT xt_mark xt_conntrack \
-            xt_multiport xt_tcpudp
+          for m in nfnetlink_queue ip_tables iptable_mangle iptable_raw xt_NFQUEUE \
+                   xt_connbytes xt_connmark xt_CT xt_mark xt_conntrack xt_multiport xt_tcpudp; do
+            sudo modprobe "$m" || echo "::warning::modprobe $m failed"
+          done
       - name: Build integration image
         run: docker build -f docker/integration.Dockerfile -t bcw-it .
       - name: Run e2e_infra tests
