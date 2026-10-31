@@ -255,7 +255,7 @@ pub async fn resolve_domain(
             // Find a DoH server for spoofing check
             let doh_server = doh::find_working_doh_server().await;
 
-            if let Some(server) = doh_server {
+            if let Some(server) = doh_server.as_ref() {
                 let spoof_result = check_dns_spoofing(server).await;
 
                 match &spoof_result {

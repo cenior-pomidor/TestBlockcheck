@@ -75,6 +75,11 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     work_dir: Option<std::path::PathBuf>,
 
+    /// Свой DoH-резолвер: `IP` или `IP:ИМЯ` (можно несколько; опрашиваются раньше встроенных
+    /// 1.1.1.1, 8.8.8.8, 9.9.9.9).
+    #[arg(long, global = true, value_name = "SPEC")]
+    doh: Vec<String>,
+
     /// Номер боевой очереди NFQUEUE (умолчание 777).
     #[arg(long, value_name = "N")]
     qnum: Option<u16>,
@@ -429,6 +434,19 @@ async fn main() {
             lua_dir: cli.lua_dir.clone().unwrap_or(defaults.lua_dir),
             work_dir: cli.work_dir.clone().unwrap_or(defaults.work_dir),
         });
+    }
+    {
+        let mut extra = Vec::with_capacity(cli.doh.len());
+        for spec in &cli.doh {
+            match blockcheckw::network::doh::parse_server(spec) {
+                Ok(server) => extra.push(server),
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        blockcheckw::network::doh::set_extra_servers(extra);
     }
     blockcheckw::machine::set_stream(cli.stream);
     blockcheckw::machine::set_progress(cli.progress);
@@ -866,6 +884,22 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--doh` повторяемый и глобальный: свои резолверы задаются там, где умолчания
+    /// недоступны, и порядок их задания — порядок опроса.
+    #[test]
+    fn doh_flag_is_repeatable_and_global() {
+        let cli = Cli::try_parse_from([
+            "bcw",
+            "scan",
+            "--doh",
+            "77.88.8.8",
+            "--doh",
+            "94.140.14.14:dns.adguard-dns.com",
+        ])
+        .expect("parse");
+        assert_eq!(cli.doh, ["77.88.8.8", "94.140.14.14:dns.adguard-dns.com"]);
+    }
 
     #[test]
     fn check_probe_path_defaults_to_root() {

@@ -13,30 +13,82 @@ const DOH_BODY_LIMIT: usize = 64 * 1024;
 ///
 /// Адрес литералом, потому что иначе разрешение имени резолвера упёрлось бы в само себя —
 /// а системного резолвера, которому можно верить, у нас по условию задачи нет.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DohServer {
-    pub host: &'static str,
-    pub ip: &'static str,
-    pub path: &'static str,
+    pub host: String,
+    pub ip: String,
+    pub path: String,
 }
 
-const DOH_SERVERS: &[DohServer] = &[
-    DohServer {
-        host: "cloudflare-dns.com",
-        ip: "1.1.1.1",
-        path: "/dns-query",
-    },
-    DohServer {
-        host: "dns.google",
-        ip: "8.8.8.8",
-        path: "/dns-query",
-    },
-    DohServer {
-        host: "dns.quad9.net",
-        ip: "9.9.9.9",
-        path: "/dns-query",
-    },
-];
+/// Путь запроса у всех известных резолверов один и тот же.
+const DEFAULT_PATH: &str = "/dns-query";
+
+/// Встроенные резолверы оригинала. Доступны ли они на сети человека — заранее неизвестно,
+/// поэтому к ним можно добавить свои (`--doh`).
+pub fn default_servers() -> Vec<DohServer> {
+    [
+        ("cloudflare-dns.com", "1.1.1.1"),
+        ("dns.google", "8.8.8.8"),
+        ("dns.quad9.net", "9.9.9.9"),
+    ]
+    .into_iter()
+    .map(|(host, ip)| DohServer {
+        host: host.to_string(),
+        ip: ip.to_string(),
+        path: DEFAULT_PATH.to_string(),
+    })
+    .collect()
+}
+
+/// Разобрать `--doh`: `IP` (имя для SNI — сам IP) или `IP:HOST`.
+///
+/// IP — только литерал IPv4: разрешать имя резолвера через резолвер значит упереться в само
+/// себя. HOST — из букв, цифр, точки и дефиса: он едет в SNI и в заголовок `Host`.
+pub fn parse_server(spec: &str) -> Result<DohServer, String> {
+    let spec = spec.trim();
+    let (ip, host) = match spec.split_once(':') {
+        Some((ip, host)) => (ip, host),
+        None => (spec, spec),
+    };
+    if !is_ipv4(ip) {
+        return Err(format!(
+            "--doh {spec:?}: ожидается IPv4-адрес резолвера, а не {ip:?}"
+        ));
+    }
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return Err(format!(
+            "--doh {spec:?}: имя резолвера {host:?} — только буквы, цифры, точка и дефис"
+        ));
+    }
+    Ok(DohServer {
+        host: host.to_string(),
+        ip: ip.to_string(),
+        path: DEFAULT_PATH.to_string(),
+    })
+}
+
+static EXTRA_SERVERS: std::sync::RwLock<Vec<DohServer>> = std::sync::RwLock::new(Vec::new());
+
+/// Объявить свои резолверы (ставится разбором командной строки).
+pub fn set_extra_servers(servers: Vec<DohServer>) {
+    if let Ok(mut slot) = EXTRA_SERVERS.write() {
+        *slot = servers;
+    }
+}
+
+/// Все резолверы в порядке опроса: свои первыми, затем встроенные.
+pub fn servers() -> Vec<DohServer> {
+    let mut all = EXTRA_SERVERS
+        .read()
+        .map(|extra| extra.clone())
+        .unwrap_or_default();
+    all.extend(default_servers());
+    all
+}
 
 /// Разрешить имя через DoH СВОИМ помеченным сокетом.
 ///
@@ -60,8 +112,8 @@ pub async fn doh_resolve(domain: &str, server: &DohServer) -> Option<Vec<String>
 
     let path = format!("{}?name={domain}&type=A", server.path);
     let body = http_client::fetch_https_body(
-        server.ip,
-        server.host,
+        &server.ip,
+        &server.host,
         &path,
         "application/dns-json",
         ProbeMark::Control.so_mark(),
@@ -93,9 +145,9 @@ fn parse_doh_response(json: &str) -> Vec<String> {
 }
 
 /// Try each DoH server with a test query (iana.org) and return the first working one.
-pub async fn find_working_doh_server() -> Option<&'static DohServer> {
-    for server in DOH_SERVERS {
-        if let Some(ips) = doh_resolve("iana.org", server).await {
+pub async fn find_working_doh_server() -> Option<DohServer> {
+    for server in servers() {
+        if let Some(ips) = doh_resolve("iana.org", &server).await {
             if !ips.is_empty() {
                 return Some(server);
             }
@@ -115,7 +167,7 @@ pub async fn resolve_ipv4_doh(domain: &str) -> Result<Vec<String>, BlockcheckErr
             })?;
 
     let ips =
-        doh_resolve(domain, server)
+        doh_resolve(domain, &server)
             .await
             .ok_or_else(|| BlockcheckError::DnsResolveFailed {
                 domain: domain.to_string(),
@@ -166,14 +218,58 @@ mod tests {
     /// упереться в само себя, а системному резолверу мы по условию задачи не верим.
     #[test]
     fn every_resolver_is_reachable_without_resolving_anything() {
-        for server in DOH_SERVERS {
+        for server in default_servers() {
             assert!(
-                crate::network::dns::is_ipv4(server.ip),
+                crate::network::dns::is_ipv4(&server.ip),
                 "{}: адрес обязан быть литералом, а не именем",
                 server.host
             );
             assert!(!server.host.is_empty(), "имя нужно для SNI");
         }
+    }
+
+    #[test]
+    fn parse_ip_only() {
+        let s = parse_server("77.88.8.8").unwrap();
+        assert_eq!(
+            (s.ip.as_str(), s.host.as_str(), s.path.as_str()),
+            ("77.88.8.8", "77.88.8.8", "/dns-query")
+        );
+    }
+
+    #[test]
+    fn parse_ip_and_host() {
+        let s = parse_server("77.88.8.8:common.dot.dns.yandex.net").unwrap();
+        assert_eq!(s.ip, "77.88.8.8");
+        assert_eq!(s.host, "common.dot.dns.yandex.net");
+        assert_eq!(s.path, "/dns-query");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        for bad in [
+            "",
+            "dns.google",
+            "1.2.3",
+            "1.2.3.4:bad host",
+            "1.2.3.4:a&b",
+            "1.2.3.4:",
+        ] {
+            assert!(parse_server(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Свои резолверы — первыми: пользователь задаёт их ровно потому, что умолчания на его
+    /// сети недоступны, и ждать таймаута каждого умолчания перед своим незачем.
+    #[test]
+    fn extra_servers_go_first() {
+        let mine = parse_server("77.88.8.8:common.dot.dns.yandex.net").unwrap();
+        set_extra_servers(vec![mine.clone()]);
+        let all = servers();
+        set_extra_servers(Vec::new());
+        assert_eq!(all[0], mine);
+        assert_eq!(&all[1..], &default_servers()[..]);
+        assert_eq!(default_servers().len(), 3);
     }
 
     #[test]
