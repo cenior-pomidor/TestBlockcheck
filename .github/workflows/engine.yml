@@ -29,3 +29,24 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo test --lib --bins
       - run: cargo test --test orphan_reaping --test background_shutdown --test cli --test ipt_isolation
+
+  integration:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Load kernel modules
+        run: |
+          sudo modprobe -a nfnetlink_queue ip_tables iptable_mangle iptable_raw \
+            xt_NFQUEUE xt_connbytes xt_connmark xt_CONNMARK xt_CT xt_mark xt_conntrack \
+            xt_multiport xt_tcpudp
+      - name: Build integration image
+        run: docker build -f docker/integration.Dockerfile -t bcw-it .
+      - name: Run e2e_infra tests
+        run: docker run --rm --privileged bcw-it --test e2e_infra -- --nocapture
+      - name: Run parallel_benchmark tests
+        continue-on-error: true
+        run: docker run --rm --privileged bcw-it --test parallel_benchmark -- --nocapture

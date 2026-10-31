@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
-    nftables \
+    iptables \
     conntrack \
     libnetfilter-queue-dev \
     libnfnetlink-dev \
@@ -19,6 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
+
+# ── iptables-legacy: на Android nftables в ядре нет, а в Ubuntu 24.04 по умолчанию
+#    iptables-nft. Стенд обязан говорить тем же языком ядра, что и телефон.
+RUN update-alternatives --set iptables /usr/sbin/iptables-legacy \
+    && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
+    && iptables -V | grep -q legacy \
+    && iptables-restore --version | grep -q legacy
 
 # ── Rust toolchain ────────────────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable

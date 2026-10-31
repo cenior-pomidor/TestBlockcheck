@@ -1,11 +1,11 @@
 //! Integration benchmark: tests parallel strategy execution with different worker counts.
 //!
-//! Requires: root, nfqws2 installed, nftables available.
+//! Requires: root, nfqws2 in /opt/zapret2/nfq2, iptables-legacy.
 //! Run: `sudo cargo test --test parallel_bench -- --nocapture`
 
 use std::time::Instant;
 
-use blockcheckw::config::{CoreConfig, Protocol};
+use blockcheckw::config::{set_paths, CoreConfig, Paths, Protocol};
 use blockcheckw::nfqws2::run::SystemNfqws2;
 use blockcheckw::pipeline::runner::{run_parallel, RunParams};
 use blockcheckw::pipeline::worker_task::HttpTestMode;
@@ -35,20 +35,23 @@ fn check_no_nfqws2_zombies() -> bool {
     }
 }
 
-/// Check that the nftables table has been dropped.
-fn check_nft_table_dropped(table: &str) -> bool {
-    let output = std::process::Command::new("nft")
-        .args(["list", "table", "inet", table])
+/// Check that our iptables chains have been dropped.
+fn check_chains_dropped(prefix: &str) -> bool {
+    let own = format!("{prefix}_");
+    let output = std::process::Command::new("iptables-save")
+        .args(["-t", "mangle"])
         .output();
-
     match output {
         Ok(out) => {
-            if out.status.success() {
-                eprintln!("WARNING: nft table '{}' still exists!", table);
-                false
-            } else {
-                true
+            let left: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains(&own))
+                .map(str::to_string)
+                .collect();
+            if !left.is_empty() {
+                eprintln!("WARNING: our chains still exist: {left:?}");
             }
+            left.is_empty()
         }
         Err(_) => true,
     }
@@ -63,7 +66,7 @@ struct BenchRow {
     failures: usize,
     errors: usize,
     clean_nfqws2: bool,
-    clean_nft: bool,
+    clean_chains: bool,
 }
 
 #[tokio::test]
@@ -81,6 +84,11 @@ async fn parallel_scaling_bench() {
     let strategies = generate_strategies(strategy_count);
     let worker_counts = [8, 16, 64];
 
+    set_paths(Paths {
+        nfqws2: "/opt/zapret2/nfq2/nfqws2".into(),
+        lua_dir: "/opt/zapret2/lua".into(),
+        work_dir: "/tmp/bcw-bench".into(),
+    });
     let filter_mark = SystemNfqws2::probe_sync(&CoreConfig::default().nfqws2_env())
         .expect("nfqws2 must support --filter-mark for this benchmark to run");
 
@@ -117,7 +125,7 @@ async fn parallel_scaling_bench() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let clean_nfqws2 = check_no_nfqws2_zombies();
-        let clean_nft = check_nft_table_dropped(&config.nft_table);
+        let clean_chains = check_chains_dropped(&config.chain_prefix);
 
         rows.push(BenchRow {
             worker_count: wc,
@@ -128,12 +136,12 @@ async fn parallel_scaling_bench() {
             failures: stats.failures,
             errors: stats.errors,
             clean_nfqws2,
-            clean_nft,
+            clean_chains,
         });
 
         assert!(
-            clean_nft,
-            "nftables table not cleaned up for worker_count={wc}"
+            clean_chains,
+            "iptables chains not cleaned up for worker_count={wc}"
         );
         assert!(clean_nfqws2, "nfqws2 zombies found for worker_count={wc}");
         assert_eq!(
@@ -154,7 +162,7 @@ async fn parallel_scaling_bench() {
         "Success",
         "Failed",
         "Errors",
-        "NFT",
+        "CHAINS",
         "NFQWS2"
     );
     eprintln!("{}", "-".repeat(90));
@@ -168,7 +176,7 @@ async fn parallel_scaling_bench() {
             r.successes,
             r.failures,
             r.errors,
-            if r.clean_nft { "OK" } else { "FAIL" },
+            if r.clean_chains { "OK" } else { "FAIL" },
             if r.clean_nfqws2 { "OK" } else { "FAIL" },
         );
     }

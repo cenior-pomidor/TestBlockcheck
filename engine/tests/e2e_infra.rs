@@ -1,16 +1,22 @@
-//! Infrastructure e2e tests — verify SO_MARK, real-kernel nftables dispatch, autottl pipeline.
+//! Infrastructure e2e tests — verify SO_MARK, real-kernel iptables dispatch, autottl pipeline.
 //!
-//! Requires: root, nfqws2 installed, nftables available.
+//! Requires: root, nfqws2 in /opt/zapret2/nfq2 (стенд — `docker/integration.Dockerfile`),
+//! iptables-legacy.
 //! Run: `sudo cargo test --test e2e_infra -- --nocapture`
+//!
+//! Тесты, трогающие ядро, идут ПО ОДНОМУ (замок `KERNEL`): в iptables `ACCEPT` в цепочке
+//! одного прогона прекращает обход `mangle` и для пакетов другого прогона, поэтому два
+//! прогона в одном ядре одновременно мешают друг другу — в отличие от независимых
+//! nft-таблиц оригинала.
 
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 
-use blockcheckw::config::{CoreConfig, Protocol, DEFAULT_NFT_TABLE};
-use blockcheckw::firewall::nft::SystemNft;
-use blockcheckw::firewall::nftables;
+use blockcheckw::config::{set_paths, CoreConfig, Paths, Protocol};
+use blockcheckw::firewall::ipt::SystemIpt;
+use blockcheckw::firewall::rules;
 use blockcheckw::network::http_client;
-use blockcheckw::nfqws2::mark::ProfileMark;
+use blockcheckw::nfqws2::mark::{control_mark, ProfileMark};
 use blockcheckw::nfqws2::plan::{FilterMark, Plan, QueueNum};
 use blockcheckw::nfqws2::ready::{queue_bound, PROCFS_PATH};
 use blockcheckw::nfqws2::run::SystemNfqws2;
@@ -18,6 +24,47 @@ use blockcheckw::system::process::run_process;
 
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+/// Один прогон в ядре за раз (см. заголовок файла).
+static KERNEL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Пути стенда: движок и Lua там, куда их кладёт `docker/integration.Dockerfile`.
+fn e2e_paths() {
+    set_paths(Paths {
+        nfqws2: "/opt/zapret2/nfq2/nfqws2".into(),
+        lua_dir: "/opt/zapret2/lua".into(),
+        work_dir: "/tmp/bcw-e2e".into(),
+    });
+}
+
+/// `iptables-save` таблицы без комментариев и счётчиков — то, что сравнимо до и после.
+async fn ipt_save(table: &str) -> String {
+    run_process(&["iptables-save", "-t", table], 5000)
+        .await
+        .map(|r| {
+            r.stdout
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| match l.split_once(" [") {
+                    Some((chain, _)) if l.starts_with(':') => chain.to_string(),
+                    _ => l.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Строки `iptables-save -t mangle`, относящиеся к цепочкам с префиксом `prefix`.
+async fn our_mangle_lines(prefix: &str) -> Vec<String> {
+    let own = format!("{prefix}_");
+    ipt_save("mangle")
+        .await
+        .lines()
+        .filter(|l| l.contains(&own))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Настоящая проверка `--filter-mark` через `--help` реального бинаря.
@@ -188,33 +235,32 @@ async fn so_mark_zero_means_no_mark() {
 
 // ── Test 2: dispatch rules on a real kernel ──────────────────────────────────
 
-/// До #68ч2: N воркеров давали N цепочек и N элементов в двух vmap'ах
-/// (`postnat_qmap`/`prenat_qmap`) — снесённая вместе с `src/worker/` схема,
-/// где каждый новый воркер добавлял ещё одну цепочку и ещё один элемент.
-/// Теперь диспетчеризация — ровно ДВА статических правила (по одному в
-/// `postnat` и в `prenat`) независимо от числа профилей в плане; мокнутый
-/// вариант этого утверждения уже живёт в
-/// `nftables::dispatch_tests::dispatch_is_exactly_two_rules`
-/// (`src/firewall/nftables.rs`), здесь — то же самое на настоящем `nft`:
-/// план из трёх профилей не должен породить больше двух упоминаний `queue`
-/// (по одному на каждую хук-цепочку), и после `remove_dispatch` от них не
-/// должно остаться следа.
+/// Диспетчеризация на настоящем ядре: план из трёх профилей даёт ровно две очереди
+/// (исходящая `<p>_q` и SYN/ACK `<p>_qin`), правило отбора — по строке на IP цели с
+/// лимитом первых 10 пакетов; после `remove_dispatch` очередей нет, а после
+/// `drop_chains` таблицы `raw` и `mangle` совпадают с исходными. Мокнутые двойники —
+/// `firewall::rules` (`dispatch_rules_match_spec_for_each_ip` и соседи).
 #[tokio::test]
-async fn nft_dispatch_add_remove_rules_on_real_kernel() {
+async fn ipt_dispatch_add_remove_rules_on_real_kernel() {
     if !is_root() {
         eprintln!("SKIPPED: requires root");
         return;
     }
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
 
-    const TABLE: &str = "zapret_test_dispatch";
+    const PREFIX: &str = "bcwt2";
     let config = CoreConfig::default();
     let witness = probe_witness(&config);
     let queue = QueueNum::new(500);
-    let ips = vec!["1.1.1.1".to_string()];
+    let ips = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()];
 
-    let table = nftables::prepare_table(&SystemNft, TABLE)
+    let raw_before = ipt_save("raw").await;
+    let mangle_before = ipt_save("mangle").await;
+
+    let chains = rules::prepare_chains(&SystemIpt, PREFIX)
         .await
-        .expect("prepare_table");
+        .expect("prepare_chains");
 
     let strategies = vec![
         vec!["--lua-desync=fake:ttl=1".to_string()],
@@ -230,66 +276,52 @@ async fn nft_dispatch_add_remove_rules_on_real_kernel() {
         .await
         .expect("nfqws2 must bind the queue");
 
-    nftables::apply_dispatch(&SystemNft, &table, &ready, &plan.dispatch(443), &ips)
+    rules::apply_dispatch(&SystemIpt, &chains, &ready, &plan.dispatch(443), &ips)
         .await
         .expect("apply_dispatch");
 
-    // Собрать факты ДО разбора хвостов: паника между `apply_dispatch` и
-    // `remove_dispatch`/`stop`/`drop_table` иначе оставила бы на стенде
-    // таблицу с правилом `queue to {queue}` без слушателя — помеченные
-    // пакеты на этот адрес и порт молча дропались бы, а продуктовый
-    // `prepare_table` эту таблицу не подобрал бы: имя чужое (см.
-    // `foreign_zapret1_table_survives_our_cleanup` — тот же приём).
-    //
-    // `nft list` тоже может отказать — по таймауту в 5с в том числе, на
-    // нагруженной машине это реалистично. `.expect` здесь паниковал бы и
-    // пропустил уборку ниже — ровно тот отказ, от которого уборка защищает,
-    // просто сдвинутый на шаг раньше. Поэтому не `.expect`, а откат к
-    // пустой строке; что чтение не удалось, всё равно валит тест — ниже,
-    // уже после уборки, явным ассертом на непустоту.
-    let content = run_process(&["nft", "list", "table", "inet", TABLE], 5000)
-        .await
-        .map(|r| r.stdout)
-        .unwrap_or_default();
-
-    nftables::remove_dispatch(&SystemNft, &table).await;
+    // Факты — ДО уборки: паника между постановкой правил и сносом оставила бы на стенде
+    // правило очереди без слушателя.
+    let content = our_mangle_lines(PREFIX).await;
+    rules::remove_dispatch(&SystemIpt, &chains).await;
+    let content_after_remove = our_mangle_lines(PREFIX).await;
     SystemNfqws2::stop(instance).await;
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
 
-    let content_after_remove = run_process(&["nft", "list", "table", "inet", TABLE], 5000)
-        .await
-        .map(|r| r.stdout)
-        .unwrap_or_default();
+    let raw_after = ipt_save("raw").await;
+    let mangle_after = ipt_save("mangle").await;
 
-    let _ = table.drop_table(&SystemNft).await;
-
-    // Только теперь — ассерты. Таблица уже снесена независимо от их исхода.
-    assert!(
-        !content.is_empty(),
-        "nft list table timed out or failed before cleanup — table state is unknown"
-    );
-    assert!(
-        !content_after_remove.is_empty(),
-        "nft list table timed out or failed after remove_dispatch — table state is unknown"
-    );
-    let queue_mentions = content.matches("queue num").count() + content.matches("queue to").count();
+    // Только теперь — ассерты. Цепочки уже сняты независимо от их исхода.
+    assert!(!content.is_empty(), "наших цепочек в mangle не видно");
+    let queue_rule = format!("-j NFQUEUE --queue-num {}", queue.get());
     assert_eq!(
-        queue_mentions, 2,
-        "ровно два правила должны ссылаться на очередь (postnat + prenat), \
-         независимо от 3 профилей в плане:\n{content}"
+        content.iter().filter(|l| l.contains(&queue_rule)).count(),
+        2,
+        "ровно две очереди (исходящая и SYN/ACK) независимо от 3 профилей:\n{content:#?}"
+    );
+    let to_q = format!("-j {PREFIX}_q");
+    assert_eq!(
+        content.iter().filter(|l| l.ends_with(&to_q)).count(),
+        ips.len(),
+        "правило диспетчеризации — по одному на IP цели:\n{content:#?}"
     );
     assert!(
-        content.contains(&format!("queue num {}", queue.get()))
-            || content.contains(&format!("queue to {}", queue.get())),
-        "table should dispatch to queue {}. Content:\n{content}",
-        queue.get(),
+        content
+            .iter()
+            .any(|l| l.contains("--connbytes 1:10") && l.ends_with(&to_q)),
+        "в очередь — только первые 10 пакетов соединения:\n{content:#?}"
     );
     assert!(
-        !content.contains("postnat_qmap") && !content.contains("prenat_qmap"),
-        "vmap-схемы больше не существует:\n{content}"
+        !content_after_remove.iter().any(|l| l.contains("NFQUEUE")),
+        "после remove_dispatch очередей нет:\n{content_after_remove:#?}"
     );
-    assert!(
-        !content_after_remove.contains("queue num") && !content_after_remove.contains("queue to"),
-        "queue directive should be gone after remove_dispatch:\n{content_after_remove}"
+    assert_eq!(
+        raw_before, raw_after,
+        "raw после уборки не совпал с исходным"
+    );
+    assert_eq!(
+        mangle_before, mangle_after,
+        "mangle после уборки не совпал с исходным"
     );
 }
 
@@ -307,15 +339,18 @@ async fn nfqws2_receives_marked_traffic() {
         return;
     }
 
-    const TABLE: &str = "zapret_test_nfqws2";
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
+
+    const PREFIX: &str = "bcwt3";
     let config = CoreConfig::default();
     let witness = probe_witness(&config);
     let queue = QueueNum::new(600);
     let ips = vec!["1.1.1.1".to_string()];
 
-    let table = nftables::prepare_table(&SystemNft, TABLE)
+    let table = rules::prepare_chains(&SystemIpt, PREFIX)
         .await
-        .expect("prepare_table");
+        .expect("prepare_chains");
 
     let strategy = vec!["--lua-desync=fake:ttl=1".to_string()];
     let env = config.nfqws2_env();
@@ -329,7 +364,7 @@ async fn nfqws2_receives_marked_traffic() {
         .await
         .expect("nfqws2 must bind the queue");
 
-    nftables::apply_dispatch(&SystemNft, &table, &ready, &plan.dispatch(80), &ips)
+    rules::apply_dispatch(&SystemIpt, &table, &ready, &plan.dispatch(80), &ips)
         .await
         .expect("apply_dispatch");
 
@@ -347,10 +382,10 @@ async fn nfqws2_receives_marked_traffic() {
 
     // Собрать факты ДО сноса — падение ассерта ниже не должно оставить на
     // стенде таблицу с правилом `queue to {queue}` без слушателя (см. тот же
-    // приём в `nft_dispatch_add_remove_rules_on_real_kernel`).
-    nftables::remove_dispatch(&SystemNft, &table).await;
+    // приём в `ipt_dispatch_add_remove_rules_on_real_kernel`).
+    rules::remove_dispatch(&SystemIpt, &table).await;
     SystemNfqws2::stop(instance).await;
-    let _ = table.drop_table(&SystemNft).await;
+    rules::drop_chains(&SystemIpt, &table.marker()).await;
 
     assert!(
         still_bound,
@@ -378,15 +413,18 @@ async fn autottl_prenat_captures_synack() {
         return;
     }
 
-    const TABLE: &str = "zapret_test_autottl";
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
+
+    const PREFIX: &str = "bcwt4";
     let config = CoreConfig::default();
     let witness = probe_witness(&config);
     let queue = QueueNum::new(700);
     let ips = vec!["1.1.1.1".to_string()];
 
-    let table = nftables::prepare_table(&SystemNft, TABLE)
+    let table = rules::prepare_chains(&SystemIpt, PREFIX)
         .await
-        .expect("prepare_table");
+        .expect("prepare_chains");
 
     let strategy = vec!["--lua-desync=fake:autottl=-2,3-20".to_string()];
     let env = config.nfqws2_env();
@@ -400,22 +438,19 @@ async fn autottl_prenat_captures_synack() {
         .await
         .expect("nfqws2 must bind the queue");
 
-    nftables::apply_dispatch(&SystemNft, &table, &ready, &plan.dispatch(443), &ips)
+    rules::apply_dispatch(&SystemIpt, &table, &ready, &plan.dispatch(443), &ips)
         .await
         .expect("apply_dispatch");
 
     // Verify prenat chain has the SYN/ACK dispatch rule.
     //
-    // Не `.expect`: `nft list` может отказать по таймауту в 5с на
+    // Не `.expect`: `iptables-save` может отказать по таймауту в 5с на
     // нагруженной машине, а `.expect` здесь паниковал бы ДО уборки ниже и
     // оставил бы на стенде правило `queue to {queue}` без слушателя — тот
     // же отказ, от которого уборка защищает, просто сдвинутый на шаг
     // раньше. Откат к пустой строке; что чтение не удалось, всё равно
     // валит тест — ассертом на непустоту после уборки.
-    let prenat_content = run_process(&["nft", "list", "chain", "inet", TABLE, "prenat"], 5000)
-        .await
-        .map(|r| r.stdout)
-        .unwrap_or_default();
+    let prenat_content = our_mangle_lines(PREFIX).await.join("\n");
 
     // Make a marked TLS connection
     let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
@@ -453,7 +488,7 @@ async fn autottl_prenat_captures_synack() {
         });
         eprintln!("conntrack output:\n{}", ct_result.stdout);
         if has_mark {
-            eprintln!("OK: conntrack entry has combined DESYNC|WORKER mark");
+            eprintln!("OK: conntrack entry has combined DESYNC|PROFILE mark");
         } else {
             eprintln!("WARNING: no conntrack entry with expected mark found");
         }
@@ -461,22 +496,30 @@ async fn autottl_prenat_captures_synack() {
 
     // Собрать факты ДО сноса — падение ассерта ниже не должно оставить на
     // стенде таблицу с правилом `queue to {queue}` без слушателя (тот же
-    // приём, что в `nft_dispatch_add_remove_rules_on_real_kernel`).
-    nftables::remove_dispatch(&SystemNft, &table).await;
+    // приём, что в `ipt_dispatch_add_remove_rules_on_real_kernel`).
+    rules::remove_dispatch(&SystemIpt, &table).await;
     SystemNfqws2::stop(instance).await;
-    let _ = table.drop_table(&SystemNft).await;
+    rules::drop_chains(&SystemIpt, &table.marker()).await;
 
     assert!(
         !prenat_content.is_empty(),
-        "nft list chain prenat timed out or failed before cleanup — chain state is unknown"
+        "iptables-save не показал наших цепочек до уборки — состояние неизвестно"
     );
     assert!(
-        prenat_content.contains("syn") || prenat_content.contains("flags"),
-        "prenat chain should have SYN/ACK matching rule. Content:\n{prenat_content}"
+        prenat_content
+            .lines()
+            .any(|l| l.starts_with(&format!("-A {PREFIX}_pre"))
+                && l.contains("--tcp-flags SYN,ACK SYN,ACK")
+                && l.ends_with(&format!("-j {PREFIX}_qin"))),
+        "pre должна вести SYN/ACK наших соединений в очередь. Content:\n{prenat_content}"
     );
     assert!(
-        prenat_content.contains("queue"),
-        "prenat chain should dispatch to a queue. Content:\n{prenat_content}"
+        prenat_content.contains(&format!(
+            "-A {PREFIX}_qin -j NFQUEUE --queue-num {}",
+            queue.get()
+        )),
+        "qin должна отдавать в очередь {}. Content:\n{prenat_content}",
+        queue.get()
     );
     assert!(
         still_bound,
@@ -549,7 +592,10 @@ async fn the_mask_is_not_forgotten_and_profiles_are_selective() {
         return;
     }
 
-    const TABLE: &str = "zapret_test_mask";
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
+
+    const PREFIX: &str = "bcwt4b";
     const TARGET_IP: &str = "1.0.0.1";
     let config = CoreConfig::default();
     let witness = probe_witness(&config);
@@ -577,13 +623,13 @@ async fn the_mask_is_not_forgotten_and_profiles_are_selective() {
     let mark1 = plan.profiles()[0].mark;
     let mark2 = plan.profiles()[1].mark;
 
-    let table = nftables::prepare_table(&SystemNft, TABLE)
+    let table = rules::prepare_chains(&SystemIpt, PREFIX)
         .await
-        .expect("prepare_table");
+        .expect("prepare_chains");
 
     // M3: от старта процесса и дальше — любой отказ обязан пройти через
     // уборку ПЕРЕД паникой, а не после. `start`/`wait_ready` сами по себе не
-    // ставят nft-правил (это делает только `apply_dispatch` ниже), но живой
+    // ставят правил iptables (это делает только `apply_dispatch` ниже), но живой
     // процесс на очереди `queue` — тоже ресурс, который нельзя бросать: без
     // явной уборки он пережил бы панику (`Instance`/`BackgroundProcess`
     // используют `kill_on_drop`, так что технически не осиротеет, но это
@@ -593,7 +639,7 @@ async fn the_mask_is_not_forgotten_and_profiles_are_selective() {
     let mut instance = match SystemNfqws2::start(&env, &plan).await {
         Ok(i) => i,
         Err(e) => {
-            let _ = table.drop_table(&SystemNft).await;
+            rules::drop_chains(&SystemIpt, &table.marker()).await;
             panic!("start nfqws2: {e}");
         }
     };
@@ -602,16 +648,16 @@ async fn the_mask_is_not_forgotten_and_profiles_are_selective() {
         Ok(r) => r,
         Err(e) => {
             SystemNfqws2::stop(instance).await;
-            let _ = table.drop_table(&SystemNft).await;
+            rules::drop_chains(&SystemIpt, &table.marker()).await;
             panic!("nfqws2 must bind the queue: {e}");
         }
     };
 
     if let Err(e) =
-        nftables::apply_dispatch(&SystemNft, &table, &ready, &plan.dispatch(443), &ips).await
+        rules::apply_dispatch(&SystemIpt, &table, &ready, &plan.dispatch(443), &ips).await
     {
         SystemNfqws2::stop(instance).await;
-        let _ = table.drop_table(&SystemNft).await;
+        rules::drop_chains(&SystemIpt, &table.marker()).await;
         panic!("apply_dispatch: {e}");
     }
 
@@ -665,9 +711,9 @@ async fn the_mask_is_not_forgotten_and_profiles_are_selective() {
 
     let still_bound = queue_still_bound(queue);
 
-    nftables::remove_dispatch(&SystemNft, &table).await;
+    rules::remove_dispatch(&SystemIpt, &table).await;
     SystemNfqws2::stop(instance).await;
-    let _ = table.drop_table(&SystemNft).await;
+    rules::drop_chains(&SystemIpt, &table.marker()).await;
     let _ = std::fs::remove_file(&log_path);
 
     // Только теперь — ассерты. Стенд уже прибран независимо от их исхода.
@@ -886,82 +932,199 @@ async fn capturing_probe_keeps_partial_on_stall() {
     server.abort();
 }
 
-// ── Test 7: чужая nft-таблица переживает наш цикл ────────────────────────────
+// ── Test 7: чужая цепочка с очередью переживает наш цикл ────────────────────
 
-/// Существует ли таблица `inet <name>`.
-async fn nft_table_exists(name: &str) -> bool {
-    run_process(&["nft", "list", "table", "inet", name], 5000)
+/// Строки `iptables -S` встроенной цепочки `chain` таблицы mangle.
+async fn mangle_chain_rules(chain: &str) -> Vec<String> {
+    run_process(&["iptables", "-w", "-t", "mangle", "-S", chain], 5000)
         .await
-        .map(|r| r.exit_code == 0)
-        .unwrap_or(false)
+        .map(|r| {
+            r.stdout
+                .lines()
+                .filter(|l| l.starts_with("-A "))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// issue #66: имя нашей таблицы совпадало с таблицей zapret1, и наш cleanup
-/// сносил чужую рабочую конфигурацию.
+async fn ipt(args: &[&str]) -> i32 {
+    let mut argv = vec!["iptables", "-w", "-t", "mangle"];
+    argv.extend_from_slice(args);
+    run_process(&argv, 5000)
+        .await
+        .map(|r| r.exit_code)
+        .unwrap_or(-1)
+}
+
+/// Наш цикл не смеет задеть чужой обход: модуль nfqws2-android держит в mangle свои
+/// цепочки с очередью, и уборка обязана снимать ровно свои цепочки, а пока они стоят —
+/// наш переход обязан быть первым.
 #[tokio::test]
-async fn foreign_zapret1_table_survives_our_cleanup() {
+async fn foreign_nfqueue_chain_survives_our_cleanup() {
     if !is_root() {
         eprintln!("SKIPPED: requires root");
         return;
     }
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
 
-    const FOREIGN: &str = "zapret";
+    const FOREIGN: &str = "nfqws_post";
+    const PREFIX: &str = "bcwt7";
 
-    // Имитация работающего zapret1: очередь на 80/443 в таблице "zapret"
-    run_process(&["nft", "delete", "table", "inet", FOREIGN], 5000)
-        .await
-        .ok();
+    // Имитация работающего обхода: своя цепочка с очередью, переход из POSTROUTING.
+    ipt(&["-D", "POSTROUTING", "-j", FOREIGN]).await;
+    ipt(&["-F", FOREIGN]).await;
+    ipt(&["-X", FOREIGN]).await;
     for args in [
-        vec!["nft", "add", "table", "inet", FOREIGN],
-        vec![
-            "nft",
-            "add",
-            "chain",
-            "inet",
+        &["-N", FOREIGN][..],
+        &[
+            "-A",
             FOREIGN,
-            "postrouting",
-            "{ type filter hook postrouting priority 101; }",
-        ],
-        vec![
-            "nft",
-            "add",
-            "rule",
-            "inet",
-            FOREIGN,
-            "postrouting",
-            "meta l4proto tcp tcp dport { 80, 443 } queue num 200 bypass",
-        ],
+            "-p",
+            "tcp",
+            "-m",
+            "multiport",
+            "--dports",
+            "80,443",
+            "-j",
+            "NFQUEUE",
+            "--queue-num",
+            "300",
+            "--queue-bypass",
+        ][..],
+        &["-I", "POSTROUTING", "1", "-j", FOREIGN][..],
     ] {
-        let r = run_process(&args, 5000).await.expect("nft setup");
-        assert_eq!(r.exit_code, 0, "setup failed: {args:?}\n{}", r.stderr);
+        assert_eq!(ipt(args).await, 0, "фикстура не создалась: {args:?}");
     }
-    assert!(
-        nft_table_exists(FOREIGN).await,
-        "фикстура zapret1 не создалась"
-    );
 
-    // Полный цикл blockcheckw: `prepare_table` сама подбирает остатки
-    // прошлого прогона одной транзакцией (см. её doc-комментарий в
-    // `src/firewall/nftables.rs`) — отдельный снос перед созданием больше не
-    // нужен, в этом и разница со старой трёхшаговой схемой. `drop_table` по
-    // метке — ровно то, что зовут аварийные обработчики (`cmd/mod.rs`,
-    // `cmd/scan.rs`), а не отдельная тестовая имитация.
-    let table = nftables::prepare_table(&SystemNft, DEFAULT_NFT_TABLE)
+    let chains = rules::prepare_chains(&SystemIpt, PREFIX)
         .await
-        .expect("prepare_table");
-    nftables::drop_table(&SystemNft, &table.marker()).await;
+        .expect("prepare_chains");
+    let post_while_ours = mangle_chain_rules("POSTROUTING").await;
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
 
-    let foreign_alive = nft_table_exists(FOREIGN).await;
-    let own_gone = !nft_table_exists(DEFAULT_NFT_TABLE).await;
-
-    // Убираем фикстуру до ассертов, чтобы падение теста не оставило мусор
-    run_process(&["nft", "delete", "table", "inet", FOREIGN], 5000)
+    let post_after = mangle_chain_rules("POSTROUTING").await;
+    let foreign_rules = run_process(&["iptables", "-w", "-t", "mangle", "-S", FOREIGN], 5000)
         .await
-        .ok();
+        .map(|r| r.stdout)
+        .unwrap_or_default();
+    let ours_left = our_mangle_lines(PREFIX).await;
 
-    assert!(
-        foreign_alive,
-        "таблица zapret1 '{FOREIGN}' снесена нашим cleanup (наша таблица: '{DEFAULT_NFT_TABLE}')"
+    // Фикстура убирается до ассертов.
+    ipt(&["-D", "POSTROUTING", "-j", FOREIGN]).await;
+    ipt(&["-F", FOREIGN]).await;
+    ipt(&["-X", FOREIGN]).await;
+
+    assert_eq!(
+        post_while_ours.first().map(String::as_str),
+        Some(format!("-A POSTROUTING -j {PREFIX}_post").as_str()),
+        "пока наши цепочки стоят, наш переход — первый:\n{post_while_ours:#?}"
     );
-    assert!(own_gone, "наша таблица '{DEFAULT_NFT_TABLE}' не убрана");
+    assert!(
+        post_after.contains(&format!("-A POSTROUTING -j {FOREIGN}")),
+        "переход в чужую цепочку снят нашей уборкой:\n{post_after:#?}"
+    );
+    assert!(
+        foreign_rules.contains("NFQUEUE --queue-num 300"),
+        "чужая цепочка задета нашей уборкой:\n{foreign_rules}"
+    );
+    assert!(
+        ours_left.is_empty(),
+        "наши цепочки не убраны:\n{ours_left:#?}"
+    );
+}
+
+// ── Test 8: контрольная проба минует чужие цепочки ──────────────────────────
+
+/// Пакетов, засчитанных первым правилом цепочки `chain` таблицы mangle.
+async fn first_rule_packets(chain: &str) -> Option<u64> {
+    let out = run_process(
+        &[
+            "iptables", "-w", "-t", "mangle", "-L", chain, "-v", "-x", "-n",
+        ],
+        5000,
+    )
+    .await
+    .ok()?;
+    // Две строки заголовка, затем правила: первый столбец — пакеты.
+    out.stdout
+        .lines()
+        .nth(2)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Изоляция (спека §4): контроль без десинка несёт метку `CONTROL` и обязан пройти МИМО
+/// цепочек модуля обхода — иначе обход пользователя «вылечит» контроль, и прогон объявит
+/// домен незаблокированным. Чужая цепочка стоит в `mangle OUTPUT` после нашего перехода и
+/// считает пакеты на порт слушателя: помеченное соединение её не задевает, непомеченное —
+/// задевает (вторая половина — доказательство, что счётчик вообще работает).
+#[tokio::test]
+async fn control_probe_skips_foreign_chain() {
+    if !is_root() {
+        eprintln!("SKIPPED: requires root");
+        return;
+    }
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
+
+    const FOREIGN: &str = "foreign_cnt";
+    const PREFIX: &str = "bcwt8";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            if listener.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let port_s = port.to_string();
+
+    ipt(&["-D", "OUTPUT", "-j", FOREIGN]).await;
+    ipt(&["-F", FOREIGN]).await;
+    ipt(&["-X", FOREIGN]).await;
+    for args in [
+        &["-N", FOREIGN][..],
+        &[
+            "-A", FOREIGN, "-p", "tcp", "--dport", &port_s, "-j", "RETURN",
+        ][..],
+        &["-A", "OUTPUT", "-j", FOREIGN][..],
+    ] {
+        assert_eq!(ipt(args).await, 0, "фикстура не создалась: {args:?}");
+    }
+
+    let chains = rules::prepare_chains(&SystemIpt, PREFIX)
+        .await
+        .expect("prepare_chains");
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let marked = http_client::marked_tcp_connect(addr, control_mark()).await;
+    let after_marked = first_rule_packets(FOREIGN).await;
+    drop(marked);
+    let plain = http_client::marked_tcp_connect(addr, 0).await;
+    let after_plain = first_rule_packets(FOREIGN).await;
+    drop(plain);
+
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
+    ipt(&["-D", "OUTPUT", "-j", FOREIGN]).await;
+    ipt(&["-F", FOREIGN]).await;
+    ipt(&["-X", FOREIGN]).await;
+    server.abort();
+
+    assert_eq!(
+        after_marked,
+        Some(0),
+        "помеченный контроль (0x{:08X}) прошёл через чужую цепочку",
+        control_mark()
+    );
+    assert!(
+        after_plain.unwrap_or(0) > 0,
+        "непомеченное соединение не засчитано чужой цепочкой — счётчик ничего не доказывает \
+         ({after_plain:?})"
+    );
 }
