@@ -256,6 +256,10 @@ enum Command {
         from_file: Option<String>,
     },
 
+    /// Проверить устройство перед первым прогоном: root, ядро, iptables, nfqws2, маршрут
+    /// помеченных сокетов, DoH, соседи. JSON в stdout, таблица в stderr. Ничего не меняет.
+    Doctor,
+
     /// Show zapret2 effectiveness: compare access with and without the service
     Status {
         /// Path to file with blocked domains (one per line)
@@ -484,6 +488,12 @@ async fn main() {
     );
     // На Android маршрута «через шлюз» нет: netd решает маршрут по правилам fwmark,
     // и `ip route add` в основную таблицу ничего не меняет. Поэтому `--via` убран.
+
+    // `doctor` сам проверяет root и отчитывается о нём — поднимать права до него незачем,
+    // а замок, преflight и память прогона ему не нужны.
+    if matches!(cli.command, Some(Command::Doctor)) {
+        cmd::doctor::run_doctor_cmd().await;
+    }
 
     blockcheckw::system::elevate::require_root();
     blockcheckw::system::elevate::raise_nofile_limit();
@@ -869,6 +879,7 @@ async fn main() {
                 })
                 .await;
             }
+            Some(Command::Doctor) => unreachable!("doctor обрабатывается до elevation"),
             None => unreachable!("справка без команды печатается до elevation"),
         }
     }

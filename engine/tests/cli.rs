@@ -82,3 +82,11 @@ fn removed_flags_are_rejected() {
     assert!(ok, "--version обязан работать:\n{output}");
     assert!(output.contains(env!("CARGO_PKG_VERSION")), "{output}");
 }
+
+/// `doctor` — проверка устройства перед первым прогоном; справка не требует root.
+#[test]
+fn doctor_subcommand_exists() {
+    let (output, ok) = run(&["doctor", "--help"]);
+    assert!(ok, "doctor --help обязан работать:\n{output}");
+    assert!(output.contains("Usage:"), "{output}");
+}
