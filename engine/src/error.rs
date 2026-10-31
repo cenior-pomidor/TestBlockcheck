@@ -5,6 +5,9 @@ pub enum BlockcheckError {
     #[error("nftables command failed: {command}\nstderr: {stderr}")]
     Nftables { command: String, stderr: String },
 
+    #[error("iptables command failed: {command}\nstderr: {stderr}")]
+    Iptables { command: String, stderr: String },
+
     #[error("nfqws2 start failed: {reason}")]
     Nfqws2Start { reason: String },
 
