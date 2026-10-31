@@ -63,3 +63,22 @@ fn embedded_flag_is_gone() {
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("--embedded"));
 }
+
+/// На Android не нужны: маршрут через шлюз (policy routing), самообновление (модуль
+/// обновляется менеджером), автодополнение shell.
+#[test]
+fn removed_flags_are_rejected() {
+    for args in [
+        &["--via", "1.2.3.4", "status", "--domain-list", "x"][..],
+        &["--upgrade"][..],
+        &["completions", "bash"][..],
+        &["scan", "--alive-via", "socks5://h:1"][..],
+    ] {
+        let (output, ok) = run(args);
+        assert!(!ok, "{args:?} должен отвергаться:\n{output}");
+        assert!(output.contains("error:"), "{args:?}:\n{output}");
+    }
+    let (output, ok) = run(&["--version"]);
+    assert!(ok, "--version обязан работать:\n{output}");
+    assert!(output.contains(env!("CARGO_PKG_VERSION")), "{output}");
+}

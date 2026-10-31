@@ -23,10 +23,7 @@ use blockcheckw::ui;
 
 use tracing::{info_span, Instrument};
 
-use super::{
-    handle_bypass_conflicts, restore_service, set_scan_progress, set_stopped_service,
-    spawn_cleanup_handler, ScanProgress,
-};
+use super::{handle_bypass_conflicts, set_scan_progress, spawn_cleanup_handler, ScanProgress};
 
 /// Timeout for the throttle data probe. Generous so a slow-but-honest link
 /// isn't mislabelled as throttled — a real DPI cap stalls near-zero well within.
@@ -194,17 +191,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
     }
 
     // 1c. Check for conflicting DPI bypass processes
-    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &screen).await {
-        Ok(result) => result,
-        Err(()) => std::process::exit(1),
-    };
-    let stopped_service = match stopped {
-        Some(mgr) => {
-            set_stopped_service(&cleanup, mgr.clone()).await;
-            Some(mgr)
-        }
-        None => None,
-    };
+    handle_bypass_conflicts(&config.chain_prefix, &screen).await;
 
     // 2. Baseline per protocol
     screen.newline();
@@ -282,12 +269,9 @@ pub async fn run_scan(params: ScanParams<'_>) {
             run: RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
         });
         super::print_stdout_graceful(&scan_json, &screen);
-        // Restore routes + zapret2 before early return
+        // Restore routes before early return
         if let Some(v) = via {
             v.cleanup().await;
-        }
-        if let Some(ref mgr) = stopped_service {
-            restore_service(mgr, &screen).await;
         }
         // Легитимный исход «ничего не заблокировано» — пишем found=0, иначе
         // span bcw.scan уходит без поля и неотличим от обрыва инструментации.
@@ -621,12 +605,9 @@ pub async fn run_scan(params: ScanParams<'_>) {
 
     screen.finish_info();
 
-    // Cleanup routes + restore zapret2
+    // Cleanup routes
     if let Some(v) = via {
         v.cleanup().await;
-    }
-    if let Some(ref mgr) = stopped_service {
-        restore_service(mgr, &screen).await;
     }
 }
 

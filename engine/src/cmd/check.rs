@@ -11,7 +11,7 @@ use blockcheckw::pipeline::{check, reference};
 use blockcheckw::strategy::{generator, rank};
 use blockcheckw::ui;
 
-use super::{handle_bypass_conflicts, restore_service, set_stopped_service, spawn_cleanup_handler};
+use super::{handle_bypass_conflicts, spawn_cleanup_handler};
 
 pub struct CheckParams<'a> {
     pub domain: &'a str,
@@ -76,7 +76,7 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
         ..CoreConfig::default()
     });
 
-    let cleanup = spawn_cleanup_handler(&config.chain_prefix);
+    let _cleanup = spawn_cleanup_handler(&config.chain_prefix);
 
     let mut screen = ui::Console::new();
 
@@ -217,17 +217,7 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
     }
 
     // Check for conflicts
-    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &screen).await {
-        Ok(result) => result,
-        Err(()) => std::process::exit(1),
-    };
-    let stopped_service = match stopped {
-        Some(mgr) => {
-            set_stopped_service(&cleanup, mgr.clone()).await;
-            Some(mgr)
-        }
-        None => None,
-    };
+    handle_bypass_conflicts(&config.chain_prefix, &screen).await;
 
     // Run check
     screen.newline();
@@ -347,12 +337,9 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
     }
     screen.newline();
 
-    // Cleanup routes + restore zapret2
+    // Cleanup routes
     if let Some(v) = via {
         v.cleanup().await;
-    }
-    if let Some(ref mgr) = stopped_service {
-        restore_service(mgr, &screen).await;
     }
 }
 

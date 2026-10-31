@@ -5,5 +5,4 @@ pub mod http_client;
 pub mod isp;
 pub mod patience;
 pub mod reachability;
-pub mod update_check;
 pub mod via;

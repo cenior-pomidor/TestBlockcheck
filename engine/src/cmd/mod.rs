@@ -1,6 +1,5 @@
 pub mod benchmark;
 pub mod check;
-pub mod completions;
 pub mod scan;
 pub mod status;
 pub mod universal;
@@ -27,88 +26,6 @@ pub fn print_stdout_graceful(data: &str, con: &blockcheckw::ui::Console) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
         Err(e) => con.error(&format!("stdout write error: {e}")),
-    }
-}
-
-// ── Zapret2 service management ──────────────────────────────────────────────
-
-/// How zapret2 service is managed on this system.
-// Временно: управление службой снимается целиком в Task 7.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum ServiceManager {
-    /// systemd: `systemctl stop/start zapret2`
-    Systemd { unit: String },
-    /// OpenWrt / sysv init: `/etc/init.d/zapret2 stop/start`
-    InitD { script: String },
-}
-
-impl std::fmt::Display for ServiceManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServiceManager::Systemd { unit } => write!(f, "systemd ({unit})"),
-            ServiceManager::InitD { script } => write!(f, "init.d ({script})"),
-        }
-    }
-}
-
-/// Detect how zapret2 is managed. Returns None if no service found.
-#[allow(dead_code)] // Task 7
-pub async fn detect_service_manager() -> Option<ServiceManager> {
-    use blockcheckw::system::process::run_process;
-
-    // Check systemd first (most common on desktop/server Linux)
-    if let Ok(result) = run_process(&["systemctl", "is-active", "zapret2"], 3_000).await {
-        // is-active returns 0 for "active", 3 for "inactive", etc.
-        // Any successful execution means systemd is present and knows the unit
-        if result.exit_code == 0 || result.stdout.trim() == "inactive" {
-            return Some(ServiceManager::Systemd {
-                unit: "zapret2".to_string(),
-            });
-        }
-    }
-
-    // Check OpenWrt / sysv init.d
-    let script = "/etc/init.d/zapret2";
-    if std::path::Path::new(script).exists() {
-        return Some(ServiceManager::InitD {
-            script: script.to_string(),
-        });
-    }
-
-    None
-}
-
-/// Stop zapret2 service. Returns true on success.
-#[allow(dead_code)] // Task 7
-pub async fn stop_service(mgr: &ServiceManager) -> bool {
-    use blockcheckw::system::process::run_process;
-
-    let result = match mgr {
-        ServiceManager::Systemd { unit } => run_process(&["systemctl", "stop", unit], 10_000).await,
-        ServiceManager::InitD { script } => run_process(&[script, "stop"], 10_000).await,
-    };
-
-    match result {
-        Ok(r) => r.exit_code == 0,
-        Err(_) => false,
-    }
-}
-
-/// Start zapret2 service. Returns true on success.
-pub async fn start_service(mgr: &ServiceManager) -> bool {
-    use blockcheckw::system::process::run_process;
-
-    let result = match mgr {
-        ServiceManager::Systemd { unit } => {
-            run_process(&["systemctl", "start", unit], 10_000).await
-        }
-        ServiceManager::InitD { script } => run_process(&[script, "start"], 10_000).await,
-    };
-
-    match result {
-        Ok(r) => r.exit_code == 0,
-        Err(_) => false,
     }
 }
 
@@ -179,11 +96,8 @@ pub async fn detect_bypass_conflicts(own_prefix: &str) -> BypassConflicts {
 /// Сказать о соседях: в консоль и машинно (`neighbours`). Наши пробы идут мимо их цепочек
 /// (изоляция по метке), но человеку и продукту полезно знать, что рядом работает обход.
 ///
-/// Тип возврата сохранён для вызывающих: службу на Android мы не останавливаем никогда.
-pub async fn handle_bypass_conflicts(
-    own_prefix: &str,
-    con: &blockcheckw::ui::Console,
-) -> Result<Option<ServiceManager>, ()> {
+/// Службу обхода на Android мы не останавливаем никогда.
+pub async fn handle_bypass_conflicts(own_prefix: &str, con: &blockcheckw::ui::Console) {
     let conflicts = detect_bypass_conflicts(own_prefix).await;
     if !conflicts.is_empty() {
         con.warn(&format!(
@@ -201,18 +115,16 @@ pub async fn handle_bypass_conflicts(
             conflicts.has_nfqws2_processes,
         );
     }
-    Ok(None)
 }
 
 // ── Shared cleanup state ────────────────────────────────────────────────────
 
-/// Shared state for Ctrl+C handler: our iptables chains to drop + optional service to restart.
+/// Shared state for Ctrl+C handler: our iptables chains to drop.
 pub type CleanupState = Arc<Mutex<CleanupInfo>>;
 
 pub struct CleanupInfo {
     /// Метка НАШИХ цепочек: единственное, что аварийные пути вправе снести.
     pub chains: OwnedChainsMarker,
-    pub stopped_service: Option<ServiceManager>,
     /// Strategies found so far, so a Ctrl+C / SIGTERM mid-scan still writes them.
     pub scan_progress: Option<ScanProgressState>,
 }
@@ -222,17 +134,6 @@ fn emergency_cleanup_sync(info: &CleanupInfo) {
     // sent to an unbound NFQUEUE during emergency shutdown.
     blockcheckw::firewall::rules::drop_chains_sync(&SystemIptSync, &info.chains);
     blockcheckw::system::process::start_kill_all_background_processes();
-
-    if let Some(ref mgr) = info.stopped_service {
-        let _ = match mgr {
-            ServiceManager::Systemd { unit } => std::process::Command::new("systemctl")
-                .args(["start", unit])
-                .status(),
-            ServiceManager::InitD { script } => {
-                std::process::Command::new(script).arg("start").status()
-            }
-        };
-    }
 }
 
 // ── Scan progress (interrupt-safe result accumulator) ────────────────────────
@@ -382,17 +283,14 @@ mod scan_progress_tests {
 }
 
 /// Create shared cleanup state and spawn signal handlers (SIGINT + SIGTERM) that will:
-/// 1. Drop our iptables chains
-/// 2. Restart zapret2 service if we stopped it
+/// drop our iptables chains and kill our engines.
 pub fn spawn_cleanup_handler(chain_prefix: &str) -> CleanupState {
     let state = Arc::new(Mutex::new(CleanupInfo {
         chains: OwnedChainsMarker::planned(chain_prefix),
-        stopped_service: None,
         scan_progress: None,
     }));
 
-    // Panic hook: restore zapret2 synchronously if we crash.
-    // We can't use async here, so we shell out directly.
+    // Panic hook: drop our chains synchronously if we crash.
     let panic_state = state.clone();
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -400,12 +298,6 @@ pub fn spawn_cleanup_handler(chain_prefix: &str) -> CleanupState {
         blockcheckw::network::via::Via::cleanup_sync();
         if let Ok(guard) = panic_state.try_lock() {
             emergency_cleanup_sync(&guard);
-            if guard.stopped_service.is_some() {
-                eprintln!(
-                    "\n  {} zapret2 restored after panic",
-                    style("OK").green().bold(),
-                );
-            }
         }
         prev_hook(info);
     }));
@@ -477,21 +369,8 @@ async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i3
     // With queue rules gone, explicitly kill and reap every child we spawned.
     // process::exit below skips destructors, so kill_on_drop alone is not enough.
     blockcheckw::system::process::kill_all_background_processes().await;
-    if let Some(ref mgr) = info.stopped_service {
-        if start_service(mgr).await {
-            eprintln!(
-                "  {} zapret2 restarted via {mgr}",
-                style("OK").green().bold(),
-            );
-        } else {
-            eprintln!(
-                "  {}failed to restart zapret2 via {mgr}, please start manually",
-                WARN,
-            );
-        }
-    }
     // Persist partial results only after network state is safe. A second Ctrl+C
-    // may skip the report, but must never leave queue rules or zapret2 altered.
+    // may skip the report, but must never leave queue rules behind.
     if let Some(progress) = &info.scan_progress {
         let (domain, output, block_type, dns_spoofed, blocked, summary) = {
             let p = progress.lock().unwrap();
@@ -526,29 +405,10 @@ async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i3
     std::process::exit(exit_code);
 }
 
-/// Record that we stopped a service, so Ctrl+C handler can restart it.
-pub async fn set_stopped_service(state: &CleanupState, mgr: ServiceManager) {
-    state.lock().await.stopped_service = Some(mgr);
-}
-
 /// Register the scan's result accumulator so the signal handler can write a
 /// report from whatever was found if the scan is interrupted.
 pub async fn set_scan_progress(state: &CleanupState, progress: ScanProgressState) {
     state.lock().await.scan_progress = Some(progress);
-}
-
-/// Поднять zapret2 обратно. Своих nft-правил он не теряет: init-скрипт
-/// применяет их на `start` ровно так же, как снимал на `stop` (#66).
-pub async fn restore_service(mgr: &ServiceManager, con: &blockcheckw::ui::Console) {
-    con.newline();
-    con.section("Restoring zapret2");
-    if start_service(mgr).await {
-        con.ok(&format!("zapret2 restarted via {mgr}"));
-    } else {
-        con.warn(&format!(
-            "failed to restart zapret2 via {mgr}, please start manually"
-        ));
-    }
 }
 
 // ── Instance lock ───────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ use blockcheckw::pipeline::worker_task::HttpTestMode;
 use blockcheckw::strategy::generator;
 use blockcheckw::ui;
 
-use super::{handle_bypass_conflicts, restore_service, set_stopped_service, spawn_cleanup_handler};
+use super::{handle_bypass_conflicts, spawn_cleanup_handler};
 
 /// Load domain list from file, filtering out invalid entries.
 fn load_domain_list(path: &str) -> Result<Vec<String>, String> {
@@ -69,7 +69,7 @@ pub async fn run_universal(
 ) {
     let config = Arc::new(universal_core_config(workers, profiles_per_instance));
 
-    let cleanup = spawn_cleanup_handler(&config.chain_prefix);
+    let _cleanup = spawn_cleanup_handler(&config.chain_prefix);
 
     let mut screen = ui::Console::new();
 
@@ -98,17 +98,7 @@ pub async fn run_universal(
     }
 
     // Check for conflicts
-    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &screen).await {
-        Ok(result) => result,
-        Err(()) => std::process::exit(1),
-    };
-    let stopped_service = match stopped {
-        Some(mgr) => {
-            set_stopped_service(&cleanup, mgr.clone()).await;
-            Some(mgr)
-        }
-        None => None,
-    };
+    handle_bypass_conflicts(&config.chain_prefix, &screen).await;
 
     // Shuffle domain list for random sampling
     let candidates = shuffle(&all_domains);
@@ -346,12 +336,9 @@ pub async fn run_universal(
         ));
     }
 
-    // Cleanup routes + restore zapret2
+    // Cleanup routes
     if let Some(v) = via {
         v.cleanup().await;
-    }
-    if let Some(ref mgr) = stopped_service {
-        restore_service(mgr, &screen).await;
     }
 }
 

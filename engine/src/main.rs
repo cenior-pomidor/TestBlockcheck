@@ -51,13 +51,9 @@ Per-command flags (timeouts, DNS mode, passes, worker count):
     styles = help_styles(),
 )]
 struct Cli {
-    /// Print version and check for updates
+    /// Print version
     #[arg(short = 'V', long)]
     version: bool,
-
-    /// Upgrade to the latest release
-    #[arg(long)]
-    upgrade: bool,
 
     /// Number of parallel workers
     #[arg(short, long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=254))]
@@ -66,10 +62,6 @@ struct Cli {
     /// How many strategies to keep loaded in one nfqws2 process at a time (ceiling 254)
     #[arg(long, default_value_t = 254)]
     profiles_per_instance: usize,
-
-    /// Route traffic through a gateway or proxy (e.g. 100.64.0.5, localhost:8888, socks5://host:1080)
-    #[arg(long, global = true)]
-    via: Option<String>,
 
     /// Путь к nfqws2 (умолчание /data/adb/modules/nfqws2-android/bin/nfqws2).
     #[arg(long, global = true, value_name = "PATH")]
@@ -140,17 +132,6 @@ enum Command {
         /// Raw output: table only, no recommendation (for scripts)
         #[arg(long)]
         raw: bool,
-    },
-
-    /// Generate shell completions (prints to stdout, or installs with --install)
-    Completions {
-        /// Shell to generate completions for (auto-detected if omitted)
-        #[arg(value_enum)]
-        shell: Option<clap_complete::Shell>,
-
-        /// Install completions into the appropriate system directory
-        #[arg(long)]
-        install: bool,
     },
 
     /// Check strategies from a vanilla report with real data transfer.
@@ -268,13 +249,6 @@ enum Command {
         /// Load strategies from file instead of using built-in corpus
         #[arg(long)]
         from_file: Option<String>,
-
-        /// Verify aliveness of IP-blocked hosts through this egress ONLY (does NOT
-        /// route the scan). When the direct SYN is dropped, a probe through this
-        /// proxy splits the verdict into SYN-blocked (host alive elsewhere) vs
-        /// host-dead. Same endpoint format as --via (e.g. socks5://host:1080).
-        #[arg(long)]
-        alive_via: Option<String>,
     },
 
     /// Show zapret2 effectiveness: compare access with and without the service
@@ -428,34 +402,9 @@ async fn main() {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    // --version: print version + check for updates (no root needed)
+    // --version: только версия. Обновления на Android приходят модулем через менеджер.
     if cli.version {
-        print_version_and_check().await;
-        return;
-    }
-
-    // --upgrade: download and install latest release (no root needed)
-    if cli.upgrade {
-        run_upgrade().await;
-        return;
-    }
-
-    // Completions don't need root — handle before elevation
-    if let Some(Command::Completions { shell, install }) = &cli.command {
-        let shell = shell.unwrap_or_else(|| {
-            cmd::completions::detect_shell().unwrap_or_else(|| {
-                eprintln!(
-                    "Could not detect shell. Specify it explicitly: blockcheckw completions bash"
-                );
-                std::process::exit(1);
-            })
-        });
-
-        if *install {
-            cmd::completions::install_completions(shell, &mut Cli::command());
-        } else {
-            cmd::completions::generate_completions(shell, &mut Cli::command());
-        }
+        println!("bcw v{}", env!("CARGO_PKG_VERSION"));
         return;
     }
 
@@ -515,29 +464,8 @@ async fn main() {
             .unwrap_or(blockcheckw::config::DEFAULT_CHAIN_PREFIX),
         cli.smoke_qnum_base.unwrap_or(65_526),
     );
-    let via = cli.via.map(|raw| {
-        blockcheckw::network::via::Via::parse(&raw).unwrap_or_else(|e| {
-            eprintln!("ERROR: --via: {e}");
-            std::process::exit(1);
-        })
-    });
-
-    // --via и --reference-via несовместимы: весь прогон уже идёт через шлюз (--via),
-    // и «чистый egress» через второй шлюз ничего не доказывает, а маршруты подерутся.
-    // Проверяем до всякой работы — раньше require_root() и прочих побочных эффектов.
-    if via.is_some() {
-        if let Some(Command::Check {
-            reference_via: Some(_),
-            ..
-        }) = &cli.command
-        {
-            eprintln!(
-                "ERROR: --via и --reference-via несовместимы: весь прогон уже идёт через \
-                 шлюз, эталон через второй шлюз ничего не доказывает"
-            );
-            std::process::exit(1);
-        }
-    }
+    // На Android маршрута «через шлюз» нет: netd решает маршрут по правилам fwmark,
+    // и `ip route add` в основную таблицу ничего не меняет. Поэтому `--via` убран.
 
     blockcheckw::system::elevate::require_root();
     blockcheckw::system::elevate::raise_nofile_limit();
@@ -750,10 +678,19 @@ async fn main() {
                 let dns_mode = dns_mode_of(&eff_dns, embedded);
 
                 let reference_via = reference_via.map(|raw| {
-                    blockcheckw::network::via::Via::parse(&raw).unwrap_or_else(|e| {
+                    let v = blockcheckw::network::via::Via::parse(&raw).unwrap_or_else(|e| {
                         eprintln!("ERROR: --reference-via: {e}");
                         std::process::exit(1);
-                    })
+                    });
+                    // Шлюз означал бы `ip route add`, а маршрутом на Android правит netd.
+                    if !v.is_proxy() {
+                        eprintln!(
+                            "ERROR: --reference-via на Android — только прокси \
+                             (socks5://host:port или host:port)"
+                        );
+                        std::process::exit(1);
+                    }
+                    v
                 });
 
                 cmd::check::run_check_cmd(cmd::check::CheckParams {
@@ -766,7 +703,7 @@ async fn main() {
                     deadline_secs: deadline,
                     passes,
                     output: output.as_deref(),
-                    via: via.as_ref(),
+                    via: None,
                     reference_via: reference_via.as_ref(),
                     probe_path: &probe_path,
                     identity_path: &identity_path,
@@ -789,7 +726,6 @@ async fn main() {
                 top,
                 output,
                 from_file,
-                alive_via,
             }) => {
                 let sub = matches
                     .subcommand_matches("scan")
@@ -819,23 +755,6 @@ async fn main() {
                     }
                 };
                 let dns_mode = dns_mode_of(&eff_dns, embedded);
-                // --alive-via: a proxy used ONLY to verify aliveness of IP-blocked
-                // hosts (not to route the scan). Must be a proxy we can tcp-connect
-                // through; reachability is verified later in run_scan.
-                let alive_via_proxy = alive_via.as_ref().map(|raw| {
-                    let v = blockcheckw::network::via::Via::parse(raw).unwrap_or_else(|e| {
-                        eprintln!("ERROR: --alive-via: {e}");
-                        std::process::exit(1);
-                    });
-                    if !v.is_proxy() {
-                        eprintln!(
-                            "ERROR: --alive-via must be a proxy (e.g. socks5://host:1080) — it is \
-                             used only to tcp-connect through for an aliveness probe, not to route"
-                        );
-                        std::process::exit(1);
-                    }
-                    v
-                });
 
                 cmd::scan::run_scan(cmd::scan::ScanParams {
                     workers: eff_workers as usize,
@@ -847,8 +766,8 @@ async fn main() {
                     top_n: top,
                     output: output.as_deref(),
                     from_file: from_file.as_deref(),
-                    via: via.as_ref(),
-                    alive_via: alive_via_proxy.as_ref(),
+                    via: None,
+                    alive_via: None,
                     prereq: prereq
                         .as_ref()
                         .expect("scan requires prerequisites (skipped only for `status`)"),
@@ -897,7 +816,7 @@ async fn main() {
                     dns_mode,
                     sample,
                     output.as_deref(),
-                    via.as_ref(),
+                    None,
                     prereq
                         .as_ref()
                         .expect("universal requires prerequisites (skipped only for `status`)"),
@@ -928,11 +847,10 @@ async fn main() {
                     dns_mode,
                     timeout,
                     output: output.as_deref(),
-                    via: via.as_ref(),
+                    via: None,
                 })
                 .await;
             }
-            Some(Command::Completions { .. }) => unreachable!("handled above"),
             None => unreachable!("справка без команды печатается до elevation"),
         }
     }
@@ -945,139 +863,9 @@ async fn main() {
     otel_guard.shutdown().await;
 }
 
-/// Print current version and check GitHub for updates.
-async fn print_version_and_check() {
-    use console::style;
-
-    let current = env!("CARGO_PKG_VERSION");
-    println!("blockcheckw v{current}");
-
-    eprint!("checking for updates... ");
-    match blockcheckw::network::update_check::check_latest_release(current).await {
-        Some(release) => {
-            eprintln!(
-                "{}",
-                style(format!("newer version available: {}", release.tag))
-                    .yellow()
-                    .bold()
-            );
-            eprintln!(
-                "  upgrade: {}",
-                style("blockcheckw --upgrade").green().bold()
-            );
-        }
-        None => {
-            eprintln!("{}", style("up to date").green());
-        }
-    }
-}
-
-const INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/rcd27/blockcheckw/main/scripts/install.sh";
-
-fn install_dir_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
-    exe.parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-}
-
-fn download_install_script(destination: &std::path::Path) -> Result<(), String> {
-    let curl = std::process::Command::new("curl")
-        .args(["-fSL", "--retry", "3", "-o"])
-        .arg(destination)
-        .arg(INSTALL_SCRIPT_URL)
-        .status();
-    if matches!(curl, Ok(ref status) if status.success()) {
-        return Ok(());
-    }
-
-    let _ = std::fs::remove_file(destination);
-    let wget = std::process::Command::new("wget")
-        .args(["-q", "-O"])
-        .arg(destination)
-        .arg(INSTALL_SCRIPT_URL)
-        .status();
-    if matches!(wget, Ok(ref status) if status.success()) {
-        return Ok(());
-    }
-
-    let _ = std::fs::remove_file(destination);
-    Err("failed to download install script with curl or wget".to_string())
-}
-
-/// Download and install the latest release.
-async fn run_upgrade() {
-    use console::style;
-
-    let current = env!("CARGO_PKG_VERSION");
-    let con = blockcheckw::ui::Console::new();
-
-    con.println(&format!("blockcheckw v{current}"));
-    con.println("checking for updates...");
-
-    match blockcheckw::network::update_check::check_latest_release(current).await {
-        Some(release) => {
-            con.ok(&format!(
-                "newer version available: {} → {}",
-                style(format!("v{current}")).dim(),
-                style(&release.tag).green().bold(),
-            ));
-            con.println("  running install script...");
-            con.newline();
-
-            let install_dir = std::env::current_exe()
-                .ok()
-                .as_deref()
-                .and_then(install_dir_from_exe)
-                .unwrap_or_else(|| {
-                    con.error("cannot determine current install directory");
-                    std::process::exit(1);
-                });
-            let script_path =
-                std::env::temp_dir().join(format!("blockcheckw-install-{}.sh", std::process::id()));
-            if let Err(e) = download_install_script(&script_path) {
-                con.error(&e);
-                std::process::exit(1);
-            }
-
-            let status = std::process::Command::new("/bin/sh")
-                .arg(&script_path)
-                .env("INSTALL_DIR", &install_dir)
-                .status();
-            let _ = std::fs::remove_file(&script_path);
-
-            match status {
-                Ok(s) if s.success() => {
-                    con.newline();
-                    con.ok("upgrade complete");
-                }
-                _ => {
-                    con.newline();
-                    con.error("upgrade failed");
-                    std::process::exit(1);
-                }
-            }
-        }
-        None => {
-            con.ok(&format!("v{current} is the latest version"));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn upgrade_uses_current_executable_directory() {
-        let exe = std::path::Path::new("custom")
-            .join("bin")
-            .join("blockcheckw");
-        assert_eq!(
-            install_dir_from_exe(&exe),
-            Some(std::path::Path::new("custom").join("bin"))
-        );
-    }
 
     #[test]
     fn check_probe_path_defaults_to_root() {
@@ -1166,34 +954,6 @@ mod tests {
         match cli.command {
             Some(Command::Check { passes, .. }) => assert_eq!(passes, 5),
             _ => panic!("expected Check command"),
-        }
-    }
-
-    #[test]
-    fn scan_accepts_alive_via_flag() {
-        let cli = Cli::try_parse_from([
-            "blockcheckw",
-            "scan",
-            "-d",
-            "example.com",
-            "--alive-via",
-            "socks5://127.0.0.1:1080",
-        ])
-        .expect("parse");
-        match cli.command {
-            Some(Command::Scan { alive_via, .. }) => {
-                assert_eq!(alive_via.as_deref(), Some("socks5://127.0.0.1:1080"));
-            }
-            _ => panic!("expected Scan command"),
-        }
-    }
-
-    #[test]
-    fn scan_alive_via_defaults_to_none() {
-        let cli = Cli::try_parse_from(["blockcheckw", "scan", "-d", "example.com"]).expect("parse");
-        match cli.command {
-            Some(Command::Scan { alive_via, .. }) => assert_eq!(alive_via, None),
-            _ => panic!("expected Scan command"),
         }
     }
 
