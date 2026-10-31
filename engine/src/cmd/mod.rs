@@ -11,9 +11,9 @@ use std::sync::Arc;
 use console::style;
 use tokio::sync::Mutex;
 
-use blockcheckw::firewall::nft::{
-    self, ForeignTable, NftRun, NftRunSync, OwnedTableMarker, SystemNft, SystemNftSync, UserConsent,
-};
+use blockcheckw::firewall::ipt::{SystemIpt, SystemIptSync};
+use blockcheckw::firewall::nft::{self, ForeignTable, NftRun, SystemNft, UserConsent};
+use blockcheckw::firewall::rules::OwnedChainsMarker;
 use blockcheckw::ui::WARN;
 
 /// Write JSON to stdout, silently ignoring BrokenPipe (downstream closed).
@@ -346,8 +346,8 @@ fn prompt_yes_no() -> bool {
 pub type CleanupState = Arc<Mutex<CleanupInfo>>;
 
 pub struct CleanupInfo {
-    /// Метка НАШЕЙ таблицы: единственное, что аварийные пути вправе снести.
-    pub nft_table: OwnedTableMarker,
+    /// Метка НАШИХ цепочек: единственное, что аварийные пути вправе снести.
+    pub chains: OwnedChainsMarker,
     pub stopped_service: Option<ServiceManager>,
     /// Strategies found so far, so a Ctrl+C / SIGTERM mid-scan still writes them.
     pub scan_progress: Option<ScanProgressState>,
@@ -356,7 +356,7 @@ pub struct CleanupInfo {
 fn emergency_cleanup_sync(info: &CleanupInfo) {
     // Drop queue rules before terminating their listeners so packets are not
     // sent to an unbound NFQUEUE during emergency shutdown.
-    let _ = SystemNftSync.run(info.nft_table.drop_batch());
+    blockcheckw::firewall::rules::drop_chains_sync(&SystemIptSync, &info.chains);
     blockcheckw::system::process::start_kill_all_background_processes();
 
     if let Some(ref mgr) = info.stopped_service {
@@ -520,9 +520,9 @@ mod scan_progress_tests {
 /// Create shared cleanup state and spawn signal handlers (SIGINT + SIGTERM) that will:
 /// 1. Drop our nft table
 /// 2. Restart zapret2 service if we stopped it
-pub fn spawn_cleanup_handler(nft_table: &str) -> CleanupState {
+pub fn spawn_cleanup_handler(chain_prefix: &str) -> CleanupState {
     let state = Arc::new(Mutex::new(CleanupInfo {
-        nft_table: OwnedTableMarker::planned(nft_table),
+        chains: OwnedChainsMarker::planned(chain_prefix),
         stopped_service: None,
         scan_progress: None,
     }));
@@ -604,11 +604,11 @@ async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i3
     blockcheckw::network::via::Via::cleanup_all().await;
     let info = state.lock().await;
 
-    blockcheckw::firewall::nftables::drop_table(&SystemNft, &info.nft_table).await;
+    blockcheckw::firewall::rules::drop_chains(&SystemIpt, &info.chains).await;
     eprintln!(
-        "  {} nft table '{}' dropped",
+        "  {} iptables chains '{}_*' dropped",
         style("OK").green().bold(),
-        info.nft_table.name(),
+        blockcheckw::config::chain_prefix(),
     );
     // With queue rules gone, explicitly kill and reap every child we spawned.
     // process::exit below skips destructors, so kill_on_drop alone is not enough.

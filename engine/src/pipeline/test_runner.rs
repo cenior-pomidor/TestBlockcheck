@@ -3,8 +3,8 @@ use std::time::Instant;
 use crate::config::{CoreConfig, Protocol};
 use crate::dto::{PassResult, StrategyStats, StrategyTestResult};
 use crate::error::BlockcheckError;
-use crate::firewall::nft::{OwnedTable, SystemNft};
-use crate::firewall::nftables;
+use crate::firewall::ipt::SystemIpt;
+use crate::firewall::rules::{self, OwnedChains};
 use crate::network::http_client::{http_test, interpret_http_result, pick_random_ip, HttpVerdict};
 use crate::nfqws2::plan::{FilterMark, Plan, QueueNum};
 use crate::nfqws2::run::SystemNfqws2;
@@ -75,7 +75,7 @@ fn shell_split(s: &str) -> Vec<String> {
 async fn execute_timed_test(
     config: &CoreConfig,
     witness: &FilterMark,
-    table: &OwnedTable,
+    table: &OwnedChains,
     domain: &str,
     protocol: Protocol,
     ips: &[String],
@@ -124,26 +124,20 @@ async fn execute_timed_test(
     };
 
     // Поставить диспетчеризацию — только теперь, когда слушатель точно есть
-    if let Err(e) = nftables::apply_dispatch(
-        &SystemNft,
-        table,
-        &ready,
-        &plan.dispatch(protocol.port()),
-        ips,
-    )
-    .await
+    if let Err(e) =
+        crate::pipeline::guard::apply_guarded(table, &ready, &plan.dispatch(protocol.port()), ips)
+            .await
     {
-        // Батч атомарен, но `Err` тут может значить и таймаут
-        // `run_process_stdin` (15с): нельзя быть уверенным, что nft не успел
+        // Транзакция атомарна, но `Err` тут может значить и таймаут
+        // `run_process_stdin` (15с): нельзя быть уверенным, что iptables не успел
         // применить правила до обрыва. Снимаем диспетчеризацию на всякий
-        // случай, прежде чем убивать слушателя — иначе `queue to N` рискует
-        // остаться стоять без него до конца всего прогона.
-        nftables::remove_dispatch(&SystemNft, table).await;
+        // случай, прежде чем убивать слушателя.
+        rules::remove_dispatch(&SystemIpt, table).await;
         SystemNfqws2::stop(instance).await;
         return PassResult {
             pass_index: 0,
             success: false,
-            verdict: format!("ERROR: nftables: {e}"),
+            verdict: format!("ERROR: iptables: {e}"),
             latency_ms: start.elapsed().as_millis() as u64,
             timestamp,
         };
@@ -168,7 +162,7 @@ async fn execute_timed_test(
     let latency_ms = test_start.elapsed().as_millis() as u64;
 
     // best-effort cleanup: снять диспетчеризацию, затем убить nfqws2
-    nftables::remove_dispatch(&SystemNft, table).await;
+    rules::remove_dispatch(&SystemIpt, table).await;
     SystemNfqws2::stop(instance).await;
 
     PassResult {
@@ -224,12 +218,11 @@ pub async fn run_strategy_tests(
 ) -> Vec<StrategyTestResult> {
     let mut results = Vec::new();
 
-    // Подготовить таблицу: один батч, атомарный снос остатков прошлого
-    // прогона включительно — см. doc-комментарий `prepare_table`.
-    let table = match nftables::prepare_table(&SystemNft, &core_config.nft_table).await {
+    // Подготовить цепочки: снос остатков прошлого прогона и статическая часть.
+    let table = match rules::prepare_chains(&SystemIpt, &core_config.chain_prefix).await {
         Ok(t) => t,
         Err(e) => {
-            screen.println(&format!("  ERROR: failed to prepare nftables: {e}"));
+            screen.println(&format!("  ERROR: failed to prepare iptables chains: {e}"));
             return results;
         }
     };
@@ -308,7 +301,7 @@ pub async fn run_strategy_tests(
     }
 
     // Cleanup: снести таблицу целиком, хэндл потреблён.
-    let _ = table.drop_table(&SystemNft).await;
+    rules::drop_chains(&SystemIpt, &table.marker()).await;
 
     results
 }

@@ -5,8 +5,8 @@ use console::style;
 use blockcheckw::config::{CoreConfig, DnsMode, Protocol};
 use blockcheckw::dto::{BlockType, BrokenReason, DnsSpoofed, Limit, Outcome, RunProvenance};
 use blockcheckw::error::TaskResult;
-use blockcheckw::firewall::nft::{OwnedTableMarker, SystemNft};
-use blockcheckw::firewall::nftables;
+use blockcheckw::firewall::ipt::SystemIpt;
+use blockcheckw::firewall::rules::{self, OwnedChainsMarker};
 use blockcheckw::network::dns::DnsSpoofResult;
 use blockcheckw::network::http_client::{
     self as http_client, http_test_data, interpret_data_transfer_result, BodyMode,
@@ -90,7 +90,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
     } = params;
     let config = Arc::new(scan_core_config(workers, profiles_per_instance));
 
-    let cleanup = spawn_cleanup_handler(&config.nft_table);
+    let cleanup = spawn_cleanup_handler(&config.chain_prefix);
 
     // Result accumulator visible to the signal handler — found strategies survive
     // a Ctrl+C / SIGTERM / timeout mid-scan (#41).
@@ -194,7 +194,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
     }
 
     // 1c. Check for conflicting DPI bypass processes
-    let stopped = match handle_bypass_conflicts(&config.nft_table, &screen).await {
+    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &screen).await {
         Ok(result) => result,
         Err(()) => std::process::exit(1),
     };
@@ -364,7 +364,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
     let scan_future = async {
         for &protocol in &blocked_protocols {
             // Re-check for conflicts before each protocol scan
-            resolve_bypass_conflicts_if_any(&config.nft_table).await;
+            resolve_bypass_conflicts_if_any(&config.chain_prefix).await;
 
             screen.newline();
             screen.println(&ui::section(&format!("Scanning {protocol}")));
@@ -469,7 +469,11 @@ pub async fn run_scan(params: ScanParams<'_>) {
             // scan_future was cancelled mid-protocol — recover everything found so
             // far, including the in-progress protocol's partial results (#41).
             summary = progress.lock().unwrap().snapshot();
-            nftables::drop_table(&SystemNft, &OwnedTableMarker::planned(&config.nft_table)).await;
+            rules::drop_chains(
+                &SystemIpt,
+                &OwnedChainsMarker::planned(&config.chain_prefix),
+            )
+            .await;
             screen.newline();
             screen.println(&format!(
                 "{} scan timed out after {}s — showing partial results",

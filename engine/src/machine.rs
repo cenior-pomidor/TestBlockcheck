@@ -86,6 +86,23 @@ pub fn emit_neighbours(tables: &[String], engines_running: bool) {
     let _ = err.flush();
 }
 
+/// Строка события стража порядка: наш переход перестал быть первым (или исчез) и поставлен
+/// заново.
+fn reorder_line(table: &str, chain: &str, reapplied: bool) -> String {
+    format!(r#"{{"event":"reorder","table":"{table}","chain":"{chain}","reapplied":{reapplied}}}"#)
+}
+
+/// Сказать машинно, что страж порядка поправил наши правила.
+pub fn emit_reorder(table: &str, chain: &str, reapplied: bool) {
+    if !PROGRESS.load(Ordering::Relaxed) {
+        return;
+    }
+    let line = reorder_line(table, chain, reapplied);
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{line}");
+    let _ = err.flush();
+}
+
 /// Отметить ход работы: фаза, сколько сделано из скольких, сколько секунд прошло.
 pub fn emit_progress(phase: &str, done: usize, total: usize, elapsed_secs: f64) {
     if !PROGRESS.load(Ordering::Relaxed) {
@@ -152,5 +169,15 @@ mod tests {
         set_stream(true);
         assert!(stream_is_on());
         set_stream(false);
+    }
+
+    #[test]
+    fn reorder_event_is_ndjson() {
+        let line = reorder_line("mangle", "OUTPUT", true);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["event"], "reorder");
+        assert_eq!(v["table"], "mangle");
+        assert_eq!(v["chain"], "OUTPUT");
+        assert_eq!(v["reapplied"], true);
     }
 }

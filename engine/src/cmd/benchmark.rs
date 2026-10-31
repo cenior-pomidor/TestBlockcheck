@@ -24,7 +24,7 @@ pub async fn run_benchmark_cmd(
     };
 
     let config = CoreConfig::default();
-    let stopped = match handle_bypass_conflicts(&config.nft_table, &con).await {
+    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &con).await {
         Ok(result) => result,
         Err(()) => std::process::exit(1),
     };

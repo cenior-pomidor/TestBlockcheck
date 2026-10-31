@@ -352,7 +352,7 @@ mod tests {
             "profiles_per_instance",
             "dns",
             "qnum",
-            "nft_table",
+            "chain_prefix",
             "profile_mask",
             "control_mark",
             "desync_mark",

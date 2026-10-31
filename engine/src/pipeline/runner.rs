@@ -11,8 +11,8 @@ use tracing::info;
 
 use crate::config::{CoreConfig, Protocol};
 use crate::error::{BlockcheckError, TaskResult};
-use crate::firewall::nft::SystemNft;
-use crate::firewall::nftables;
+use crate::firewall::ipt::SystemIpt;
+use crate::firewall::rules;
 use crate::nfqws2::plan::{FilterMark, Plan, QueueNum};
 use crate::nfqws2::run::SystemNfqws2;
 use crate::pipeline::worker_task::{probe_profile, HttpTestMode, ProbeTask};
@@ -163,7 +163,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
         );
     }
 
-    let table = match nftables::prepare_table(&SystemNft, &config.nft_table).await {
+    let table = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
         Ok(t) => t,
         Err(e) => return all_as_error(strategies, e, start.elapsed()),
     };
@@ -239,8 +239,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
             }
         };
 
-        if let Err(e) = nftables::apply_dispatch(
-            &SystemNft,
+        if let Err(e) = crate::pipeline::guard::apply_guarded(
             &table,
             &ready,
             &plan.dispatch(protocol.port()),
@@ -248,7 +247,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
         )
         .await
         {
-            nftables::remove_dispatch(&SystemNft, &table).await;
+            rules::remove_dispatch(&SystemIpt, &table).await;
             SystemNfqws2::stop(instance).await;
             record_plan_failure(chunk, &e, &mut all_results, &mut errors, multi, pb);
             continue;
@@ -369,7 +368,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
             }
         }
 
-        nftables::remove_dispatch(&SystemNft, &table).await;
+        rules::remove_dispatch(&SystemIpt, &table).await;
         SystemNfqws2::stop(instance).await;
     }
 
@@ -378,7 +377,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
     }
 
     // Cleanup nftables table — хэндл потребляется, снести повторно нечем.
-    let _ = table.drop_table(&SystemNft).await;
+    rules::drop_chains(&SystemIpt, &table.marker()).await;
 
     let elapsed = start.elapsed();
     // Итоговая отметка: без неё последняя машинная строка застревала бы на кратном 250, и

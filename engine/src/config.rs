@@ -1,9 +1,8 @@
 use std::fmt;
 
-/// Имя нашей nft-таблицы. Не должно совпадать с чужими: "zapret" занято zapret1,
-/// "zapret2" — zapret2 (см. common/nft.sh), иначе их таблицы попадают под наш
-/// cleanup и при этом не видны детекту конфликтов.
-pub const DEFAULT_NFT_TABLE: &str = "blockcheckw";
+/// Префикс наших цепочек iptables (`bcw_raw`, `bcw_out`, …). Не должен совпадать с чужими:
+/// nfqws2-android использует `nfqws_*`, иначе их цепочки попали бы под нашу уборку.
+pub const DEFAULT_CHAIN_PREFIX: &str = "bcw";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsMode {
@@ -55,7 +54,7 @@ mod kernel_keys {
             Ok(name) if !name.is_empty() => name.clone(),
             // Пусто (не задавали) или отравлен (упал сосед) — умолчание. Имя таблицы не
             // тот предмет, ради которого стоит ронять прогон.
-            _ => super::DEFAULT_NFT_TABLE.to_string(),
+            _ => super::DEFAULT_CHAIN_PREFIX.to_string(),
         }
     }
 
@@ -75,10 +74,10 @@ mod kernel_keys {
 }
 
 /// Объявить ключи ядра (ставится разбором командной строки).
-pub fn set_kernel_keys(qnum: u16, nft_table: &str, smoke_qnum_base: u16) {
+pub fn set_kernel_keys(qnum: u16, chain_prefix: &str, smoke_qnum_base: u16) {
     kernel_keys::QNUM.store(qnum, std::sync::atomic::Ordering::Relaxed);
     kernel_keys::SMOKE_BASE.store(smoke_qnum_base, std::sync::atomic::Ordering::Relaxed);
-    kernel_keys::set_table(nft_table);
+    kernel_keys::set_table(chain_prefix);
 }
 
 /// Боевая очередь этого прогона.
@@ -95,7 +94,7 @@ pub fn smoke_qnum_base() -> u16 {
 pub const SMOKE_QUEUE_COUNT: u16 = 10;
 
 /// Имя нашей nft-таблицы в этом прогоне.
-pub fn nft_table() -> String {
+pub fn chain_prefix() -> String {
     kernel_keys::table()
 }
 
@@ -107,7 +106,7 @@ pub struct CoreConfig {
     /// сколько проб этого плана летит одновременно.
     pub profiles_per_instance: usize,
     pub base_qnum: u16,
-    pub nft_table: String,
+    pub chain_prefix: String,
     pub nfqws2_path: String,
     pub request_timeout: u64,
     pub zapret_base: String,
@@ -121,7 +120,7 @@ impl Default for CoreConfig {
             worker_count: 8,
             profiles_per_instance: MAX_PROFILES_PER_INSTANCE,
             base_qnum: qnum(),
-            nft_table: nft_table(),
+            chain_prefix: chain_prefix(),
             nfqws2_path: nfqws2_path("/opt/zapret2"),
             request_timeout: 2,
             // FIXME: zapret_base is hardcoded; add CLI option to override
@@ -319,12 +318,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_nft_table_does_not_collide_with_foreign_ones() {
-        // issue #66: имя "zapret" принадлежит zapret1
-        for foreign in ["zapret", "zapret2", "fw4"] {
-            assert_ne!(DEFAULT_NFT_TABLE, foreign);
+    fn default_chain_prefix_does_not_collide_with_foreign_ones() {
+        // nfqws2-android: nfqws_*; nzapret и прочие модули — свои имена
+        for foreign in ["nfqws", "zapret", "zapret2"] {
+            assert_ne!(DEFAULT_CHAIN_PREFIX, foreign);
         }
-        assert_eq!(CoreConfig::default().nft_table, DEFAULT_NFT_TABLE);
+        assert_eq!(CoreConfig::default().chain_prefix, DEFAULT_CHAIN_PREFIX);
     }
 
     #[test]

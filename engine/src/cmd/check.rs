@@ -76,7 +76,7 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
         ..CoreConfig::default()
     });
 
-    let cleanup = spawn_cleanup_handler(&config.nft_table);
+    let cleanup = spawn_cleanup_handler(&config.chain_prefix);
 
     let mut screen = ui::Console::new();
 
@@ -217,7 +217,7 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
     }
 
     // Check for conflicts
-    let stopped = match handle_bypass_conflicts(&config.nft_table, &screen).await {
+    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &screen).await {
         Ok(result) => result,
         Err(()) => std::process::exit(1),
     };

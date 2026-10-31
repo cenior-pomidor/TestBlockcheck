@@ -2,6 +2,7 @@ pub mod baseline;
 pub mod benchmark;
 pub mod check;
 pub mod fate;
+pub mod guard;
 pub mod observe;
 pub mod reference;
 pub mod report;

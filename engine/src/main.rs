@@ -94,9 +94,9 @@ struct Cli {
     #[arg(long, value_name = "N")]
     qnum: Option<u16>,
 
-    /// Имя нашей nft-таблицы (умолчание blockcheckw).
+    /// Префикс наших цепочек iptables (умолчание bcw).
     #[arg(long, value_name = "NAME")]
-    nft_table: Option<String>,
+    chain_prefix: Option<String>,
 
     /// Метка пакетов nfqws2 поиска, 0xHEX или десятичное (умолчание 0x00200000, бит 21).
     #[arg(long, value_name = "MARK")]
@@ -416,19 +416,17 @@ fn resolve_u16(matches: &clap::ArgMatches, id: &str, cli_val: u16, persisted: Op
 
 #[tokio::main]
 async fn main() {
-    // Panic hook: cleanup nftables table on panic (async runtime may be dead, use sync Command)
+    // Panic hook: снять наши цепочки iptables (async-рантайм может быть мёртв — синхронно)
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         blockcheckw::network::via::Via::cleanup_sync();
-        // Сносим ТОЛЬКО свою таблицу: метку выдаёт firewall-слой, другой
-        // команды из неё не собрать (#66). Таймаут внутри — panic-хук без
-        // него уводил роутеры в перезагрузку.
-        let _ = blockcheckw::firewall::nft::NftRunSync::run(
-            &blockcheckw::firewall::nft::SystemNftSync,
-            blockcheckw::firewall::nft::OwnedTableMarker::planned(
-                blockcheckw::config::DEFAULT_NFT_TABLE,
-            )
-            .drop_batch(),
+        // Сносим ТОЛЬКО свои цепочки: метку выдаёт firewall-слой (#66). Таймаут внутри —
+        // panic-хук без него уводил роутеры в перезагрузку.
+        blockcheckw::firewall::rules::drop_chains_sync(
+            &blockcheckw::firewall::ipt::SystemIptSync,
+            &blockcheckw::firewall::rules::OwnedChainsMarker::planned(
+                &blockcheckw::config::chain_prefix(),
+            ),
         );
         default_hook(info);
     }));
@@ -515,9 +513,9 @@ async fn main() {
 
     blockcheckw::config::set_kernel_keys(
         cli.qnum.unwrap_or(200),
-        cli.nft_table
+        cli.chain_prefix
             .as_deref()
-            .unwrap_or(blockcheckw::config::DEFAULT_NFT_TABLE),
+            .unwrap_or(blockcheckw::config::DEFAULT_CHAIN_PREFIX),
         cli.smoke_qnum_base.unwrap_or(65_526),
     );
     let via = cli.via.map(|raw| {
@@ -614,21 +612,21 @@ async fn main() {
         }
         let defaults = blockcheckw::config::CoreConfig::default();
         let signature = blockcheckw::system::orphans::Signature {
-            table: defaults.nft_table.clone(),
+            chain_prefix: defaults.chain_prefix.clone(),
             qnum: defaults.base_qnum,
             desync_mark: blockcheckw::nfqws2::mark::desync_mark(),
         };
         let swept = blockcheckw::system::orphans::sweep_own(
-            &blockcheckw::firewall::nft::SystemNft,
+            &blockcheckw::firewall::ipt::SystemIpt,
             &signature,
         )
         .await;
         if !swept.is_empty() {
             eprintln!(
-                "{}сняты остатки прошлого прогона: движков {}, таблица {}",
+                "{}сняты остатки прошлого прогона: движков {}, цепочки {}",
                 blockcheckw::ui::WARN,
                 swept.killed.len(),
-                if swept.table_dropped {
+                if swept.chains_dropped {
                     "снесена"
                 } else {
                     "чиста"

@@ -69,7 +69,7 @@ pub async fn run_universal(
 ) {
     let config = Arc::new(universal_core_config(workers, profiles_per_instance));
 
-    let cleanup = spawn_cleanup_handler(&config.nft_table);
+    let cleanup = spawn_cleanup_handler(&config.chain_prefix);
 
     let mut screen = ui::Console::new();
 
@@ -98,7 +98,7 @@ pub async fn run_universal(
     }
 
     // Check for conflicts
-    let stopped = match handle_bypass_conflicts(&config.nft_table, &screen).await {
+    let stopped = match handle_bypass_conflicts(&config.chain_prefix, &screen).await {
         Ok(result) => result,
         Err(()) => std::process::exit(1),
     };

@@ -10,15 +10,15 @@
 //! не вмешиваться. Марка десинка (`--fwmark`) нашей раскладки вместе с номером очереди уже
 //! достаточно узка: чужой `nfqws2` несёт свою.
 
-use crate::firewall::nft::{NftRun, OwnedTableMarker};
-use crate::firewall::nftables;
+use crate::firewall::ipt::{parse_rules, IptRun, Table};
+use crate::firewall::rules::{self, OwnedChainsMarker};
 use crate::nfqws2::plan::{self, QueueNum};
 
 /// Признак нашего остатка.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
-    /// Имя нашей nft-таблицы — его задаёт вызывающий, и по нему таблица опознаётся точно.
-    pub table: String,
+    /// Префикс наших цепочек — его задаёт вызывающий, и по нему цепочки опознаются точно.
+    pub chain_prefix: String,
     /// Боевая очередь этого прогона.
     pub qnum: u16,
     /// Марка десинка нашей раскладки — её не ставит никто другой.
@@ -31,13 +31,13 @@ pub struct Signature {
 pub struct SweepReport {
     /// Pid'ы снятых движков.
     pub killed: Vec<i32>,
-    /// Была ли снята наша таблица.
-    pub table_dropped: bool,
+    /// Были ли сняты наши цепочки.
+    pub chains_dropped: bool,
 }
 
 impl SweepReport {
     pub fn is_empty(&self) -> bool {
-        self.killed.is_empty() && !self.table_dropped
+        self.killed.is_empty() && !self.chains_dropped
     }
 }
 
@@ -93,12 +93,11 @@ fn our_engines(sig: &Signature) -> Vec<i32> {
         .collect()
 }
 
-/// Снять свои остатки: движки по признаку и нашу таблицу по имени.
+/// Снять свои остатки: движки по признаку и наши цепочки по префиксу.
 ///
-/// Идемпотентность входа — не удобство, а условие работы под оркестратором: продукт шлёт
-/// `SIGKILL`, по которому не отрабатывает ни один хук, и следующий прогон обязан начинаться с
-/// того, что прошлый за собой не убрал. Иначе очередь занята, движок жив, а подбор слеп.
-pub async fn sweep_own<R: NftRun>(runner: &R, sig: &Signature) -> SweepReport {
+/// Идемпотентность входа — условие работы после `SIGKILL`: следующий прогон обязан начинаться
+/// с того, что прошлый за собой не убрал. Иначе очередь занята, движок жив, а подбор слеп.
+pub async fn sweep_own<R: IptRun>(runner: &R, sig: &Signature) -> SweepReport {
     let engines = our_engines(sig);
     let killed = engines
         .iter()
@@ -110,23 +109,27 @@ pub async fn sweep_own<R: NftRun>(runner: &R, sig: &Signature) -> SweepReport {
         .copied()
         .collect();
 
-    // Таблица сносится ПОСЛЕ движков: пока движок жив, правила ведут в очередь, у которой
-    // есть слушатель. Обратный порядок оставил бы окно, в котором пакеты уходят в очередь без
-    // читателя, — то есть дроп трафика человека на ровном месте.
+    // Цепочки снимаются ПОСЛЕ движков: пока движок жив, правила ведут в очередь, у которой
+    // есть слушатель. Обратный порядок оставил бы окно с очередью без читателя.
+    let marker = OwnedChainsMarker::planned(&sig.chain_prefix);
+    let ours = marker.names().out();
     let existed = runner
-        .table_names()
+        .cmd(Table::Mangle, &["-S".to_string(), "OUTPUT".to_string()])
         .await
-        .map(|tables| tables.iter().any(|(_, name)| *name == sig.table))
-        // Не прочитали рулсет — не утверждаем, что таблицы не было. Снос идёт всё равно
-        // (он идемпотентен), а в отчёт уходит «не сносили»: соврать в эту сторону дешевле.
+        .map(|out| {
+            out.ok
+                && parse_rules("OUTPUT", &out.stdout)
+                    .iter()
+                    .any(|rule| rule == &format!("-A OUTPUT -j {ours}"))
+        })
+        // Не прочитали — не утверждаем, что цепочек не было. Снос идёт всё равно
+        // (он идемпотентен), а в отчёт уходит «не сносили».
         .unwrap_or(false);
-    if existed {
-        nftables::drop_table(runner, &OwnedTableMarker::planned(&sig.table)).await;
-    }
+    rules::drop_chains(runner, &marker).await;
 
     SweepReport {
         killed,
-        table_dropped: existed,
+        chains_dropped: existed,
     }
 }
 
@@ -136,7 +139,7 @@ mod tests {
 
     fn sig() -> Signature {
         Signature {
-            table: "blockcheckw".to_string(),
+            chain_prefix: "bcw".to_string(),
             qnum: 200,
             desync_mark: 0x1000_0000,
         }
@@ -182,8 +185,43 @@ mod tests {
         assert!(SweepReport::default().is_empty());
         assert!(!SweepReport {
             killed: vec![42],
-            table_dropped: false
+            chains_dropped: false
         }
         .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_own_drops_our_chains_after_engines() {
+        use crate::firewall::ipt::testing::RecordingIpt;
+        use crate::firewall::ipt::Table;
+        let r = RecordingIpt::default();
+        r.set_rules(Table::Mangle, "OUTPUT", vec!["-A OUTPUT -j bcw_out".into()]);
+        let report = sweep_own(
+            &r,
+            &Signature {
+                chain_prefix: "bcw".to_string(),
+                qnum: 54_321,
+                desync_mark: 0x0020_0000,
+            },
+        )
+        .await;
+        assert!(report.chains_dropped);
+        assert!(report.killed.is_empty(), "движков на очереди 54321 нет");
+        for (_, args) in r.cmds() {
+            match args[0].as_str() {
+                "-D" => assert!(args[3].starts_with("bcw_"), "{args:?}"),
+                "-F" | "-X" => assert!(args[1].starts_with("bcw_"), "{args:?}"),
+                _ => {}
+            }
+        }
+        assert!(r.cmds().iter().any(|(_, a)| a[0] == "-X"));
+    }
+
+    #[tokio::test]
+    async fn sweep_on_a_clean_system_reports_nothing_dropped() {
+        use crate::firewall::ipt::testing::RecordingIpt;
+        let r = RecordingIpt::default();
+        let report = sweep_own(&r, &sig()).await;
+        assert!(!report.chains_dropped);
     }
 }

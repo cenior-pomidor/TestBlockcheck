@@ -74,8 +74,8 @@ pub enum Limit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokenReason {
-    /// nftables не принял наши правила.
-    Nft,
+    /// iptables не принял наши правила.
+    Firewall,
     /// Нет `CAP_NET_ADMIN` — ни марок, ни очереди.
     NoCapNetAdmin,
     /// Боевая очередь занята чужим слушателем. Лечится другой очередью, не переустановкой.
@@ -118,7 +118,7 @@ impl Outcome {
             | Outcome::NothingWorks { .. }
             | Outcome::Censored { .. } => 0,
             Outcome::Broken { reason } => match reason {
-                BrokenReason::Nft | BrokenReason::NoCapNetAdmin => 3,
+                BrokenReason::Firewall | BrokenReason::NoCapNetAdmin => 3,
                 BrokenReason::DnsFailed => 4,
                 BrokenReason::EngineStart => 5,
                 BrokenReason::InputUnreadable => 6,
@@ -165,8 +165,8 @@ pub struct RunProvenance {
     pub dns: String,
     /// Номер боевой очереди NFQUEUE.
     pub qnum: u16,
-    /// Имя нашей nft-таблицы.
-    pub nft_table: String,
+    /// Префикс наших цепочек iptables.
+    pub chain_prefix: String,
     /// Маска поля стратегии в метке.
     pub profile_mask: String,
     /// Метка контроля (проба без десинка, DoH).
@@ -207,7 +207,7 @@ impl RunProvenance {
             profiles_per_instance: config.profiles_per_instance,
             dns: dns.to_string(),
             qnum: config.base_qnum,
-            nft_table: config.nft_table.clone(),
+            chain_prefix: config.chain_prefix.clone(),
             profile_mask: format!("0x{:08X}", crate::nfqws2::mark::profile_mask()),
             control_mark: format!("0x{:08X}", crate::nfqws2::mark::control_mark()),
             desync_mark: format!("0x{:08X}", crate::nfqws2::mark::desync_mark()),
@@ -630,13 +630,32 @@ mod tests {
 mod outcome_tests {
     use super::*;
 
+    #[test]
+    fn broken_firewall_serialises_as_firewall() {
+        assert_eq!(
+            serde_json::to_string(&BrokenReason::Firewall).unwrap(),
+            "\"firewall\""
+        );
+    }
+
+    #[test]
+    fn broken_firewall_exits_with_code_3() {
+        assert_eq!(
+            Outcome::Broken {
+                reason: BrokenReason::Firewall
+            }
+            .exit_code(),
+            3
+        );
+    }
+
     /// САМЫЙ ДОРОГОЙ ОТКАЗ КОНТРАКТА. Продукт читает исход и решает, снимать ли лечение;
     /// поломка прибора, прочитанная как «цель чиста», оставляет человека без лечения — и
     /// именно из-за НАШЕЙ поломки, а не из-за состояния сети.
     #[test]
     fn a_broken_instrument_is_never_a_clean_target() {
         for reason in [
-            BrokenReason::Nft,
+            BrokenReason::Firewall,
             BrokenReason::NoCapNetAdmin,
             BrokenReason::QueueBusy { queue: 200 },
             BrokenReason::DnsFailed,
@@ -675,7 +694,7 @@ mod outcome_tests {
                 limit: Limit::Deadline,
             },
             Outcome::Broken {
-                reason: BrokenReason::Nft,
+                reason: BrokenReason::Firewall,
             },
         ];
         assert_eq!(all.iter().filter(|o| o.target_is_clean()).count(), 1);

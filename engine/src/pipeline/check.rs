@@ -8,8 +8,8 @@ use crate::dto::{
     BrokenReason, CheckReport, CheckedStrategy, ControlVerdict, Limit, Outcome, RunProvenance,
     VerifiedStrategy,
 };
-use crate::firewall::nft::{OwnedTable, SystemNft};
-use crate::firewall::nftables;
+use crate::firewall::ipt::SystemIpt;
+use crate::firewall::rules::{self, OwnedChains};
 use crate::network::http_client::{http_probe, pick_random_ip, BodyMode, Ended, HttpResult};
 use crate::network::patience::Patience;
 use crate::nfqws2::mark::ProbeMark;
@@ -66,11 +66,11 @@ pub async fn run_check(
     // прогона так же, как отчёт об успехе, — иначе о самой частой беде мы знаем меньше всего.
     let provenance = RunProvenance::of(config, "—", crate::nfqws2::mark::is_embedded());
 
-    let table = match nftables::prepare_table(&SystemNft, &config.nft_table).await {
+    let table = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
         Ok(t) => t,
         Err(e) => {
             screen.println(&format!(
-                "  {} failed to prepare nftables: {e}",
+                "  {} failed to prepare iptables chains: {e}",
                 style("ERROR:").red().bold(),
             ));
             // ПОЛОМКА ПРИБОРА, а не суждение о цели. Прежде здесь уходил отчёт с пустым
@@ -79,7 +79,7 @@ pub async fn run_check(
             return CheckReport {
                 schema: crate::dto::SCHEMA,
                 outcome: Outcome::Broken {
-                    reason: BrokenReason::Nft,
+                    reason: BrokenReason::Firewall,
                 },
                 run: provenance.clone(),
                 domain: domain.to_string(),
@@ -365,7 +365,7 @@ pub async fn run_check(
     let verified: Vec<VerifiedStrategy> = order.into_iter().map(|(_, s)| s).collect();
 
     // Cleanup
-    let _ = table.drop_table(&SystemNft).await;
+    rules::drop_chains(&SystemIpt, &table.marker()).await;
 
     let mut run = provenance;
     run.tried = checked_count;
@@ -693,7 +693,7 @@ async fn measure_channel(
 async fn check_single_strategy(
     config: &CoreConfig,
     witness: &FilterMark,
-    table: &OwnedTable,
+    table: &OwnedChains,
     domain: &str,
     tagged: &TaggedStrategy,
     ips: &[String],
@@ -753,23 +753,18 @@ async fn check_single_strategy(
     };
 
     // 3. Поставить диспетчеризацию — только теперь, когда слушатель точно есть
-    if let Err(e) = nftables::apply_dispatch(
-        &SystemNft,
-        table,
-        &ready,
-        &plan.dispatch(protocol.port()),
-        ips,
-    )
-    .await
+    if let Err(e) =
+        crate::pipeline::guard::apply_guarded(table, &ready, &plan.dispatch(protocol.port()), ips)
+            .await
     {
-        // Батч атомарен, но `Err` тут может значить и таймаут
-        // `run_process_stdin` (15с): нельзя быть уверенным, что nft не успел
+        // Транзакция атомарна, но `Err` тут может значить и таймаут
+        // `run_process_stdin` (15с): нельзя быть уверенным, что iptables не успел
         // применить правила до обрыва. Снимаем диспетчеризацию на всякий
-        // случай, прежде чем убивать слушателя — иначе `queue to N` рискует
+        // случай, прежде чем убивать слушателя — иначе правило очереди рискует
         // остаться стоять без него до конца всего прогона.
-        nftables::remove_dispatch(&SystemNft, table).await;
+        rules::remove_dispatch(&SystemIpt, table).await;
         SystemNfqws2::stop(instance).await;
-        return make_failed(format!("nftables: {e}"));
+        return make_failed(format!("iptables: {e}"));
     }
 
     // 4. Обе пробы спеки §6-тер. `ips` гарантированно непусты: `apply_dispatch` выше уже
@@ -792,7 +787,7 @@ async fn check_single_strategy(
     .await;
 
     // 5. Cleanup: снять диспетчеризацию, затем убить nfqws2 (best-effort)
-    nftables::remove_dispatch(&SystemNft, table).await;
+    rules::remove_dispatch(&SystemIpt, table).await;
     SystemNfqws2::stop(instance).await;
 
     // 6. Свести обе пробы в строку отчёта.
