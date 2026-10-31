@@ -1,0 +1,1096 @@
+pub mod benchmark;
+pub mod check;
+pub mod completions;
+pub mod scan;
+pub mod status;
+pub mod universal;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use console::style;
+use tokio::sync::Mutex;
+
+use blockcheckw::firewall::nft::{
+    self, ForeignTable, NftRun, NftRunSync, OwnedTableMarker, SystemNft, SystemNftSync, UserConsent,
+};
+use blockcheckw::ui::WARN;
+
+/// Write JSON to stdout, silently ignoring BrokenPipe (downstream closed).
+pub fn print_stdout_graceful(data: &str, con: &blockcheckw::ui::Console) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out
+        .write_all(data.as_bytes())
+        .and_then(|_| out.write_all(b"\n"))
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => con.error(&format!("stdout write error: {e}")),
+    }
+}
+
+/// Global flag: auto-confirm all prompts (set by --yes / -y).
+static AUTO_YES: AtomicBool = AtomicBool::new(false);
+
+/// Set auto-confirm mode (called from main).
+pub fn set_auto_yes(yes: bool) {
+    AUTO_YES.store(yes, Ordering::Relaxed);
+}
+
+/// Global flag: skip detection/cleanup of foreign DPI-bypass nft tables and nfqws2 processes.
+/// For embedded use (an orchestrator owns the nft state and installs its own queue tables);
+/// without it blockcheckw deletes any non-own table with queue rules on 443 + kills nfqws2.
+static SKIP_CONFLICT_CLEANUP: AtomicBool = AtomicBool::new(false);
+
+/// Enable embedded mode: leave foreign nft tables/processes untouched (called from main).
+pub fn set_skip_conflict_cleanup(skip: bool) {
+    SKIP_CONFLICT_CLEANUP.store(skip, Ordering::Relaxed);
+}
+
+// ── Zapret2 service management ──────────────────────────────────────────────
+
+/// How zapret2 service is managed on this system.
+#[derive(Debug, Clone)]
+pub enum ServiceManager {
+    /// systemd: `systemctl stop/start zapret2`
+    Systemd { unit: String },
+    /// OpenWrt / sysv init: `/etc/init.d/zapret2 stop/start`
+    InitD { script: String },
+}
+
+impl std::fmt::Display for ServiceManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceManager::Systemd { unit } => write!(f, "systemd ({unit})"),
+            ServiceManager::InitD { script } => write!(f, "init.d ({script})"),
+        }
+    }
+}
+
+/// Detect how zapret2 is managed. Returns None if no service found.
+pub async fn detect_service_manager() -> Option<ServiceManager> {
+    use blockcheckw::system::process::run_process;
+
+    // Check systemd first (most common on desktop/server Linux)
+    if let Ok(result) = run_process(&["systemctl", "is-active", "zapret2"], 3_000).await {
+        // is-active returns 0 for "active", 3 for "inactive", etc.
+        // Any successful execution means systemd is present and knows the unit
+        if result.exit_code == 0 || result.stdout.trim() == "inactive" {
+            return Some(ServiceManager::Systemd {
+                unit: "zapret2".to_string(),
+            });
+        }
+    }
+
+    // Check OpenWrt / sysv init.d
+    let script = "/etc/init.d/zapret2";
+    if std::path::Path::new(script).exists() {
+        return Some(ServiceManager::InitD {
+            script: script.to_string(),
+        });
+    }
+
+    None
+}
+
+/// Stop zapret2 service. Returns true on success.
+pub async fn stop_service(mgr: &ServiceManager) -> bool {
+    use blockcheckw::system::process::run_process;
+
+    let result = match mgr {
+        ServiceManager::Systemd { unit } => run_process(&["systemctl", "stop", unit], 10_000).await,
+        ServiceManager::InitD { script } => run_process(&[script, "stop"], 10_000).await,
+    };
+
+    match result {
+        Ok(r) => r.exit_code == 0,
+        Err(_) => false,
+    }
+}
+
+/// Start zapret2 service. Returns true on success.
+pub async fn start_service(mgr: &ServiceManager) -> bool {
+    use blockcheckw::system::process::run_process;
+
+    let result = match mgr {
+        ServiceManager::Systemd { unit } => {
+            run_process(&["systemctl", "start", unit], 10_000).await
+        }
+        ServiceManager::InitD { script } => run_process(&[script, "start"], 10_000).await,
+    };
+
+    match result {
+        Ok(r) => r.exit_code == 0,
+        Err(_) => false,
+    }
+}
+
+// ── Bypass conflict detection & resolution ──────────────────────────────────
+
+pub struct BypassConflicts {
+    pub has_nfqws2_processes: bool,
+    pub conflicting_tables: Vec<ForeignTable>,
+}
+
+impl BypassConflicts {
+    pub fn is_empty(&self) -> bool {
+        !self.has_nfqws2_processes && self.conflicting_tables.is_empty()
+    }
+}
+
+/// Таблицы, которые могут принадлежать чужому bypass: всё, кроме нашей
+/// собственной и обвязки OpenWrt (fw4).
+fn foreign_table_candidates(tables: &[(String, String)], own_table: &str) -> Vec<ForeignTable> {
+    tables
+        .iter()
+        .filter(|(_, name)| name != own_table && name != "fw4")
+        .map(|(family, name)| ForeignTable::detected(family.clone(), name.clone()))
+        .collect()
+}
+
+/// Похоже ли содержимое таблицы на DPI bypass: очередь на HTTPS-порт.
+fn table_has_bypass_rules(table_content: &str) -> bool {
+    table_content.contains("queue")
+        && (table_content.contains("dport 443") || table_content.contains("dport { 80, 443"))
+}
+
+fn pgrep_has_matches(exit_code: i32, stdout: &str) -> bool {
+    exit_code == 0 && !stdout.trim().is_empty()
+}
+
+/// Detect conflicting DPI bypass processes and nftables tables.
+pub async fn detect_bypass_conflicts(own_table: &str) -> BypassConflicts {
+    use blockcheckw::system::process::run_process;
+
+    let mut conflicts = BypassConflicts {
+        has_nfqws2_processes: false,
+        conflicting_tables: Vec::new(),
+    };
+
+    // Check for other nfqws2 processes
+    if let Ok(result) = run_process(&["pgrep", "-x", "nfqws2"], 3_000).await {
+        conflicts.has_nfqws2_processes = pgrep_has_matches(result.exit_code, &result.stdout);
+    }
+
+    // Check for other nftables tables with queue rules on ports 80/443
+    if let Ok(tables) = SystemNft.table_names().await {
+        for candidate in foreign_table_candidates(&tables, own_table) {
+            if let Ok(content) = SystemNft.dump_foreign(&candidate).await {
+                if table_has_bypass_rules(&content) {
+                    conflicts.conflicting_tables.push(candidate);
+                }
+            }
+        }
+    }
+
+    conflicts
+}
+
+/// Разобраться с конфликтующим DPI-обходом. Возвращает `Some(ServiceManager)`,
+/// если сервис был остановлен (вызывающий обязан поднять его на выходе), или
+/// `None`, если сервиса не было. `Err(())` — пользователь отказался.
+///
+/// Снимка чужого состояния здесь нет намеренно (#66): сервис, который мы
+/// останавливаем его же init-скриптом, поднимает свои таблицы сам —
+/// `start` симметричен `stop`.
+pub async fn handle_bypass_conflicts(
+    own_table: &str,
+    con: &blockcheckw::ui::Console,
+) -> Result<Option<ServiceManager>, ()> {
+    // НАБЛЮДЕНИЕ ОТДЕЛЕНО ОТ ВМЕШАТЕЛЬСТВА. Во встроенном режиме чужое ядро принадлежит
+    // вызывающему, и трогать его нельзя — но и МОЛЧАТЬ о том, что мы видим, незачем: для
+    // продукта «на 443 сидит мой собственный слот» есть диагноз, объясняющий пустой подбор.
+    // Прежде этот метод выходил первой же строкой, и сказать ему было нечего.
+    let conflicts = detect_bypass_conflicts(own_table).await;
+
+    if SKIP_CONFLICT_CLEANUP.load(Ordering::Relaxed) {
+        if !conflicts.is_empty() {
+            let tables: Vec<String> = conflicts
+                .conflicting_tables
+                .iter()
+                .map(|t| format!("{} {}", t.family(), t.name()))
+                .collect();
+            con.warn(&format!(
+                "рядом работает чужой обход (таблиц: {}, процессы nfqws2: {}) — не трогаю,                  но подбор может мерить его, а не линию",
+                tables.len(),
+                if conflicts.has_nfqws2_processes { "есть" } else { "нет" },
+            ));
+            blockcheckw::machine::emit_neighbours(&tables, conflicts.has_nfqws2_processes);
+        }
+        return Ok(None); // embedded: оркестратор владеет nft-состоянием, чужие трубы не трогаем
+    }
+
+    if conflicts.is_empty() {
+        return Ok(None);
+    }
+
+    con.newline();
+    con.section("Conflicting DPI bypass");
+    if conflicts.has_nfqws2_processes {
+        con.warn("running nfqws2 processes found");
+    }
+    for table in &conflicts.conflicting_tables {
+        con.warn(&format!(
+            "nft table '{} {}' has queue rules on port 443",
+            table.family(),
+            table.name(),
+        ));
+    }
+
+    // Try to detect service manager
+    let service_mgr = detect_service_manager().await;
+
+    if let Some(ref mgr) = service_mgr {
+        con.println(&format!(
+            "  detected service: {}",
+            style(format!("{mgr}")).cyan().bold()
+        ));
+        con.newline();
+        eprint!(
+            "  Stop zapret2 via {mgr} for the duration of the scan? {} ",
+            style("[Y/n]").bold()
+        );
+
+        if !prompt_yes_no() {
+            con.println(&format!("  {}", style("Aborted.").red()));
+            return Err(());
+        }
+
+        if stop_service(mgr).await {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            con.ok(&format!("zapret2 stopped via {mgr}"));
+            con.info("will restart automatically when blockcheckw finishes");
+            Ok(Some(mgr.clone()))
+        } else {
+            con.error(&format!("failed to stop zapret2 via {mgr}"));
+            con.info("please stop it manually and re-run blockcheckw");
+            Err(())
+        }
+    } else {
+        con.warn("no systemd unit or init.d script found for zapret2");
+        con.newline();
+        eprint!(
+            "  Kill nfqws2 processes and drop conflicting nft tables? {} ",
+            style("[Y/n]").bold()
+        );
+
+        if !prompt_yes_no() {
+            con.println(&format!("  {}", style("Aborted.").red()));
+            return Err(());
+        }
+
+        resolve_bypass_conflicts_manual(&conflicts, &UserConsent::granted()).await;
+        con.ok("processes killed, nft tables dropped");
+        con.warn("you will need to restart DPI bypass manually afterwards");
+        Ok(None)
+    }
+}
+
+/// Fallback: kill nfqws2 by PID (not killall) and drop conflicting tables.
+async fn resolve_bypass_conflicts_manual(conflicts: &BypassConflicts, consent: &UserConsent) {
+    use blockcheckw::system::process::run_process;
+
+    if conflicts.has_nfqws2_processes {
+        // Kill by PID instead of killall — safer, only kills processes we detected
+        if let Ok(result) = run_process(&["pgrep", "-x", "nfqws2"], 3_000).await {
+            if result.exit_code == 0 {
+                for pid in result.stdout.lines() {
+                    let pid = pid.trim();
+                    if !pid.is_empty() {
+                        let _ = run_process(&["kill", pid], 3_000).await;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    for table in &conflicts.conflicting_tables {
+        let _ = SystemNft.run(table.delete_batch(consent)).await;
+    }
+}
+
+/// Re-check and resolve conflicts silently (used between protocol scans).
+pub async fn resolve_bypass_conflicts_if_any(own_table: &str) {
+    if SKIP_CONFLICT_CLEANUP.load(Ordering::Relaxed) {
+        return; // embedded: чужие трубы/процессы не трогаем
+    }
+    let conflicts = detect_bypass_conflicts(own_table).await;
+    if !conflicts.is_empty() {
+        resolve_bypass_conflicts_manual(&conflicts, &UserConsent::granted()).await;
+    }
+}
+
+fn prompt_yes_no() -> bool {
+    if AUTO_YES.load(Ordering::Relaxed) {
+        eprintln!("(auto-confirmed by --auto)");
+        return true;
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!("  non-interactive mode: use --auto to confirm automatically");
+        return false;
+    }
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let input = input.trim().to_lowercase();
+    input.is_empty() || input == "y" || input == "yes"
+}
+
+// ── Shared cleanup state ────────────────────────────────────────────────────
+
+/// Shared state for Ctrl+C handler: nft table to drop + optional service to restart.
+pub type CleanupState = Arc<Mutex<CleanupInfo>>;
+
+pub struct CleanupInfo {
+    /// Метка НАШЕЙ таблицы: единственное, что аварийные пути вправе снести.
+    pub nft_table: OwnedTableMarker,
+    pub stopped_service: Option<ServiceManager>,
+    /// Strategies found so far, so a Ctrl+C / SIGTERM mid-scan still writes them.
+    pub scan_progress: Option<ScanProgressState>,
+}
+
+fn emergency_cleanup_sync(info: &CleanupInfo) {
+    // Drop queue rules before terminating their listeners so packets are not
+    // sent to an unbound NFQUEUE during emergency shutdown.
+    let _ = SystemNftSync.run(info.nft_table.drop_batch());
+    blockcheckw::system::process::start_kill_all_background_processes();
+
+    if let Some(ref mgr) = info.stopped_service {
+        let _ = match mgr {
+            ServiceManager::Systemd { unit } => std::process::Command::new("systemctl")
+                .args(["start", unit])
+                .status(),
+            ServiceManager::InitD { script } => {
+                std::process::Command::new(script).arg("start").status()
+            }
+        };
+    }
+}
+
+// ── Scan progress (interrupt-safe result accumulator) ────────────────────────
+
+/// Sink that `run_parallel` pushes each AVAILABLE strategy's args into as it is
+/// discovered, so found strategies are never lost to an interrupt.
+pub type SuccessSink = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+/// Shared, signal-handler-visible view of what a scan has found so far.
+pub type ScanProgressState = Arc<std::sync::Mutex<ScanProgress>>;
+
+struct CurrentProto {
+    protocol: blockcheckw::config::Protocol,
+    found: SuccessSink,
+}
+
+/// Accumulates scan results across protocols. The signal handler reads
+/// [`snapshot`](ScanProgress::snapshot) to write a report before exiting, so an
+/// interrupt mid-protocol still persists everything found up to that point.
+pub struct ScanProgress {
+    pub domain: String,
+    pub output: Option<String>,
+    pub block_type: blockcheckw::dto::BlockType,
+    pub dns_spoofed: blockcheckw::dto::DnsSpoofed,
+    blocked: Vec<blockcheckw::config::Protocol>,
+    completed: Vec<blockcheckw::pipeline::report::ProtocolSummary>,
+    current: Option<CurrentProto>,
+}
+
+impl ScanProgress {
+    pub fn new(domain: String, output: Option<String>) -> ScanProgressState {
+        Arc::new(std::sync::Mutex::new(ScanProgress {
+            domain,
+            output,
+            block_type: blockcheckw::dto::BlockType::NotBlocked,
+            dns_spoofed: blockcheckw::dto::DnsSpoofed::Unchecked,
+            blocked: Vec::new(),
+            completed: Vec::new(),
+            current: None,
+        }))
+    }
+
+    /// Record the blocked protocols detected at baseline, so an interrupted
+    /// scan persists the same `blocked` list as a completed run (#49).
+    pub fn set_blocked(&mut self, blocked: Vec<blockcheckw::config::Protocol>) {
+        self.blocked = blocked;
+    }
+
+    /// Record the network-layer block verdict so an interrupted scan persists
+    /// the same `block_type` as a completed run.
+    pub fn set_block_type(&mut self, block_type: blockcheckw::dto::BlockType) {
+        self.block_type = block_type;
+    }
+
+    /// Record the DNS-spoofing flag so an interrupted scan persists it too.
+    pub fn set_dns_spoofed(&mut self, dns_spoofed: blockcheckw::dto::DnsSpoofed) {
+        self.dns_spoofed = dns_spoofed;
+    }
+
+    /// Start a protocol; returns the sink to hand to `run_parallel`.
+    pub fn begin_protocol(&mut self, protocol: blockcheckw::config::Protocol) -> SuccessSink {
+        let found: SuccessSink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.current = Some(CurrentProto {
+            protocol,
+            found: found.clone(),
+        });
+        found
+    }
+
+    /// Fold the in-progress protocol into the completed set (called when it
+    /// finishes normally). Empty protocols are kept to mirror the summary shown.
+    pub fn finish_protocol(&mut self) {
+        if let Some(c) = self.current.take() {
+            let strategies = c.found.lock().unwrap().clone();
+            self.completed
+                .push(blockcheckw::pipeline::report::ProtocolSummary {
+                    protocol: c.protocol,
+                    strategies,
+                });
+        }
+    }
+
+    /// Everything found so far, including the in-progress protocol's partial
+    /// results. This is what makes an interrupted scan still produce a report.
+    pub fn snapshot(&self) -> Vec<blockcheckw::pipeline::report::ProtocolSummary> {
+        let mut out = self.completed.clone();
+        if let Some(c) = &self.current {
+            let found = c.found.lock().unwrap().clone();
+            if !found.is_empty() {
+                out.push(blockcheckw::pipeline::report::ProtocolSummary {
+                    protocol: c.protocol,
+                    strategies: found,
+                });
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod scan_progress_tests {
+    use super::ScanProgress;
+    use blockcheckw::config::Protocol;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn snapshot_empty_when_nothing_found() {
+        let p = ScanProgress::new("ex.com".into(), None);
+        assert!(p.lock().unwrap().snapshot().is_empty());
+    }
+
+    #[test]
+    fn snapshot_includes_completed_protocol() {
+        let p = ScanProgress::new("ex.com".into(), None);
+        {
+            let mut g = p.lock().unwrap();
+            let sink = g.begin_protocol(Protocol::HttpsTls12);
+            sink.lock().unwrap().push(args("--dpi-desync=fake"));
+            g.finish_protocol();
+        }
+        let snap = p.lock().unwrap().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].strategies, vec![args("--dpi-desync=fake")]);
+    }
+
+    #[test]
+    fn snapshot_includes_in_progress_partial() {
+        // THE #41 bug: interrupted mid-protocol must still expose found strategies.
+        let p = ScanProgress::new("ex.com".into(), None);
+        let sink = p.lock().unwrap().begin_protocol(Protocol::HttpsTls12);
+        sink.lock().unwrap().push(args("--dpi-desync=split2"));
+        // deliberately NO finish_protocol — simulating an interrupt
+        let snap = p.lock().unwrap().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].strategies, vec![args("--dpi-desync=split2")]);
+    }
+
+    #[test]
+    fn snapshot_skips_empty_in_progress() {
+        let p = ScanProgress::new("ex.com".into(), None);
+        let _sink = p.lock().unwrap().begin_protocol(Protocol::HttpsTls12);
+        assert!(p.lock().unwrap().snapshot().is_empty());
+    }
+}
+
+/// Create shared cleanup state and spawn signal handlers (SIGINT + SIGTERM) that will:
+/// 1. Drop our nft table
+/// 2. Restart zapret2 service if we stopped it
+pub fn spawn_cleanup_handler(nft_table: &str) -> CleanupState {
+    let state = Arc::new(Mutex::new(CleanupInfo {
+        nft_table: OwnedTableMarker::planned(nft_table),
+        stopped_service: None,
+        scan_progress: None,
+    }));
+
+    // Panic hook: restore zapret2 synchronously if we crash.
+    // We can't use async here, so we shell out directly.
+    let panic_state = state.clone();
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort synchronous cleanup
+        blockcheckw::network::via::Via::cleanup_sync();
+        if let Ok(guard) = panic_state.try_lock() {
+            emergency_cleanup_sync(&guard);
+            if guard.stopped_service.is_some() {
+                eprintln!(
+                    "\n  {} zapret2 restored after panic",
+                    style("OK").green().bold(),
+                );
+            }
+        }
+        prev_hook(info);
+    }));
+
+    // SIGTERM handler — same cleanup as Ctrl+C
+    let sigterm_state = state.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        sigterm.recv().await;
+        graceful_cleanup("SIGTERM", &sigterm_state, 143).await;
+    });
+
+    // SIGINT (Ctrl+C) handler
+    let sigint_state = state.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            // Spawn force-quit listener + delayed hint
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                eprintln!(
+                    "  {} press Ctrl+C again for emergency cleanup",
+                    style("→").dim()
+                );
+            });
+            let force_state = sigint_state.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    blockcheckw::system::process::begin_background_shutdown();
+                    blockcheckw::network::via::Via::cleanup_sync();
+                    if let Ok(guard) = force_state.try_lock() {
+                        eprintln!("\n  emergency cleanup");
+                        emergency_cleanup_sync(&guard);
+                        std::process::exit(137);
+                    }
+                    eprintln!("\n  network cleanup already in progress; waiting for safe shutdown");
+                }
+            });
+            graceful_cleanup("Ctrl+C", &sigint_state, 130).await;
+        }
+    });
+
+    state
+}
+
+/// Shared graceful cleanup logic for SIGINT and SIGTERM.
+async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i32) {
+    // Make shutdown atomic with BackgroundProcess::spawn. No plan may start a
+    // new nfqws2 instance after this point.
+    blockcheckw::system::process::begin_background_shutdown();
+
+    eprintln!(
+        "\n{}",
+        style(format!("=== {signal_name} — cleaning up ==="))
+            .bold()
+            .cyan()
+    );
+
+    blockcheckw::network::via::Via::cleanup_all().await;
+    let info = state.lock().await;
+
+    blockcheckw::firewall::nftables::drop_table(&SystemNft, &info.nft_table).await;
+    eprintln!(
+        "  {} nft table '{}' dropped",
+        style("OK").green().bold(),
+        info.nft_table.name(),
+    );
+    // With queue rules gone, explicitly kill and reap every child we spawned.
+    // process::exit below skips destructors, so kill_on_drop alone is not enough.
+    blockcheckw::system::process::kill_all_background_processes().await;
+    if let Some(ref mgr) = info.stopped_service {
+        if start_service(mgr).await {
+            eprintln!(
+                "  {} zapret2 restarted via {mgr}",
+                style("OK").green().bold(),
+            );
+        } else {
+            eprintln!(
+                "  {}failed to restart zapret2 via {mgr}, please start manually",
+                WARN,
+            );
+        }
+    }
+    // Persist partial results only after network state is safe. A second Ctrl+C
+    // may skip the report, but must never leave queue rules or zapret2 altered.
+    if let Some(progress) = &info.scan_progress {
+        let (domain, output, block_type, dns_spoofed, blocked, summary) = {
+            let p = progress.lock().unwrap();
+            (
+                p.domain.clone(),
+                p.output.clone(),
+                p.block_type,
+                p.dns_spoofed,
+                p.blocked.clone(),
+                p.snapshot(),
+            )
+        };
+        if !summary.is_empty() {
+            match scan::write_scan_reports(
+                &domain,
+                output.as_deref(),
+                block_type,
+                dns_spoofed,
+                &blocked,
+                &summary,
+            ) {
+                Ok(w) => eprintln!(
+                    "  {} partial results saved: {} strategies → {}",
+                    style("OK").green().bold(),
+                    w.count,
+                    style(&w.scan_path).cyan(),
+                ),
+                Err(e) => eprintln!("  {}failed to save partial results: {e}", WARN),
+            }
+        }
+    }
+    std::process::exit(exit_code);
+}
+
+/// Record that we stopped a service, so Ctrl+C handler can restart it.
+pub async fn set_stopped_service(state: &CleanupState, mgr: ServiceManager) {
+    state.lock().await.stopped_service = Some(mgr);
+}
+
+/// Register the scan's result accumulator so the signal handler can write a
+/// report from whatever was found if the scan is interrupted.
+pub async fn set_scan_progress(state: &CleanupState, progress: ScanProgressState) {
+    state.lock().await.scan_progress = Some(progress);
+}
+
+/// Поднять zapret2 обратно. Своих nft-правил он не теряет: init-скрипт
+/// применяет их на `start` ровно так же, как снимал на `stop` (#66).
+pub async fn restore_service(mgr: &ServiceManager, con: &blockcheckw::ui::Console) {
+    con.newline();
+    con.section("Restoring zapret2");
+    if start_service(mgr).await {
+        con.ok(&format!("zapret2 restarted via {mgr}"));
+    } else {
+        con.warn(&format!(
+            "failed to restart zapret2 via {mgr}, please start manually"
+        ));
+    }
+}
+
+// ── Instance lock ───────────────────────────────────────────────────────────
+
+const LOCK_PATH: &str = "/var/run/blockcheckw.lock";
+
+/// Acquire an exclusive lock to prevent parallel blockcheckw execution.
+/// Opaque lock handle — keeps the flock alive until dropped.
+pub struct InstanceLock(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
+
+/// Returns the lock handle (must be kept alive for the duration of the process).
+/// Exits if another instance is already running.
+pub fn acquire_instance_lock() -> InstanceLock {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::io::Write;
+
+    // No truncate before flock — truncate would create a new file description
+    // and bypass the existing lock held by another process
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(LOCK_PATH);
+
+    let file = match file {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "  {} cannot create lock file {}: {e}",
+                style("ERROR:").red().bold(),
+                LOCK_PATH,
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Try non-blocking first
+    let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((inner_file, _err)) => {
+            // Lock held by another instance — wait (supports pipe: universal | check)
+            let held_pid = std::fs::read_to_string(LOCK_PATH).unwrap_or_default();
+            let held_pid = held_pid.trim();
+            eprintln!(
+                "  {} waiting for another blockcheckw instance (PID {held_pid}) to finish...",
+                style("WAIT:").yellow().bold(),
+            );
+            match Flock::lock(inner_file, FlockArg::LockExclusive) {
+                Ok(lock) => lock,
+                Err(_) => {
+                    eprintln!("  {} failed to acquire lock", style("ERROR:").red().bold(),);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    // Write PID for diagnostics (truncate after locking, not before)
+    // Flock<File> implements DerefMut<Target=File>, so we can write directly
+    let mut lock = lock;
+    let _ = lock.set_len(0);
+    let _ = write!(lock, "{}", std::process::id());
+
+    InstanceLock(lock)
+}
+
+// ── Prerequisites check ─────────────────────────────────────────────────────
+
+/// Свидетельства, добытые преflight'ом. Носит тот, кто их получил: собрать
+/// `Plan` без него невозможно — см. `nfqws2::plan::FilterMark`.
+pub struct Prerequisites {
+    pub filter_mark: blockcheckw::nfqws2::plan::FilterMark,
+}
+
+/// Check that required binaries and kernel features are available.
+/// Exits with code 6 (matching vanilla blockcheck2) if something is missing.
+pub fn check_prerequisites(con: &blockcheckw::ui::Console) -> Prerequisites {
+    use blockcheckw::config::CoreConfig;
+    use blockcheckw::nfqws2::run::SystemNfqws2;
+    use blockcheckw::nfqws2::Error as Nfqws2Error;
+
+    con.section("Checking prerequisites");
+
+    let config = CoreConfig::default();
+    let mut ok = true;
+
+    // nfqws2 binary
+    if std::path::Path::new(&config.nfqws2_path).is_file() {
+        con.ok(&format!("nfqws2: {}", style(&config.nfqws2_path).dim()));
+    } else {
+        con.error(&format!(
+            "nfqws2 not found at {}",
+            style(&config.nfqws2_path).cyan()
+        ));
+        con.println(&format!(
+            "       run \"{}/install_bin.sh\" or check ZAPRET_BASE path",
+            config.zapret_base,
+        ));
+        ok = false;
+    }
+
+    // nft binary
+    if which(nft::BINARY) {
+        con.ok(nft::BINARY);
+    } else {
+        con.error("nft not found in PATH");
+        con.println("       install nftables: apt install nftables / opkg install nftables");
+        ok = false;
+    }
+
+    // nft (наличие таблиц читаем, а не пытаемся судить про очереди —
+    // `is_available_sync()` зовёт `nft list tables` и про NFQUEUE ничего не
+    // знает; за очередь теперь по-настоящему ручается дымовой запуск ниже)
+    if ok {
+        if nft::is_available_sync() {
+            con.ok("nft");
+        } else {
+            con.error("nft is not usable (`nft list tables` failed)");
+            con.println(
+                "       check that nftables is installed and you have permission to run it",
+            );
+            ok = false;
+        }
+    }
+
+    // 4. Движок понимает --filter-mark (нужна сборка ≥ v1.0.5)
+    let witness = if ok {
+        match SystemNfqws2::probe_sync(&config.nfqws2_env()) {
+            Ok(w) => {
+                con.ok("nfqws2 --filter-mark");
+                Some(w)
+            }
+            Err(e) => {
+                con.error(&format!("{e}"));
+                // Подсказка про версию уместна только для NoFilterMark — на
+                // Spawn (нет прав, чужая архитектура) или таймауте она
+                // указывала бы не на ту причину.
+                if matches!(e, Nfqws2Error::NoFilterMark) {
+                    con.println("       update zapret2 to v1.0.5 or newer");
+                }
+                ok = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 5. Дымовой запуск: lua-версия, архитектура, nfnetlink_queue, CAP_NET_ADMIN
+    if let Some(w) = &witness {
+        match SystemNfqws2::smoke_sync(&config.nfqws2_env(), w) {
+            Ok(()) => con.ok("nfqws2 starts and binds a queue"),
+            Err(e) => {
+                con.error(&format!("{e}"));
+                ok = false;
+            }
+        }
+    }
+
+    if !ok {
+        std::process::exit(6);
+    }
+
+    // 6. БОЕВАЯ очередь свободна — ТОЛЬКО во встроенном режиме.
+    //
+    // Дымовой запуск (шаг 5) доказывает исправность бинаря на СВОЕЙ очереди из дальнего
+    // диапазона и о боевой не говорит ничего. Занятая боевая очередь означала бы, что
+    // правила поедут в очередь с чужим слушателем: пакеты уходят не нам, и подбор молча
+    // мерит чужой мир. Своих остатков здесь уже нет — их снял идемпотентный вход.
+    //
+    // ПОЧЕМУ НЕ ВСЕГДА. Вне встроенного режима занятую очередь разбирает разрешатель
+    // конфликтов (`handle_bypass_conflicts`), и работает он ПОЗЖЕ преflight'а. Откажи мы
+    // здесь — свой же осиротевший движок на боевой очереди запирал бы человека на КАЖДОМ
+    // следующем запуске, а снял бы его тот, до кого управление уже не дошло. Это ровно та
+    // ловушка, из-за которой дымовой запуск ходит по дальнему диапазону (см. `SMOKE_QUEUES`).
+    // Во встроенном режиме разрешателя нет по уговору с вызывающим — там отказ и уместен.
+    //
+    // Отказ машинный: оркестратору нужен КОД и ИМЯ занятой очереди, а не строка для глаз.
+    if SKIP_CONFLICT_CLEANUP.load(Ordering::Relaxed)
+        && queue_is_taken(blockcheckw::nfqws2::plan::QueueNum::new(config.base_qnum))
+    {
+        con.error(&format!(
+            "боевая очередь {} занята чужим слушателем",
+            config.base_qnum
+        ));
+        println!(
+            "{{\"outcome\":\"broken\",\"reason\":\"queue_busy\",\"queue\":{}}}",
+            config.base_qnum
+        );
+        std::process::exit(blockcheckw::dto::EXIT_QUEUE_BUSY);
+    }
+
+    Prerequisites {
+        filter_mark: witness.expect("ok означает, что свидетельство есть"),
+    }
+}
+
+/// Занята ли очередь прямо сейчас. Читаем procfs тем же способом, что и исполнитель
+/// (`nfqws2::run`): недоступный procfs означает «не знаем», и тогда не мешаем — остановит
+/// нас сам движок, когда не сможет забиндиться.
+fn queue_is_taken(queue: blockcheckw::nfqws2::plan::QueueNum) -> bool {
+    std::fs::read_to_string(blockcheckw::nfqws2::ready::PROCFS_PATH)
+        .map(|procfs| blockcheckw::nfqws2::ready::queue_bound(&procfs, queue))
+        .unwrap_or(false)
+}
+
+/// Check whether `name` is an executable on `PATH`.
+///
+/// We walk `$PATH` ourselves instead of shelling out to the `which` command:
+/// on minimal targets (busybox / OpenWrt routers) `which` is often absent, and
+/// the spawn then fails — which previously got misreported as "not found".
+fn which(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| which_in(name, &path))
+        .unwrap_or(false)
+}
+
+fn which_in(name: &str, path: &std::ffi::OsStr) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod which_tests {
+    use super::which_in;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bcw_which_{tag}_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(dir: &Path, name: &str, mode: u32) {
+        let p = dir.join(name);
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn finds_executable_in_path() {
+        let dir = tmp_dir("found");
+        write_file(&dir, "faketool", 0o755);
+        let path = OsString::from(&dir);
+        assert!(which_in("faketool", &path));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_binary_returns_false() {
+        let dir = tmp_dir("missing");
+        let path = OsString::from(&dir);
+        assert!(!which_in("nope_not_here", &path));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_executable_file_returns_false() {
+        let dir = tmp_dir("nonexec");
+        write_file(&dir, "plain", 0o644);
+        let path = OsString::from(&dir);
+        assert!(!which_in("plain", &path));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn searches_multiple_path_entries() {
+        let a = tmp_dir("multi_a");
+        let b = tmp_dir("multi_b");
+        write_file(&b, "tool", 0o755);
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        assert!(which_in("tool", &path));
+        fs::remove_dir_all(&a).ok();
+        fs::remove_dir_all(&b).ok();
+    }
+}
+
+/// Generate a local-time prefix for report filenames: "2026-03-20_18-30"
+pub fn chrono_local_prefix() -> String {
+    use std::process::Command;
+    let output = Command::new("date").arg("+%Y-%m-%d_%H-%M").output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            format!("{secs}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::{
+        foreign_table_candidates, pgrep_has_matches, table_has_bypass_rules, ForeignTable,
+    };
+
+    /// Роутер с OpenWrt, zapret1 и zapret2 одновременно.
+    /// То, что вернул бы `nft list tables` на роутере с работающим zapret1.
+    fn table_list() -> Vec<(String, String)> {
+        [
+            ("inet", "fw4"),
+            ("inet", "zapret"),
+            ("inet", "zapret2"),
+            ("ip", "nat"),
+        ]
+        .iter()
+        .map(|(f, n)| (f.to_string(), n.to_string()))
+        .collect()
+    }
+
+    /// Есть ли среди кандидатов таблица с таким именем.
+    fn has(found: &[ForeignTable], family: &str, name: &str) -> bool {
+        found
+            .iter()
+            .any(|t| t.family() == family && t.name() == name)
+    }
+
+    /// Таблица zapret1: очередь на 80/443.
+    const ZAPRET1_TABLE: &str = "\
+table inet zapret {
+	chain postrouting {
+		type filter hook postrouting priority 101; policy accept;
+		meta l4proto tcp tcp dport { 80, 443 } queue num 200 bypass
+	}
+}
+";
+
+    #[test]
+    fn zapret1_table_is_foreign_when_we_use_our_own_name() {
+        let found = foreign_table_candidates(&table_list(), "blockcheckw");
+        assert!(
+            has(&found, "inet", "zapret"),
+            "таблица zapret1 должна попадать в кандидаты: {found:?}"
+        );
+    }
+
+    #[test]
+    fn own_table_is_never_reported_as_foreign() {
+        // issue #66: пока own_table == "zapret", таблица zapret1 невидима
+        // для детекта конфликтов — и молча сносится нашим cleanup
+        let found = foreign_table_candidates(&table_list(), "zapret");
+        assert!(
+            !has(&found, "inet", "zapret"),
+            "своя таблица не может быть чужой: {found:?}"
+        );
+    }
+
+    #[test]
+    fn openwrt_fw4_table_is_skipped() {
+        let found = foreign_table_candidates(&table_list(), "blockcheckw");
+        assert!(
+            !found.iter().any(|t| t.name() == "fw4"),
+            "fw4 — обвязка OpenWrt, не bypass: {found:?}"
+        );
+    }
+
+    #[test]
+    fn queue_on_https_port_looks_like_bypass() {
+        assert!(table_has_bypass_rules(ZAPRET1_TABLE));
+        assert!(table_has_bypass_rules(
+            "\t\ttcp dport 443 queue num 100 bypass\n"
+        ));
+    }
+
+    #[test]
+    fn table_without_queue_is_not_bypass() {
+        let nat =
+            "table ip nat {\n\tchain prerouting {\n\t\ttcp dport 443 dnat to 10.0.0.1\n\t}\n}\n";
+        assert!(!table_has_bypass_rules(nat));
+    }
+
+    #[test]
+    fn queue_on_other_port_is_not_bypass() {
+        let dns =
+            "table inet mydns {\n\tchain output {\n\t\tudp sport 53 queue num 300 bypass\n\t}\n}\n";
+        assert!(!table_has_bypass_rules(dns));
+    }
+
+    #[test]
+    fn pgrep_success_with_pid_means_process_found() {
+        assert!(pgrep_has_matches(0, "1234\n"));
+    }
+
+    #[test]
+    fn pgrep_empty_or_failed_means_process_not_found() {
+        assert!(!pgrep_has_matches(0, "\n"));
+        assert!(!pgrep_has_matches(1, ""));
+        assert!(!pgrep_has_matches(1, "unexpected output\n"));
+    }
+}

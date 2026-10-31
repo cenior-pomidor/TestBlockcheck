@@ -1,0 +1,1252 @@
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+
+mod cmd;
+mod tracing_otel;
+
+use blockcheckw::nfqws2::space as mark_space;
+
+const fn help_styles() -> clap::builder::styling::Styles {
+    use clap::builder::styling::{AnsiColor, Color, Style, Styles};
+
+    Styles::styled()
+        .header(
+            Style::new()
+                .fg_color(Some(Color::Ansi(AnsiColor::Yellow)))
+                .bold()
+                .underline(),
+        )
+        .usage(
+            Style::new()
+                .fg_color(Some(Color::Ansi(AnsiColor::Yellow)))
+                .bold(),
+        )
+        .literal(
+            Style::new()
+                .fg_color(Some(Color::Ansi(AnsiColor::Green)))
+                .bold(),
+        )
+        .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Cyan))))
+}
+
+/// Верхнеуровневая справка перечисляет только команды: таймауты, DNS-режим и
+/// число проходов задаются флагами конкретной команды (#66).
+const AFTER_HELP: &str = "\
+Examples:
+  blockcheckw scan -d rutracker.org                скан домена на работающие страты
+  blockcheckw scan -d example.com -p tls12         проверка только TLS 1.2
+  blockcheckw scan -d example.com -o report.json   сохранить отчёт в файл
+  blockcheckw check --from-file report.json        проверка найденных страт
+  blockcheckw universal --domain-list domains.txt  подбор пересекающихся страт для разных доменов
+  blockcheckw status --domain-list domains.txt     оценка эффективности работающего zapret2
+
+Per-command flags (timeouts, DNS mode, passes, worker count):
+  blockcheckw <command> --help";
+
+#[derive(Parser)]
+#[command(
+    name = "blockcheckw",
+    about = "Parallel DPI bypass strategy scanner",
+    after_help = AFTER_HELP,
+    styles = help_styles(),
+)]
+struct Cli {
+    /// Print version and check for updates
+    #[arg(short = 'V', long)]
+    version: bool,
+
+    /// Upgrade to the latest release
+    #[arg(long)]
+    upgrade: bool,
+
+    /// Number of parallel workers
+    #[arg(short, long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=2048))]
+    workers: u16,
+
+    /// How many strategies to keep loaded in one nfqws2 process at a time
+    #[arg(long, default_value_t = 1024)]
+    profiles_per_instance: usize,
+
+    /// Auto-confirm all prompts (non-interactive mode)
+    #[arg(long, global = true)]
+    auto: bool,
+
+    /// Route traffic through a gateway or proxy (e.g. 100.64.0.5, localhost:8888, socks5://host:1080)
+    #[arg(long, global = true)]
+    via: Option<String>,
+
+    /// Не трогать чужие nft-таблицы и процессы nfqws2 (их владелец — вызывающий).
+    /// УЗКИЙ ключ, только про уборку: всё остальное во встроенном режиме включает --embedded.
+    #[arg(long, global = true)]
+    no_conflict_cleanup: bool,
+
+    /// ВСТРОЕННЫЙ РЕЖИМ: подбор поднят продуктом, а не человеком.
+    ///
+    /// Включает разом всё, что из этого следует: чужое ядро не трогается (как
+    /// --no-conflict-cleanup), пробы без десинка несут собственную марку процесса, вопросов
+    /// человеку не задаётся, подбор уходит в свою группу процессов и снимает свои остатки при
+    /// входе, а память прошлых запусков (~/.config/blockcheckw/config.json) НЕ ЧИТАЕТСЯ И НЕ
+    /// ПИШЕТСЯ — унаследованное умолчание ломало подбор молча.
+    #[arg(long, global = true)]
+    embedded: bool,
+
+    /// Номер боевой очереди NFQUEUE (умолчание 200).
+    #[arg(long, value_name = "N")]
+    qnum: Option<u16>,
+
+    /// Имя нашей nft-таблицы (умолчание blockcheckw).
+    #[arg(long, value_name = "NAME")]
+    nft_table: Option<String>,
+
+    /// База марки воркера, 0xHEX или десятичное (умолчание 0x20000000).
+    #[arg(long, value_name = "MARK")]
+    mark_base: Option<String>,
+
+    /// Марка десинка, 0xHEX или десятичное (умолчание 0x10000000).
+    #[arg(long, value_name = "MARK")]
+    desync_mark: Option<String>,
+
+    /// Начало диапазона дымовых очередей преflight'а, 10 подряд (умолчание 65526).
+    #[arg(long, value_name = "N")]
+    smoke_qnum_base: Option<u16>,
+
+    /// Отдавать подтверждённые стратегии ПОТОКОМ (ndjson в stdout), не дожидаясь конца
+    /// прогона: пока идёт подбор, цель в карантине, и первая же годная стратегия лечит.
+    #[arg(long, global = true)]
+    stream: bool,
+
+    /// Печатать ход работы машиночитаемо (ndjson в stderr): фаза, сделано, всего, секунды.
+    /// Чтобы «встал» судилось сроком, а не гаданием по выводу для человека.
+    #[arg(long, global = true)]
+    progress: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run parallel scaling benchmark to find optimal worker count
+    Benchmark {
+        /// Seconds to run per worker-count level
+        #[arg(short, long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(5..))]
+        time: u64,
+
+        /// Maximum number of workers to test
+        #[arg(short = 'M', long, value_parser = clap::value_parser!(u16).range(1..=2048))]
+        max_workers: Option<u16>,
+
+        /// Target domain
+        #[arg(short, long, default_value = "rutracker.org")]
+        domain: String,
+
+        /// Protocol to benchmark (http, tls12, tls13)
+        #[arg(short, long, default_value = "tls12")]
+        protocol: String,
+
+        /// Raw output: table only, no recommendation (for scripts)
+        #[arg(long)]
+        raw: bool,
+    },
+
+    /// Generate shell completions (prints to stdout, or installs with --install)
+    Completions {
+        /// Shell to generate completions for (auto-detected if omitted)
+        #[arg(value_enum)]
+        shell: Option<clap_complete::Shell>,
+
+        /// Install completions into the appropriate system directory
+        #[arg(long)]
+        install: bool,
+    },
+
+    /// Check strategies from a vanilla report with real data transfer.
+    /// В JSON две оси: `working` — прошёл ли канал (главная), `observed`/`admits` —
+    /// подлинность ресурса (побочная). Читать надо обе: «не наблюдали» и «наблюдали
+    /// пустоту» оба дают `working: false`, но это разные вещи.
+    Check {
+        /// Path to report file (reads from stdin if omitted and pipe detected)
+        #[arg(long)]
+        from_file: Option<String>,
+
+        /// Target domain to check
+        #[arg(short, long, default_value = "rutracker.org")]
+        domain: String,
+
+        /// DNS resolution mode: auto, system, doh
+        #[arg(long, default_value = "auto")]
+        dns: String,
+
+        /// Потолок одной пробы в секундах — `Expiry::Ceiling`: сколько всего мы готовы
+        /// ждать, даже если цель ещё отдаёт байты. Утверждение о нас, не о цели.
+        /// Замер 16.09 на стенде: медиана полной доставки 0,7–1,4 с, потолок не наступил
+        /// ни разу — страница, идущая дольше трёх секунд, человеку уже не годится.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=60))]
+        timeout: u64,
+
+        /// Порог тишины в миллисекундах — `Expiry::Idle`: проба обрывается, когда цель
+        /// молчит дольше этого после последнего шага (коннект, рукопожатие, заголовки,
+        /// кадр тела). Мёртвая стратегия кончается здесь, а не на потолке. Замер 16.09 на
+        /// стенде: здоровая тишина 180–370 мс, наибольшая 857; check 170 → 54–74 с при
+        /// том же числе рабочих. Порог видно в отчёте рядом с `longest_silence_ms`.
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..=60_000))]
+        idle_ms: u64,
+
+        /// Общий срок прогона в секундах (0 — без срока).
+        ///
+        /// По истечении перебор прекращается, а отдаётся ТО, ЧТО УСПЕЛО подтвердиться:
+        /// пустой отчёт по сроку наказывал бы человека за нашу медлительность. Исход при
+        /// этом честно называется `censored`/`stopped_at: deadline` — замер не полон.
+        #[arg(long, default_value_t = 0)]
+        deadline: u64,
+
+        /// Stop the SEARCH after N PASSING strategies, per protocol (0 = check all).
+        /// Выдачу не урезает: в отчёт идёт всякая наблюдённая стратегия, ранжированная
+        /// по судьбе.
+        #[arg(long, default_value_t = 0)]
+        take: usize,
+
+        /// `M` — сколько раз мерить байтовую ось (спека §6-тер, «мера байтов»).
+        ///
+        /// Один прогон на маленьком файле рапортует 19-20 «рабочих» стратегий; два
+        /// ОДИНАКОВЫХ прогона (тот же путь, тот же таймаут) дали 19 и 19, из которых
+        /// общих — 11: разошлись 16 из 27. Третий прогон с таймаутом в 2,5 раза больше
+        /// добавил ровно одну — флапает провод, а не нетерпение. Устойчивое ядро по
+        /// трём прогонам — 9. Умолчание `M = 3` несёт этот замер рядом (спека §3):
+        /// повторы возвращаются не голосованием, а числом измерений частоты.
+        ///
+        /// `M = 0` — честный исход «не наблюдали» (не паникует).
+        #[arg(long, default_value_t = 3)]
+        passes: usize,
+
+        /// Чистый egress для ОБОИХ эталонов (снимается дважды для каждого из двух
+        /// путей — `--probe-path` и `--identity-path`). Без него доли не существует, а
+        /// круг судеб не сужается до `Mirage`/`Good`/`Grinding` (см. `Fate::Mirage`).
+        #[arg(long, value_name = "ENDPOINT")]
+        reference_via: Option<String>,
+
+        /// Путь БАЙТОВОЙ оси (главная, спека §6-тер): сколько долей эталона вытянула
+        /// стратегия, повторяется `--passes` раз. Умолчание — корень `/`: главный
+        /// вердикт от пути не зависит (DPI решает по SNI в `ClientHello`, до HTTP), а
+        /// байтовая ось требует ОБЪЁМА настоящего ресурса, а не статичного файла.
+        #[arg(long, value_name = "PATH", default_value = "/")]
+        probe_path: String,
+
+        /// Путь ОСИ ПОДЛИННОСТИ (побочная, спека §6-тер): сверяется с эталоном ТОЧНО,
+        /// один раз. Только она может дать круг `[Fate::Mirage]`. Умолчание —
+        /// `/robots.txt`: детерминированный файл не редиректит и не гуляет в объёме
+        /// между узлами CDN, значит сверка точна. Отката на `--probe-path` нет: если
+        /// `robots.txt` у домена нет, сервер отдаст `404` — и это полноценная проба,
+        /// эталон получит тот же `404` и сойдётся.
+        #[arg(long, value_name = "PATH", default_value = "/robots.txt")]
+        identity_path: String,
+
+        /// Save JSON report to file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Scan domain for working DPI bypass strategies
+    Scan {
+        /// Target domain to check
+        #[arg(short, long, default_value = "rutracker.org")]
+        domain: String,
+
+        /// Protocols to test (comma-separated: http,tls12,tls13)
+        #[arg(short, long, default_value = "http,tls12,tls13")]
+        protocols: String,
+
+        /// DNS resolution mode: auto, system, doh
+        #[arg(long, default_value = "auto")]
+        dns: String,
+
+        /// Overall scan timeout in seconds (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+
+        /// Show top N ranked strategies per protocol (0 = all)
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+
+        /// Save found strategies to file
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Load strategies from file instead of using built-in corpus
+        #[arg(long)]
+        from_file: Option<String>,
+
+        /// Verify aliveness of IP-blocked hosts through this egress ONLY (does NOT
+        /// route the scan). When the direct SYN is dropped, a probe through this
+        /// proxy splits the verdict into SYN-blocked (host alive elsewhere) vs
+        /// host-dead. Same endpoint format as --via (e.g. socks5://host:1080).
+        #[arg(long)]
+        alive_via: Option<String>,
+    },
+
+    /// Show zapret2 effectiveness: compare access with and without the service
+    Status {
+        /// Path to file with blocked domains (one per line)
+        #[arg(long)]
+        domain_list: String,
+
+        /// DNS resolution mode: auto, system, doh
+        #[arg(long, default_value = "auto")]
+        dns: String,
+
+        /// Request timeout per domain in seconds
+        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u64).range(1..=60))]
+        timeout: u64,
+
+        /// Save JSON report to file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Find universal strategies that work across multiple blocked domains
+    Universal {
+        /// Path to file with blocked domains (one per line)
+        #[arg(long)]
+        domain_list: String,
+
+        /// Protocols to test (comma-separated: http,tls12,tls13)
+        #[arg(short, long, default_value = "tls12")]
+        protocols: String,
+
+        /// DNS resolution mode: auto, system, doh
+        #[arg(long, default_value = "auto")]
+        dns: String,
+
+        /// Number of domains to sample from the list
+        #[arg(long, default_value_t = 10)]
+        sample: usize,
+
+        /// Save report to file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+/// Разобрать режим DNS с оглядкой на встроенность.
+///
+/// ВО ВСТРОЕННОМ РЕЖИМЕ СИСТЕМНЫЙ РЕЗОЛВЕР ЗАПРЕЩЁН. Он работает внешними программами
+/// (`getent`, `nslookup`), а чужому процессу не поставить `SO_MARK` — запрос имени уйдёт
+/// немаркированным, то есть тем же путём, что трафик человека. Если вызывающий заворачивает
+/// `udp dport 53` в свою очередь (а третий невод заворачивает), подбор окажется внутри мира,
+/// который меряет, уже на уровне имени. Это не чинится ключом — это свойство чужого процесса,
+/// и потому здесь отказ, а не предупреждение.
+///
+/// `auto` во встроенном режиме молча становится `doh`: он начинается с системного резолва, и
+/// та же беда пришла бы через него.
+fn dns_mode_of(raw: &str, embedded: bool) -> blockcheckw::config::DnsMode {
+    let mode = match blockcheckw::config::parse_dns_mode(raw) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !embedded {
+        return mode;
+    }
+    match mode {
+        blockcheckw::config::DnsMode::System => {
+            eprintln!(
+                "ERROR: --dns system несовместим с --embedded: системный резолвер работает \
+                 внешними программами, которым не поставить марку процесса, и запрос имени \
+                 уйдёт тем же путём, что трафик человека. Используйте --dns doh."
+            );
+            std::process::exit(2);
+        }
+        blockcheckw::config::DnsMode::Auto => {
+            eprintln!(
+                "{}--embedded: режим DNS auto начинается с системного резолва внешней \
+                 программой — беру doh, чтобы запрос имени нёс нашу марку",
+                blockcheckw::ui::WARN,
+            );
+            blockcheckw::config::DnsMode::Doh
+        }
+        blockcheckw::config::DnsMode::Doh => mode,
+    }
+}
+
+/// Return true if a named arg was explicitly provided on the command line.
+fn is_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+/// Pick the effective value: CLI-explicit wins, then config, then clap default.
+/// Returns owned String to avoid borrow conflicts with persisted config mutation.
+fn resolve_str(
+    matches: &clap::ArgMatches,
+    id: &str,
+    cli_val: &str,
+    persisted: &Option<String>,
+) -> String {
+    if is_explicit(matches, id) {
+        cli_val.to_string()
+    } else {
+        persisted.as_deref().unwrap_or(cli_val).to_string()
+    }
+}
+
+/// For protocols: stored as Vec, CLI as comma-separated string.
+fn resolve_protocols(
+    matches: &clap::ArgMatches,
+    cli_val: &str,
+    persisted: &Option<Vec<String>>,
+) -> String {
+    if is_explicit(matches, "protocols") {
+        cli_val.to_string()
+    } else {
+        persisted
+            .as_ref()
+            .map(|v| v.join(","))
+            .unwrap_or_else(|| cli_val.to_string())
+    }
+}
+
+fn resolve_u16(matches: &clap::ArgMatches, id: &str, cli_val: u16, persisted: Option<u16>) -> u16 {
+    if is_explicit(matches, id) {
+        cli_val
+    } else {
+        persisted.unwrap_or(cli_val)
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    // Panic hook: cleanup nftables table on panic (async runtime may be dead, use sync Command)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        blockcheckw::network::via::Via::cleanup_sync();
+        // Сносим ТОЛЬКО свою таблицу: метку выдаёт firewall-слой, другой
+        // команды из неё не собрать (#66). Таймаут внутри — panic-хук без
+        // него уводил роутеры в перезагрузку.
+        let _ = blockcheckw::firewall::nft::NftRunSync::run(
+            &blockcheckw::firewall::nft::SystemNftSync,
+            blockcheckw::firewall::nft::OwnedTableMarker::planned(
+                blockcheckw::config::DEFAULT_NFT_TABLE,
+            )
+            .drop_batch(),
+        );
+        default_hook(info);
+    }));
+
+    // Parse CLI: get both typed struct and raw matches (for value_source detection)
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+    // --version: print version + check for updates (no root needed)
+    if cli.version {
+        print_version_and_check().await;
+        return;
+    }
+
+    // --upgrade: download and install latest release (no root needed)
+    if cli.upgrade {
+        run_upgrade().await;
+        return;
+    }
+
+    // Completions don't need root — handle before elevation
+    if let Some(Command::Completions { shell, install }) = &cli.command {
+        let shell = shell.unwrap_or_else(|| {
+            cmd::completions::detect_shell().unwrap_or_else(|| {
+                eprintln!(
+                    "Could not detect shell. Specify it explicitly: blockcheckw completions bash"
+                );
+                std::process::exit(1);
+            })
+        });
+
+        if *install {
+            cmd::completions::install_completions(shell, &mut Cli::command());
+        } else {
+            cmd::completions::generate_completions(shell, &mut Cli::command());
+        }
+        return;
+    }
+
+    // Без команды — печатаем справку и выходим. Это должно случиться до
+    // require_root() и prereq-проверок: иначе голый `blockcheckw` поднимает
+    // права через sudo и выдаёт диагностику окружения вместо help (#66).
+    if cli.command.is_none() {
+        let _ = Cli::command().print_help();
+        println!();
+        return;
+    }
+
+    // ДВА КЛЮЧА, ДВА СМЫСЛА. Прежде оба висели на `--no-conflict-cleanup`, и разъехались бы
+    // молча у первого, кому понадобился один без другого: «не трогай чужие таблицы» — это про
+    // уборку, «я поднят продуктом» — про марку проб, группу процессов, память и вопросы человеку.
+    let embedded = cli.embedded;
+    cmd::set_auto_yes(cli.auto || embedded);
+    cmd::set_skip_conflict_cleanup(cli.no_conflict_cleanup || embedded);
+    // Пробы без десинка несут собственную марку процесса, чтобы хозяин ядра отличил наш трафик
+    // от трафика человека и не увёл его вместе с ним в карантин.
+    blockcheckw::nfqws2::mark::set_embedded(embedded);
+    blockcheckw::machine::set_stream(cli.stream);
+    blockcheckw::machine::set_progress(cli.progress);
+
+    // Пространства имён ядра — от вызывающего, а не от умолчания: у него эти очереди, таблицы
+    // и биты марки уже заняты, и заняты плотно.
+    let mark_space = {
+        let desync = match cli.desync_mark.as_deref().map(mark_space::parse_mark) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => {
+                eprintln!("ERROR: --desync-mark: {e}");
+                std::process::exit(2);
+            }
+            None => mark_space::DEFAULT_DESYNC_MARK,
+        };
+        let base = match cli.mark_base.as_deref().map(mark_space::parse_mark) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => {
+                eprintln!("ERROR: --mark-base: {e}");
+                std::process::exit(2);
+            }
+            None => mark_space::DEFAULT_WORKER_MARK_BASE,
+        };
+        match mark_space::MarkSpace::new(desync, base) {
+            Ok(space) => space,
+            Err(e) => {
+                eprintln!("ERROR: раскладка марки непригодна: {e}");
+                std::process::exit(2);
+            }
+        }
+    };
+    if mark_space.intrudes_on_neighbours() {
+        eprintln!(
+            "{}раскладка марки занимает биты 16-27, объявленные в README за соседями по ядру",
+            blockcheckw::ui::WARN,
+        );
+    }
+    mark_space::set_space(mark_space);
+
+    // ВО ВСТРОЕННОМ РЕЖИМЕ ПЛАН НЕ ДОЛЖЕН ЗАЕЗЖАТЬ В ПРИБОРНУЮ ПОЛОСУ СОСЕДА.
+    //
+    // Индекс профиля растёт снизу вверх, а краевые приборы reflex пишут свою памятку с бита
+    // 13 — значит с 8192-го профиля мы делим с ними биты, и развязка сводится к порядку
+    // правил в ЧУЖОМ рулсете. Цена потолка нулевая: умолчание 1024 лежит вчетверо ниже, а
+    // весь корпус в 13 943 стратегии режется на два плана даже впритык.
+    //
+    // Проверка стоит ЗДЕСЬ, до `require_root`: отказ по аргументу не стоит того, чтобы
+    // сперва спросить у человека пароль. Соседняя `validate_parallelism` осталась ниже
+    // намеренно — она читает число воркеров из памяти прошлых запусков, а та грузится
+    // после эскалации.
+    if embedded && cli.profiles_per_instance > mark_space::MAX_PROFILES_CLEAR_OF_NEIGHBOURS {
+        eprintln!(
+            "ERROR: --profiles-per-instance {} во встроенном режиме превышает {}: с этого числа \
+             индекс профиля занимает биты 13+, где краевые приборы соседа пишут свою памятку, \
+             и наша марка стала бы зависеть от порядка правил в чужом рулсете",
+            cli.profiles_per_instance,
+            mark_space::MAX_PROFILES_CLEAR_OF_NEIGHBOURS,
+        );
+        std::process::exit(2);
+    }
+    blockcheckw::config::set_kernel_keys(
+        cli.qnum.unwrap_or(200),
+        cli.nft_table
+            .as_deref()
+            .unwrap_or(blockcheckw::config::DEFAULT_NFT_TABLE),
+        cli.smoke_qnum_base.unwrap_or(65_526),
+    );
+    let via = cli.via.map(|raw| {
+        blockcheckw::network::via::Via::parse(&raw).unwrap_or_else(|e| {
+            eprintln!("ERROR: --via: {e}");
+            std::process::exit(1);
+        })
+    });
+
+    // --via и --reference-via несовместимы: весь прогон уже идёт через шлюз (--via),
+    // и «чистый egress» через второй шлюз ничего не доказывает, а маршруты подерутся.
+    // Проверяем до всякой работы — раньше require_root() и прочих побочных эффектов.
+    if via.is_some() {
+        if let Some(Command::Check {
+            reference_via: Some(_),
+            ..
+        }) = &cli.command
+        {
+            eprintln!(
+                "ERROR: --via и --reference-via несовместимы: весь прогон уже идёт через \
+                 шлюз, эталон через второй шлюз ничего не доказывает"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    blockcheckw::system::elevate::require_root();
+    blockcheckw::system::elevate::raise_nofile_limit();
+
+    // `--workers` is global, but `check` verifies strategies sequentially by design —
+    // warn (once, post-elevation) so users don't expect it to change `check` throughput (#33).
+    if is_explicit(&matches, "workers") && matches!(cli.command, Some(Command::Check { .. })) {
+        eprintln!(
+            "{}--workers has no effect on `check` (it verifies strategies sequentially by design)",
+            blockcheckw::ui::WARN,
+        );
+    }
+
+    // Load persisted config
+    let mut persisted = blockcheckw::persist::load();
+
+    // Resolve effective workers (top-level arg)
+    let eff_workers = resolve_u16(&matches, "workers", cli.workers, persisted.workers);
+    if is_explicit(&matches, "workers") {
+        persisted.workers = Some(cli.workers);
+    }
+
+    // #68: план не может обслужить больше проб в полёте, чем в нём загружено
+    // профилей, а номер профиля не помещается в марку за потолком маски —
+    // ловим здесь, на разборе аргументов, а не паникой в уже запущенном проце.
+    //
+    // Валидация аргументов обязана идти ДО любых побочных эффектов — в
+    // частности, до `check_prerequisites` ниже, который живьём спавнит
+    // nfqws2 (`smoke_sync`). Раньше проверка стояла после преflight'а: явно
+    // мусорный `--profiles-per-instance` отвергался только после того, как
+    // движок уже запускался и убивался вхолостую.
+    if let Err(e) =
+        blockcheckw::config::validate_parallelism(eff_workers as usize, cli.profiles_per_instance)
+    {
+        eprintln!("ERROR: {e}");
+        std::process::exit(2);
+    }
+
+    // Pre-read stdin for check in pipe mode (before acquiring lock,
+    // so the upstream pipe command can finish and release its lock first)
+    let stdin_data = {
+        use std::io::IsTerminal;
+        if matches!(cli.command, Some(Command::Check { .. })) && !std::io::stdin().is_terminal() {
+            Some(std::io::read_to_string(std::io::stdin()).unwrap_or_default())
+        } else {
+            None
+        }
+    };
+
+    // Prevent parallel execution — keep _lock alive until process exits
+    let _lock = cmd::acquire_instance_lock();
+
+    // ВСТРОЕННЫЙ РЕЖИМ: своя группа процессов и снятие СВОИХ остатков.
+    //
+    // Оркестратор шлёт `SIGKILL`, по которому не отрабатывает ни один наш хук, — значит
+    // прошлый прогон мог не убрать за собой ничего: на очереди остаётся движок, в ядре
+    // таблица, и подбор слеп, а трафик человека стоит. Вход обязан быть идемпотентным, и
+    // убирать он вправе только СВОЁ: чужое во встроенном режиме принадлежит вызывающему.
+    //
+    // Группа — чтобы `kill(-pgid)` снимал нас вместе с детьми одним вызовом. Отказ не
+    // смертелен: детей всё равно снимет `PDEATHSIG`, и об отказе мы говорим вслух.
+    if embedded {
+        if let Err(e) = blockcheckw::system::group::detach_into_own_group() {
+            eprintln!(
+                "{}не удалось уйти в свою группу процессов ({e}): оркестратору придётся бить \
+                 по pid, дети снимутся PDEATHSIG",
+                blockcheckw::ui::WARN,
+            );
+        }
+        let defaults = blockcheckw::config::CoreConfig::default();
+        let signature = blockcheckw::system::orphans::Signature {
+            table: defaults.nft_table.clone(),
+            qnum: defaults.base_qnum,
+            desync_mark: blockcheckw::nfqws2::mark::desync_mark(),
+        };
+        let swept = blockcheckw::system::orphans::sweep_own(
+            &blockcheckw::firewall::nft::SystemNft,
+            &signature,
+        )
+        .await;
+        if !swept.is_empty() {
+            eprintln!(
+                "{}сняты остатки прошлого прогона: движков {}, таблица {}",
+                blockcheckw::ui::WARN,
+                swept.killed.len(),
+                if swept.table_dropped {
+                    "снесена"
+                } else {
+                    "чиста"
+                },
+            );
+        }
+    }
+
+    // Status doesn't need nfqws2/nft — skip prereqs
+    let prereq = if !matches!(cli.command, Some(Command::Status { .. })) {
+        let console = blockcheckw::ui::Console::new();
+        let prereq = cmd::check_prerequisites(&console);
+        drop(console);
+        Some(prereq)
+    } else {
+        None
+    };
+
+    // Init tracing: stderr-fmt всегда + OTLP-слой, если задан endpoint (feature otel).
+    let otel_guard = tracing_otel::init();
+
+    // Корневой span команды под родителем из TRACEPARENT (если демон прислал) —
+    // так bcw.scan/bcw.check висят детьми selection-span'а демона.
+    use tracing::Instrument;
+    let cmd_name = match &cli.command {
+        Some(Command::Scan { .. }) => "bcw.scan",
+        Some(Command::Check { .. }) => "bcw.check",
+        _ => "bcw.cmd",
+    };
+    let root = tracing::info_span!("bcw.root", cmd = cmd_name);
+    tracing_otel::set_parent_from_env(&root);
+
+    // Диспатч под bcw.root через .instrument, НЕ .enter(): держать enter-guard
+    // через .await — анти-паттерн tracing. При поллинге фьючи на другом потоке
+    // tokio thread-local «текущий span» теряется → bcw.scan/check рождаются
+    // корнями, а потомки (baseline/protocol) разлетаются по отдельным trace_id.
+    // .instrument перевходит в span на КАЖДЫЙ poll → потомки наследуют trace_id
+    // bcw.root (единый trace и в standalone, без присланного родителя).
+    async {
+        match cli.command {
+            Some(Command::Benchmark {
+                time,
+                max_workers,
+                domain,
+                protocol,
+                raw,
+            }) => {
+                let sub = matches
+                    .subcommand_matches("benchmark")
+                    .expect("clap guarantees subcommand");
+                let eff_domain = resolve_str(sub, "domain", &domain, &persisted.domain);
+
+                if is_explicit(sub, "domain") {
+                    persisted.domain = Some(domain.clone());
+                }
+                blockcheckw::persist::save(&persisted);
+
+                cmd::benchmark::run_benchmark_cmd(
+                    time,
+                    max_workers,
+                    &eff_domain,
+                    &protocol,
+                    raw,
+                    cli.profiles_per_instance,
+                    prereq
+                        .as_ref()
+                        .expect("benchmark requires prerequisites (skipped only for `status`)"),
+                )
+                .await;
+            }
+            Some(Command::Check {
+                from_file,
+                domain,
+                dns,
+                deadline,
+                timeout,
+                idle_ms,
+                take,
+                passes,
+                reference_via,
+                probe_path,
+                identity_path,
+                output,
+            }) => {
+                let sub = matches
+                    .subcommand_matches("check")
+                    .expect("clap guarantees subcommand");
+
+                let eff_domain = resolve_str(sub, "domain", &domain, &persisted.domain);
+                let eff_dns = resolve_str(sub, "dns", &dns, &persisted.dns);
+
+                if is_explicit(sub, "domain") {
+                    persisted.domain = Some(domain.clone());
+                }
+                if is_explicit(sub, "dns") {
+                    persisted.dns = Some(dns.clone());
+                }
+                blockcheckw::persist::save(&persisted);
+
+                // Determine input source: --from-file, pre-read stdin pipe, or error
+                let (source, stdin_tmp) = if let Some(path) = from_file {
+                    (path, None)
+                } else if let Some(ref data) = stdin_data {
+                    // Write pre-read stdin to temp file for load_tagged_strategies
+                    let tmp = std::env::temp_dir().join("blockcheckw_stdin.json");
+                    if let Err(e) = std::fs::write(&tmp, data) {
+                        eprintln!("ERROR: cannot write temp file: {e}");
+                        std::process::exit(1);
+                    }
+                    (tmp.to_string_lossy().into_owned(), Some(tmp))
+                } else {
+                    eprintln!("ERROR: no input — provide --from-file or pipe data to stdin");
+                    std::process::exit(1);
+                };
+
+                let dns_mode = dns_mode_of(&eff_dns, embedded);
+
+                let reference_via = reference_via.map(|raw| {
+                    blockcheckw::network::via::Via::parse(&raw).unwrap_or_else(|e| {
+                        eprintln!("ERROR: --reference-via: {e}");
+                        std::process::exit(1);
+                    })
+                });
+
+                cmd::check::run_check_cmd(cmd::check::CheckParams {
+                    domain: &eff_domain,
+                    from_file: &source,
+                    dns_mode,
+                    timeout,
+                    idle_ms,
+                    take,
+                    deadline_secs: deadline,
+                    passes,
+                    output: output.as_deref(),
+                    via: via.as_ref(),
+                    reference_via: reference_via.as_ref(),
+                    probe_path: &probe_path,
+                    identity_path: &identity_path,
+                    prereq: prereq
+                        .as_ref()
+                        .expect("check requires prerequisites (skipped only for `status`)"),
+                })
+                .await;
+
+                // Clean up temp file from stdin pipe
+                if let Some(tmp) = stdin_tmp {
+                    let _ = std::fs::remove_file(tmp);
+                }
+            }
+            Some(Command::Scan {
+                domain,
+                protocols,
+                dns,
+                timeout,
+                top,
+                output,
+                from_file,
+                alive_via,
+            }) => {
+                let sub = matches
+                    .subcommand_matches("scan")
+                    .expect("clap guarantees subcommand");
+
+                let eff_domain = resolve_str(sub, "domain", &domain, &persisted.domain);
+                let eff_protocols = resolve_protocols(sub, &protocols, &persisted.protocols);
+                let eff_dns = resolve_str(sub, "dns", &dns, &persisted.dns);
+
+                if is_explicit(sub, "domain") {
+                    persisted.domain = Some(domain.clone());
+                }
+                if is_explicit(sub, "protocols") {
+                    persisted.protocols =
+                        Some(protocols.split(',').map(|s| s.trim().to_string()).collect());
+                }
+                if is_explicit(sub, "dns") {
+                    persisted.dns = Some(dns.clone());
+                }
+                blockcheckw::persist::save(&persisted);
+
+                let protocols = match blockcheckw::config::parse_protocols(&eff_protocols) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("ERROR: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let dns_mode = dns_mode_of(&eff_dns, embedded);
+                // --alive-via: a proxy used ONLY to verify aliveness of IP-blocked
+                // hosts (not to route the scan). Must be a proxy we can tcp-connect
+                // through; reachability is verified later in run_scan.
+                let alive_via_proxy = alive_via.as_ref().map(|raw| {
+                    let v = blockcheckw::network::via::Via::parse(raw).unwrap_or_else(|e| {
+                        eprintln!("ERROR: --alive-via: {e}");
+                        std::process::exit(1);
+                    });
+                    if !v.is_proxy() {
+                        eprintln!(
+                            "ERROR: --alive-via must be a proxy (e.g. socks5://host:1080) — it is \
+                             used only to tcp-connect through for an aliveness probe, not to route"
+                        );
+                        std::process::exit(1);
+                    }
+                    v
+                });
+
+                cmd::scan::run_scan(cmd::scan::ScanParams {
+                    workers: eff_workers as usize,
+                    profiles_per_instance: cli.profiles_per_instance,
+                    domain: &eff_domain,
+                    protocols: &protocols,
+                    dns_mode,
+                    timeout_secs: timeout,
+                    top_n: top,
+                    output: output.as_deref(),
+                    from_file: from_file.as_deref(),
+                    via: via.as_ref(),
+                    alive_via: alive_via_proxy.as_ref(),
+                    prereq: prereq
+                        .as_ref()
+                        .expect("scan requires prerequisites (skipped only for `status`)"),
+                })
+                .await;
+            }
+            Some(Command::Universal {
+                domain_list,
+                protocols,
+                dns,
+                sample,
+                output,
+            }) => {
+                let sub = matches
+                    .subcommand_matches("universal")
+                    .expect("clap guarantees subcommand");
+
+                let eff_protocols = resolve_protocols(sub, &protocols, &persisted.protocols);
+                let eff_dns = resolve_str(sub, "dns", &dns, &persisted.dns);
+
+                if is_explicit(sub, "domain_list") {
+                    persisted.domain_list = Some(domain_list.clone());
+                }
+                if is_explicit(sub, "protocols") {
+                    persisted.protocols =
+                        Some(protocols.split(',').map(|s| s.trim().to_string()).collect());
+                }
+                if is_explicit(sub, "dns") {
+                    persisted.dns = Some(dns.clone());
+                }
+                blockcheckw::persist::save(&persisted);
+
+                let protocols = match blockcheckw::config::parse_protocols(&eff_protocols) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("ERROR: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let dns_mode = dns_mode_of(&eff_dns, embedded);
+                cmd::universal::run_universal(
+                    eff_workers as usize,
+                    cli.profiles_per_instance,
+                    &domain_list,
+                    &protocols,
+                    dns_mode,
+                    sample,
+                    output.as_deref(),
+                    via.as_ref(),
+                    prereq
+                        .as_ref()
+                        .expect("universal requires prerequisites (skipped only for `status`)"),
+                )
+                .await;
+            }
+            Some(Command::Status {
+                domain_list,
+                dns,
+                timeout,
+                output,
+            }) => {
+                let sub = matches
+                    .subcommand_matches("status")
+                    .expect("clap guarantees subcommand");
+
+                let eff_dns = resolve_str(sub, "dns", &dns, &persisted.dns);
+
+                if is_explicit(sub, "dns") {
+                    persisted.dns = Some(dns.clone());
+                }
+                blockcheckw::persist::save(&persisted);
+
+                let dns_mode = dns_mode_of(&eff_dns, embedded);
+
+                cmd::status::run_status_cmd(cmd::status::StatusParams {
+                    domain_list: &domain_list,
+                    dns_mode,
+                    timeout,
+                    output: output.as_deref(),
+                    via: via.as_ref(),
+                })
+                .await;
+            }
+            Some(Command::Completions { .. }) => unreachable!("handled above"),
+            None => unreachable!("справка без команды печатается до elevation"),
+        }
+    }
+    .instrument(root)
+    .await;
+
+    // bcw.root закрыт (.instrument уронил span по завершении фьючи). Принудительно
+    // выгружаем OTLP-буфер до выхода (см. OtelGuard::shutdown). Без feature otel —
+    // no-op. Пути std::process::exit (ошибки prereq) сюда не доходят — их span'ы не нужны.
+    otel_guard.shutdown().await;
+}
+
+/// Print current version and check GitHub for updates.
+async fn print_version_and_check() {
+    use console::style;
+
+    let current = env!("CARGO_PKG_VERSION");
+    println!("blockcheckw v{current}");
+
+    eprint!("checking for updates... ");
+    match blockcheckw::network::update_check::check_latest_release(current).await {
+        Some(release) => {
+            eprintln!(
+                "{}",
+                style(format!("newer version available: {}", release.tag))
+                    .yellow()
+                    .bold()
+            );
+            eprintln!(
+                "  upgrade: {}",
+                style("blockcheckw --upgrade").green().bold()
+            );
+        }
+        None => {
+            eprintln!("{}", style("up to date").green());
+        }
+    }
+}
+
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/rcd27/blockcheckw/main/scripts/install.sh";
+
+fn install_dir_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    exe.parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+}
+
+fn download_install_script(destination: &std::path::Path) -> Result<(), String> {
+    let curl = std::process::Command::new("curl")
+        .args(["-fSL", "--retry", "3", "-o"])
+        .arg(destination)
+        .arg(INSTALL_SCRIPT_URL)
+        .status();
+    if matches!(curl, Ok(ref status) if status.success()) {
+        return Ok(());
+    }
+
+    let _ = std::fs::remove_file(destination);
+    let wget = std::process::Command::new("wget")
+        .args(["-q", "-O"])
+        .arg(destination)
+        .arg(INSTALL_SCRIPT_URL)
+        .status();
+    if matches!(wget, Ok(ref status) if status.success()) {
+        return Ok(());
+    }
+
+    let _ = std::fs::remove_file(destination);
+    Err("failed to download install script with curl or wget".to_string())
+}
+
+/// Download and install the latest release.
+async fn run_upgrade() {
+    use console::style;
+
+    let current = env!("CARGO_PKG_VERSION");
+    let con = blockcheckw::ui::Console::new();
+
+    con.println(&format!("blockcheckw v{current}"));
+    con.println("checking for updates...");
+
+    match blockcheckw::network::update_check::check_latest_release(current).await {
+        Some(release) => {
+            con.ok(&format!(
+                "newer version available: {} → {}",
+                style(format!("v{current}")).dim(),
+                style(&release.tag).green().bold(),
+            ));
+            con.println("  running install script...");
+            con.newline();
+
+            let install_dir = std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(install_dir_from_exe)
+                .unwrap_or_else(|| {
+                    con.error("cannot determine current install directory");
+                    std::process::exit(1);
+                });
+            let script_path =
+                std::env::temp_dir().join(format!("blockcheckw-install-{}.sh", std::process::id()));
+            if let Err(e) = download_install_script(&script_path) {
+                con.error(&e);
+                std::process::exit(1);
+            }
+
+            let status = std::process::Command::new("/bin/sh")
+                .arg(&script_path)
+                .env("INSTALL_DIR", &install_dir)
+                .status();
+            let _ = std::fs::remove_file(&script_path);
+
+            match status {
+                Ok(s) if s.success() => {
+                    con.newline();
+                    con.ok("upgrade complete");
+                }
+                _ => {
+                    con.newline();
+                    con.error("upgrade failed");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {
+            con.ok(&format!("v{current} is the latest version"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_uses_current_executable_directory() {
+        let exe = std::path::Path::new("custom")
+            .join("bin")
+            .join("blockcheckw");
+        assert_eq!(
+            install_dir_from_exe(&exe),
+            Some(std::path::Path::new("custom").join("bin"))
+        );
+    }
+
+    #[test]
+    fn check_probe_path_defaults_to_root() {
+        // Байтовая ось (главная, спека §6-тер) идёт по настоящему ресурсу: главный
+        // вердикт от пути не зависит (DPI решает по SNI, до HTTP), а объём требует
+        // реального содержимого, а не статичного файла.
+        let cli =
+            Cli::try_parse_from(["blockcheckw", "check", "--from-file", "v.json"]).expect("parse");
+        match cli.command {
+            Some(Command::Check { probe_path, .. }) => assert_eq!(probe_path, "/"),
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn check_accepts_probe_path_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcheckw",
+            "check",
+            "--from-file",
+            "v.json",
+            "--probe-path",
+            "/forum/index.php",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Check { probe_path, .. }) => assert_eq!(probe_path, "/forum/index.php"),
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn check_identity_path_defaults_to_robots_txt() {
+        // Ось подлинности (побочная): детерминированный путь — умолчание, а не опция.
+        // Только она может дать круг [Fate::Mirage] (спека §6-тер).
+        let cli =
+            Cli::try_parse_from(["blockcheckw", "check", "--from-file", "v.json"]).expect("parse");
+        match cli.command {
+            Some(Command::Check { identity_path, .. }) => assert_eq!(identity_path, "/robots.txt"),
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn check_accepts_identity_path_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcheckw",
+            "check",
+            "--from-file",
+            "v.json",
+            "--identity-path",
+            "/static/manifest.json",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Check { identity_path, .. }) => {
+                assert_eq!(identity_path, "/static/manifest.json")
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn check_passes_defaults_to_three() {
+        // Умолчание несёт замер (спека §3): ядро устойчивости по трём одинаковым
+        // прогонам на живой линии — 9 из 27, флап — 16 из 27.
+        let cli =
+            Cli::try_parse_from(["blockcheckw", "check", "--from-file", "v.json"]).expect("parse");
+        match cli.command {
+            Some(Command::Check { passes, .. }) => assert_eq!(passes, 3),
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn check_accepts_passes_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcheckw",
+            "check",
+            "--from-file",
+            "v.json",
+            "--passes",
+            "5",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Check { passes, .. }) => assert_eq!(passes, 5),
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn scan_accepts_alive_via_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcheckw",
+            "scan",
+            "-d",
+            "example.com",
+            "--alive-via",
+            "socks5://127.0.0.1:1080",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Scan { alive_via, .. }) => {
+                assert_eq!(alive_via.as_deref(), Some("socks5://127.0.0.1:1080"));
+            }
+            _ => panic!("expected Scan command"),
+        }
+    }
+
+    #[test]
+    fn scan_alive_via_defaults_to_none() {
+        let cli = Cli::try_parse_from(["blockcheckw", "scan", "-d", "example.com"]).expect("parse");
+        match cli.command {
+            Some(Command::Scan { alive_via, .. }) => assert_eq!(alive_via, None),
+            _ => panic!("expected Scan command"),
+        }
+    }
+
+    /// #68: `--profiles-per-instance` — глобальный флаг (как `--workers`), стоит
+    /// ДО имени подкоманды. Ловит регресс, если кто-то случайно перенесёт его
+    /// внутрь `Command::Scan` при рефакторинге — тогда этот же вызов перестал
+    /// бы парситься.
+    #[test]
+    fn profiles_per_instance_parses_before_subcommand() {
+        let cli = Cli::try_parse_from([
+            "blockcheckw",
+            "--profiles-per-instance",
+            "256",
+            "scan",
+            "-d",
+            "example.com",
+        ])
+        .expect("parse");
+        assert_eq!(cli.profiles_per_instance, 256);
+    }
+
+    #[test]
+    fn profiles_per_instance_defaults_to_1024() {
+        let cli = Cli::try_parse_from(["blockcheckw", "scan", "-d", "example.com"]).expect("parse");
+        assert_eq!(cli.profiles_per_instance, 1024);
+    }
+}

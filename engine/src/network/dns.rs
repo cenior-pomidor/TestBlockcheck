@@ -1,0 +1,376 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::LazyLock;
+
+use tokio::sync::Mutex;
+
+use crate::config::DnsMode;
+use crate::dto::DnsSpoofed;
+use crate::error::BlockcheckError;
+use crate::network::doh;
+use crate::system::process::run_process;
+
+const DNS_TIMEOUT_MS: u64 = 10_000;
+const COMMAND_UNKNOWN: u8 = 0;
+const COMMAND_AVAILABLE: u8 = 1;
+const COMMAND_UNAVAILABLE: u8 = 2;
+
+static GETENT_AVAILABILITY: AtomicU8 = AtomicU8::new(COMMAND_UNKNOWN);
+
+/// DNS resolution cache — avoids redundant queries and TOCTOU races.
+static DNS_CACHE: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const SPOOFING_CHECK_DOMAINS: &[&str] = &["rutracker.org", "pornhub.com", "torproject.org"];
+
+#[derive(Debug, Clone)]
+pub enum DnsSpoofResult {
+    Clean,
+    Spoofed { details: String },
+    CheckFailed { reason: String },
+}
+
+/// СОСТОЯНИЕ проверки подмены — три значения, а не булево.
+///
+/// Прежнее `is_dns_spoofed` отвечало `false` и на «сверили, чисто», и на «сверить не
+/// смогли», и на «сверку не начинали». Для тревоги этого хватало (неподтверждённая подмена
+/// не смеет поднимать ложную тревогу — это верно и остаётся), но в ОТЧЁТ уходило
+/// «подмены нет», и читатель не мог отличить показание от его отсутствия.
+///
+/// Цена была измерена у заказчика 20.09.2026: на коробке нет `curl`, а `doh_resolve` зовёт
+/// именно его — значит DoH-сервер не находится никогда, сверка не происходит никогда, и
+/// поле сообщало «чисто» при НУЛЕ проведённых проверок.
+pub fn spoof_state(spoof: Option<&DnsSpoofResult>) -> DnsSpoofed {
+    match spoof {
+        Some(DnsSpoofResult::Spoofed { .. }) => DnsSpoofed::Spoofed,
+        Some(DnsSpoofResult::Clean) => DnsSpoofed::Clean,
+        // Сверка начиналась, но не состоялась — это «не проверено», а не «чисто».
+        Some(DnsSpoofResult::CheckFailed { .. }) | None => DnsSpoofed::Unchecked,
+    }
+}
+
+#[derive(Debug)]
+pub struct DnsResolution {
+    pub ips: Vec<String>,
+    pub method: &'static str,
+    pub spoof_result: Option<DnsSpoofResult>,
+}
+
+pub(crate) fn is_ipv4(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn command_exists_in_path(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| directory.join(command).is_file())
+    })
+}
+
+fn cached_command_available(state: &AtomicU8, command: &str) -> bool {
+    match state.load(Ordering::Relaxed) {
+        COMMAND_AVAILABLE => true,
+        COMMAND_UNAVAILABLE => false,
+        _ => {
+            let available = command_exists_in_path(command);
+            state.store(
+                if available {
+                    COMMAND_AVAILABLE
+                } else {
+                    COMMAND_UNAVAILABLE
+                },
+                Ordering::Relaxed,
+            );
+            available
+        }
+    }
+}
+
+async fn resolve_with_getent(domain: &str) -> Option<Vec<String>> {
+    if !cached_command_available(&GETENT_AVAILABILITY, "getent") {
+        return None;
+    }
+
+    let args = vec!["getent", "ahostsv4", domain];
+    let result = match run_process(&args, DNS_TIMEOUT_MS).await {
+        Ok(result) => result,
+        Err(BlockcheckError::ProcessSpawn { .. }) => {
+            GETENT_AVAILABILITY.store(COMMAND_UNAVAILABLE, Ordering::Relaxed);
+            return None;
+        }
+        Err(_) => return None,
+    };
+    if result.exit_code != 0 {
+        return None;
+    }
+
+    let ips: HashSet<String> = result
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let token = line.split_whitespace().next()?;
+            if is_ipv4(token) {
+                Some(token.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Some(ips.into_iter().collect())
+}
+
+async fn resolve_with_nslookup(domain: &str) -> Option<Vec<String>> {
+    let args = vec!["nslookup", domain];
+    let result = run_process(&args, DNS_TIMEOUT_MS).await.ok()?;
+    if result.exit_code != 0 {
+        return None;
+    }
+
+    let answer_section = result.stdout.split_once("Name:")?;
+    let ips: HashSet<String> = answer_section
+        .1
+        .split_whitespace()
+        .filter(|token| is_ipv4(token))
+        .map(|s| s.to_string())
+        .collect();
+
+    Some(ips.into_iter().collect())
+}
+
+pub async fn resolve_ipv4(domain: &str) -> Result<Vec<String>, BlockcheckError> {
+    // Check cache first
+    {
+        let cache = DNS_CACHE.lock().await;
+        if let Some(cached) = cache.get(domain) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let ips = if let Some(ips) = resolve_with_getent(domain).await {
+        Some(ips)
+    } else {
+        resolve_with_nslookup(domain).await
+    };
+
+    match ips {
+        Some(ips) if !ips.is_empty() => {
+            DNS_CACHE
+                .lock()
+                .await
+                .insert(domain.to_string(), ips.clone());
+            Ok(ips)
+        }
+        Some(_) => Err(BlockcheckError::DnsNoAddresses {
+            domain: domain.to_string(),
+        }),
+        None => Err(BlockcheckError::DnsResolveFailed {
+            domain: domain.to_string(),
+            reason: "getent and nslookup both failed".to_string(),
+        }),
+    }
+}
+
+/// Check for DNS spoofing by comparing system DNS and DoH results for known blocked domains.
+pub async fn check_dns_spoofing(doh_server: &doh::DohServer) -> DnsSpoofResult {
+    let mut mismatches = Vec::new();
+
+    for &domain in SPOOFING_CHECK_DOMAINS {
+        let system_ips = resolve_ipv4(domain).await.ok();
+        let doh_ips = doh::doh_resolve(domain, doh_server).await;
+
+        match (system_ips, doh_ips) {
+            (Some(sys), Some(doh_result)) if !doh_result.is_empty() => {
+                let sys_set: HashSet<&str> = sys.iter().map(|s| s.as_str()).collect();
+                let doh_set: HashSet<&str> = doh_result.iter().map(|s| s.as_str()).collect();
+
+                if sys_set.is_disjoint(&doh_set) {
+                    mismatches.push(format!(
+                        "{domain}: system={} doh={}",
+                        sys.join(","),
+                        doh_result.join(","),
+                    ));
+                }
+            }
+            (None, _) | (_, None) => {
+                // Can't compare — not a conclusive signal
+            }
+            _ => {}
+        }
+    }
+
+    if mismatches.is_empty() {
+        // Also check: are all system results for different domains the same IP?
+        // That's a strong signal of a captive portal / block page.
+        let mut all_sys_ips: Vec<String> = Vec::new();
+        for &domain in SPOOFING_CHECK_DOMAINS {
+            if let Ok(ips) = resolve_ipv4(domain).await {
+                all_sys_ips.extend(ips);
+            }
+        }
+        let unique: HashSet<&str> = all_sys_ips.iter().map(|s| s.as_str()).collect();
+        if all_sys_ips.len() >= 2 && unique.len() == 1 {
+            return DnsSpoofResult::Spoofed {
+                details: format!(
+                    "all {} domains resolve to same IP: {}",
+                    SPOOFING_CHECK_DOMAINS.len(),
+                    unique.into_iter().next().expect("checked len == 1"),
+                ),
+            };
+        }
+
+        DnsSpoofResult::Clean
+    } else {
+        DnsSpoofResult::Spoofed {
+            details: mismatches.join("; "),
+        }
+    }
+}
+
+/// Unified domain resolution with DNS mode support.
+pub async fn resolve_domain(
+    domain: &str,
+    dns_mode: DnsMode,
+) -> Result<DnsResolution, BlockcheckError> {
+    match dns_mode {
+        DnsMode::System => {
+            let ips = resolve_ipv4(domain).await?;
+            Ok(DnsResolution {
+                ips,
+                method: "system",
+                spoof_result: None,
+            })
+        }
+        DnsMode::Doh => {
+            let ips = doh::resolve_ipv4_doh(domain).await?;
+            Ok(DnsResolution {
+                ips,
+                method: "doh",
+                spoof_result: None,
+            })
+        }
+        DnsMode::Auto => {
+            // Try system DNS first
+            let sys_result = resolve_ipv4(domain).await;
+
+            // Find a DoH server for spoofing check
+            let doh_server = doh::find_working_doh_server().await;
+
+            if let Some(server) = doh_server {
+                let spoof_result = check_dns_spoofing(server).await;
+
+                match &spoof_result {
+                    DnsSpoofResult::Spoofed { .. } => {
+                        // DNS is spoofed — use DoH for the actual domain
+                        let ips = doh::doh_resolve(domain, server).await.ok_or_else(|| {
+                            BlockcheckError::DnsResolveFailed {
+                                domain: domain.to_string(),
+                                reason: "DoH fallback failed after spoofing detected".to_string(),
+                            }
+                        })?;
+                        if ips.is_empty() {
+                            return Err(BlockcheckError::DnsNoAddresses {
+                                domain: domain.to_string(),
+                            });
+                        }
+                        Ok(DnsResolution {
+                            ips,
+                            method: "doh (auto-fallback)",
+                            spoof_result: Some(spoof_result),
+                        })
+                    }
+                    DnsSpoofResult::Clean | DnsSpoofResult::CheckFailed { .. } => {
+                        // No spoofing detected — use system result
+                        let ips = sys_result?;
+                        Ok(DnsResolution {
+                            ips,
+                            method: "system",
+                            spoof_result: Some(spoof_result),
+                        })
+                    }
+                }
+            } else {
+                // No DoH servers available — use system DNS without spoofing check
+                let ips = sys_result?;
+                Ok(DnsResolution {
+                    ips,
+                    method: "system (no DoH available)",
+                    spoof_result: None,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_ipv4_valid() {
+        assert!(is_ipv4("192.168.1.1"));
+        assert!(is_ipv4("0.0.0.0"));
+        assert!(is_ipv4("255.255.255.255"));
+        assert!(is_ipv4("1.2.3.4"));
+        assert!(is_ipv4("172.67.182.217"));
+    }
+
+    #[test]
+    fn test_is_ipv4_invalid() {
+        assert!(!is_ipv4("256.1.1.1"));
+        assert!(!is_ipv4("1.2.3"));
+        assert!(!is_ipv4("1.2.3.4.5"));
+        assert!(!is_ipv4(""));
+        assert!(!is_ipv4("abc.def.ghi.jkl"));
+        assert!(!is_ipv4("192.168.1"));
+        assert!(!is_ipv4("1.2.3."));
+        assert!(!is_ipv4(".1.2.3"));
+        assert!(!is_ipv4("rutracker.org"));
+        assert!(!is_ipv4("STREAM"));
+    }
+
+    #[test]
+    fn unavailable_command_is_cached() {
+        let state = AtomicU8::new(COMMAND_UNKNOWN);
+        let command = "blockcheckw-command-that-does-not-exist";
+        assert!(!cached_command_available(&state, command));
+        assert_eq!(state.load(Ordering::Relaxed), COMMAND_UNAVAILABLE);
+        assert!(!cached_command_available(&state, command));
+    }
+
+    #[test]
+    fn a_confirmed_divergence_is_spoofing() {
+        assert_eq!(
+            spoof_state(Some(&DnsSpoofResult::Spoofed {
+                details: "system≠doh".to_string()
+            })),
+            DnsSpoofed::Spoofed
+        );
+    }
+
+    #[test]
+    fn a_completed_comparison_is_clean() {
+        assert_eq!(spoof_state(Some(&DnsSpoofResult::Clean)), DnsSpoofed::Clean);
+    }
+
+    /// НЕ СМОГЛИ СВЕРИТЬ — не «чисто». Тревогу это по-прежнему не поднимает (подмена не
+    /// подтверждена), но и показанием не притворяется.
+    #[test]
+    fn a_failed_comparison_is_unchecked_not_clean() {
+        let state = spoof_state(Some(&DnsSpoofResult::CheckFailed {
+            reason: "no DoH server".to_string(),
+        }));
+        assert_eq!(state, DnsSpoofed::Unchecked);
+        assert_ne!(
+            state,
+            DnsSpoofed::Clean,
+            "отсутствие сверки — не результат сверки"
+        );
+    }
+
+    /// И сверки, которой не было вовсе, тоже: на коробке без `curl` это единственный
+    /// возможный исход, и он наступал каждый раз.
+    #[test]
+    fn a_comparison_that_never_happened_is_unchecked() {
+        assert_eq!(spoof_state(None), DnsSpoofed::Unchecked);
+    }
+}
