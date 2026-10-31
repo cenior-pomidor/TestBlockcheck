@@ -50,3 +50,30 @@ jobs:
       - name: Run parallel_benchmark tests
         continue-on-error: true
         run: docker run --rm --privileged bcw-it --test parallel_benchmark -- --nocapture
+
+  build-android:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+          key: aarch64-musl
+      - uses: taiki-e/install-action@cross
+      # Статически, без UPX: упакованные бинарники на Android — лишний риск.
+      - run: cross build --release --target aarch64-unknown-linux-musl
+      - name: Verify static aarch64 binary
+        run: |
+          info="$(file target/aarch64-unknown-linux-musl/release/bcw)"
+          echo "$info"
+          echo "$info" | grep -q 'ARM aarch64'
+          echo "$info" | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcw-aarch64
+          path: engine/target/aarch64-unknown-linux-musl/release/bcw
+          if-no-files-found: error

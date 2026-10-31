@@ -16,3 +16,33 @@
 Удалено из импорта как инфраструктура upstream: `.github/`, `.claude/`, `.githooks/`,
 `config.json` (ссылка на личный конфиг автора), `.gitmodules` (подмодуль объявлен в корне
 репозитория), `release-please-config.json`, `.release-please-manifest.json`.
+
+Изменения кода (спецификация — `docs/superpowers/specs/2026-10-31-bcw-android-engine-design.md`
+в корне репозитория):
+
+1. **Раскладка метки** (`nfqws2/space.rs`, `mark.rs`, `dispatch.rs`): номер стратегии — в битах
+   22–29 (`0x3FC00000`, `1…254`, `255` — контроль), бит пакетов движка — 21 (`0x00200000`).
+   Биты 0–20 и 31 принадлежат Android netd, 30 — модулям обхода. Потолок воркеров и стратегий
+   в одном nfqws2 — 254. Ключи `--mark-desync`, `--mark-profile-shift` вместо `--desync-mark`,
+   `--mark-base`. Схема отчёта — 2 (`profile_mask`, `control_mark` вместо `mark_base`).
+2. **iptables вместо nftables** (`firewall/ipt.rs` — единственная точка вызова `iptables` и
+   `iptables-restore --noflush -w`; `firewall/rules.rs` — правила, страж порядка, уборка).
+   Модули `firewall/nft.rs`, `firewall/nftables.rs` удалены.
+3. **Вызывающие** (`pipeline/*`, `cmd/*`, `system/orphans.rs`) работают с цепочками
+   (`--chain-prefix`, по умолчанию `bcw`); перед каждым планом проверяется, что наши переходы
+   стоят первыми (событие `reorder` в `--progress`). Причина отказа файрвола в отчёте —
+   `firewall`.
+4. **Соседи**: чужие цепочки mangle с `NFQUEUE` и процессы nfqws2 только наблюдаются (событие
+   `neighbours`); уборка и остановка чужого обхода удалены вместе с вопросами пользователю.
+5. **Android-умолчания**: бинарь `bcw`; встроенный режим всегда (ключ `--embedded` удалён);
+   пути `--nfqws2`, `--lua-dir`, `--work-dir`; замок и отчёты — в рабочем каталоге
+   (`/data/adb/bcw`, отчёты в `runs/<дата-время>/`); nfqws2 от `--uid=0:0`; очередь 777;
+   без root — отказ с подсказкой `su -c`, без переподъёма через `sudo`.
+6. **Удалено**: `--via`, `--alive-via`, `--upgrade`, проверка обновлений, `completions`,
+   управление службой zapret2, `scripts/install.sh`. `network/via.rs` оставлен ради
+   `--reference-via` (на Android — только прокси).
+7. **DoH**: ключ `--doh <IP[:ИМЯ]>` для своих резолверов (опрашиваются первыми).
+8. **`bcw doctor`**: проверка устройства (root, ядро, iptables, `iptables-restore --test`,
+   nfqws2 и `--filter-mark`, Lua, маршрут помеченных сокетов, DoH, соседи), JSON в stdout.
+9. **Интеграционные тесты** (`tests/e2e_infra.rs`, `docker/integration.Dockerfile`) — на
+   iptables-legacy; добавлен тест изоляции контрольной пробы от чужих цепочек.
