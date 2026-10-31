@@ -15,7 +15,7 @@ use crate::pipeline::fate::Admits;
 /// Зачем: отчёт читает чужая программа, у которой нет компилятора, общего с нами. Пока
 /// версии не было, единственным способом узнать о сломанном контракте была поломка у
 /// читателя — то есть у человека.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// Код выхода «боевая очередь занята». Отдельный от общего отказа преflight'а (6): для
 /// оркестратора это не «инструмент сломан», а «место занято» — лечится другой очередью
@@ -167,8 +167,10 @@ pub struct RunProvenance {
     pub qnum: u16,
     /// Имя нашей nft-таблицы.
     pub nft_table: String,
-    /// База марки воркера.
-    pub mark_base: String,
+    /// Маска поля стратегии в метке.
+    pub profile_mask: String,
+    /// Метка контроля (проба без десинка, DoH).
+    pub control_mark: String,
     /// Марка десинка.
     pub desync_mark: String,
     /// Группа процессов — по ней оркестратор снимает подбор целиком.
@@ -206,7 +208,8 @@ impl RunProvenance {
             dns: dns.to_string(),
             qnum: config.base_qnum,
             nft_table: config.nft_table.clone(),
-            mark_base: format!("0x{:08X}", crate::nfqws2::mark::worker_mark_base()),
+            profile_mask: format!("0x{:08X}", crate::nfqws2::mark::profile_mask()),
+            control_mark: format!("0x{:08X}", crate::nfqws2::mark::control_mark()),
             desync_mark: format!("0x{:08X}", crate::nfqws2::mark::desync_mark()),
             process_group: crate::system::group::own_group(),
             timeout_secs: config.request_timeout,

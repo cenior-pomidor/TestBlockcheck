@@ -353,7 +353,8 @@ mod tests {
             "dns",
             "qnum",
             "nft_table",
-            "mark_base",
+            "profile_mask",
+            "control_mark",
             "desync_mark",
             "process_group",
             "embedded",
@@ -366,7 +367,9 @@ mod tests {
             );
         }
         assert_eq!(v["run"]["qnum"], 200);
-        assert_eq!(v["run"]["mark_base"], "0x20000000");
+        assert_eq!(v["run"]["profile_mask"], "0x3FC00000");
+        assert_eq!(v["run"]["control_mark"], "0x3FC00000");
+        assert_eq!(v["run"]["desync_mark"], "0x00200000");
     }
 
     #[test]

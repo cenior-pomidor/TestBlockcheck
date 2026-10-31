@@ -191,13 +191,16 @@ mod tests {
     fn every_profile_gets_its_own_mark_and_args_in_order() {
         let argv = plan_of(&["--a", "--b", "--c"]).argv(&env());
         let joined = argv.join(" ");
-        assert!(joined.contains("--filter-mark=1/0xFFFF --a"), "{joined}");
         assert!(
-            joined.contains("--new --filter-mark=2/0xFFFF --b"),
+            joined.contains("--filter-mark=0x00400000/0x3FC00000 --a"),
             "{joined}"
         );
         assert!(
-            joined.contains("--new --filter-mark=3/0xFFFF --c"),
+            joined.contains("--new --filter-mark=0x00800000/0x3FC00000 --b"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--new --filter-mark=0x00C00000/0x3FC00000 --c"),
             "{joined}"
         );
     }
@@ -225,7 +228,7 @@ mod tests {
     fn a_single_profile_plan_has_no_separator_at_all() {
         let argv = plan_of(&["--a"]).argv(&env());
         assert!(!argv.iter().any(|a| a == "--new"));
-        assert!(argv.contains(&"--filter-mark=1/0xFFFF".to_string()));
+        assert!(argv.contains(&"--filter-mark=0x00400000/0x3FC00000".to_string()));
     }
 
     #[test]
@@ -235,30 +238,21 @@ mod tests {
         assert_eq!(marks, vec![1, 2, 3]);
     }
 
-    /// Связка с `CoreConfig::MAX_PROFILES_PER_INSTANCE` (`config.rs`), которую
-    /// до этого теста стерегла только арифметика `validate_parallelism`, а не
-    /// настоящее построение плана: разъедись они — валидатор пропускал бы
-    /// значение, на котором `Plan::from_strategies` падает паникой на
-    /// `.expect` (индекс `PROFILE_MASK + 1` как `u16` даёт ноль,
-    /// `ProfileMark::new(0)` — `None`).
-    ///
-    /// `nfqws2` не смеет знать про `crate::config` (см. doc-комментарий
-    /// `nfqws2::mod`), поэтому здесь берётся `PROFILE_MASK` напрямую — по
-    /// определению `config.rs` это то же самое число
-    /// (`MAX_PROFILES_PER_INSTANCE = PROFILE_MASK as usize`).
+    /// Связка с `config::MAX_PROFILES_PER_INSTANCE` (= 254): план на потолке строится без
+    /// паники, последний профиль — 254, а 255-го не существует (это метка контроля).
     #[test]
-    fn a_plan_at_the_mark_ceiling_does_not_panic_and_the_last_mark_is_65535() {
-        use crate::nfqws2::mark::PROFILE_MASK;
+    fn a_plan_at_the_mark_ceiling_does_not_panic_and_the_last_mark_is_254() {
+        use crate::nfqws2::space::MAX_PROFILE_INDEX;
 
-        let ceiling = PROFILE_MASK as usize;
+        let ceiling = MAX_PROFILE_INDEX as usize;
         let strategies: Vec<Vec<String>> = (0..ceiling).map(|_| vec!["--a".to_string()]).collect();
 
         let plan = Plan::from_strategies(&FilterMark::granted(), QueueNum::new(200), &strategies);
 
-        assert_eq!(plan.profiles().len(), ceiling);
+        assert_eq!(plan.profiles().len(), 254);
         let last_mark = plan.profiles().last().expect("план непуст").mark.index();
-        assert_eq!(last_mark, 65535);
-        assert_eq!(u32::from(last_mark), PROFILE_MASK);
+        assert_eq!(last_mark, 254);
+        assert!(ProfileMark::new(255).is_none());
     }
 }
 

@@ -60,11 +60,11 @@ struct Cli {
     upgrade: bool,
 
     /// Number of parallel workers
-    #[arg(short, long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=2048))]
+    #[arg(short, long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=254))]
     workers: u16,
 
-    /// How many strategies to keep loaded in one nfqws2 process at a time
-    #[arg(long, default_value_t = 1024)]
+    /// How many strategies to keep loaded in one nfqws2 process at a time (ceiling 254)
+    #[arg(long, default_value_t = 254)]
     profiles_per_instance: usize,
 
     /// Auto-confirm all prompts (non-interactive mode)
@@ -98,13 +98,13 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     nft_table: Option<String>,
 
-    /// База марки воркера, 0xHEX или десятичное (умолчание 0x20000000).
+    /// Метка пакетов nfqws2 поиска, 0xHEX или десятичное (умолчание 0x00200000, бит 21).
     #[arg(long, value_name = "MARK")]
-    mark_base: Option<String>,
+    mark_desync: Option<String>,
 
-    /// Марка десинка, 0xHEX или десятичное (умолчание 0x10000000).
-    #[arg(long, value_name = "MARK")]
-    desync_mark: Option<String>,
+    /// Сдвиг восьмибитного поля стратегии в метке (умолчание 22: биты 22–29).
+    #[arg(long, value_name = "N")]
+    mark_profile_shift: Option<u32>,
 
     /// Начало диапазона дымовых очередей преflight'а, 10 подряд (умолчание 65526).
     #[arg(long, value_name = "N")]
@@ -133,7 +133,7 @@ enum Command {
         time: u64,
 
         /// Maximum number of workers to test
-        #[arg(short = 'M', long, value_parser = clap::value_parser!(u16).range(1..=2048))]
+        #[arg(short = 'M', long, value_parser = clap::value_parser!(u16).range(1..=254))]
         max_workers: Option<u16>,
 
         /// Target domain
@@ -492,23 +492,18 @@ async fn main() {
     // Пространства имён ядра — от вызывающего, а не от умолчания: у него эти очереди, таблицы
     // и биты марки уже заняты, и заняты плотно.
     let mark_space = {
-        let desync = match cli.desync_mark.as_deref().map(mark_space::parse_mark) {
+        let desync = match cli.mark_desync.as_deref().map(mark_space::parse_mark) {
             Some(Ok(value)) => value,
             Some(Err(e)) => {
-                eprintln!("ERROR: --desync-mark: {e}");
+                eprintln!("ERROR: --mark-desync: {e}");
                 std::process::exit(2);
             }
             None => mark_space::DEFAULT_DESYNC_MARK,
         };
-        let base = match cli.mark_base.as_deref().map(mark_space::parse_mark) {
-            Some(Ok(value)) => value,
-            Some(Err(e)) => {
-                eprintln!("ERROR: --mark-base: {e}");
-                std::process::exit(2);
-            }
-            None => mark_space::DEFAULT_WORKER_MARK_BASE,
-        };
-        match mark_space::MarkSpace::new(desync, base) {
+        let shift = cli
+            .mark_profile_shift
+            .unwrap_or(mark_space::DEFAULT_PROFILE_SHIFT);
+        match mark_space::MarkSpace::new(desync, shift) {
             Ok(space) => space,
             Err(e) => {
                 eprintln!("ERROR: раскладка марки непригодна: {e}");
@@ -516,35 +511,8 @@ async fn main() {
             }
         }
     };
-    if mark_space.intrudes_on_neighbours() {
-        eprintln!(
-            "{}раскладка марки занимает биты 16-27, объявленные в README за соседями по ядру",
-            blockcheckw::ui::WARN,
-        );
-    }
     mark_space::set_space(mark_space);
 
-    // ВО ВСТРОЕННОМ РЕЖИМЕ ПЛАН НЕ ДОЛЖЕН ЗАЕЗЖАТЬ В ПРИБОРНУЮ ПОЛОСУ СОСЕДА.
-    //
-    // Индекс профиля растёт снизу вверх, а краевые приборы reflex пишут свою памятку с бита
-    // 13 — значит с 8192-го профиля мы делим с ними биты, и развязка сводится к порядку
-    // правил в ЧУЖОМ рулсете. Цена потолка нулевая: умолчание 1024 лежит вчетверо ниже, а
-    // весь корпус в 13 943 стратегии режется на два плана даже впритык.
-    //
-    // Проверка стоит ЗДЕСЬ, до `require_root`: отказ по аргументу не стоит того, чтобы
-    // сперва спросить у человека пароль. Соседняя `validate_parallelism` осталась ниже
-    // намеренно — она читает число воркеров из памяти прошлых запусков, а та грузится
-    // после эскалации.
-    if embedded && cli.profiles_per_instance > mark_space::MAX_PROFILES_CLEAR_OF_NEIGHBOURS {
-        eprintln!(
-            "ERROR: --profiles-per-instance {} во встроенном режиме превышает {}: с этого числа \
-             индекс профиля занимает биты 13+, где краевые приборы соседа пишут свою памятку, \
-             и наша марка стала бы зависеть от порядка правил в чужом рулсете",
-            cli.profiles_per_instance,
-            mark_space::MAX_PROFILES_CLEAR_OF_NEIGHBOURS,
-        );
-        std::process::exit(2);
-    }
     blockcheckw::config::set_kernel_keys(
         cli.qnum.unwrap_or(200),
         cli.nft_table
@@ -1245,8 +1213,30 @@ mod tests {
     }
 
     #[test]
-    fn profiles_per_instance_defaults_to_1024() {
+    fn profiles_per_instance_defaults_to_254() {
         let cli = Cli::try_parse_from(["blockcheckw", "scan", "-d", "example.com"]).expect("parse");
-        assert_eq!(cli.profiles_per_instance, 1024);
+        assert_eq!(cli.profiles_per_instance, 254);
+    }
+
+    #[test]
+    fn workers_above_254_are_rejected() {
+        assert!(Cli::try_parse_from(["blockcheckw", "-w", "255", "scan"]).is_err());
+        assert!(Cli::try_parse_from(["blockcheckw", "-w", "254", "scan"]).is_ok());
+    }
+
+    #[test]
+    fn mark_layout_keys_parse() {
+        let cli = Cli::try_parse_from([
+            "blockcheckw",
+            "--mark-desync",
+            "0x00200000",
+            "--mark-profile-shift",
+            "22",
+            "scan",
+        ])
+        .expect("parse");
+        assert_eq!(cli.mark_desync.as_deref(), Some("0x00200000"));
+        assert_eq!(cli.mark_profile_shift, Some(22));
+        assert!(Cli::try_parse_from(["blockcheckw", "--mark-base", "0x1", "scan"]).is_err());
     }
 }

@@ -2,7 +2,7 @@ use crate::error::BlockcheckError;
 use crate::firewall::nft::{NftBatch, NftRun, OwnedTable, OwnedTableMarker};
 use crate::network::dns::is_ipv4;
 use crate::nfqws2::dispatch::Dispatch;
-use crate::nfqws2::mark::desync_mark;
+use crate::nfqws2::mark::{desync_mark, profile_mask};
 use crate::nfqws2::run::Ready;
 use tracing::warn;
 
@@ -83,15 +83,19 @@ pub async fn apply_dispatch<R: NftRun>(
         .run(NftBatch::from_lines(vec![
             format!(
                 "add rule inet {t} {CHAIN_POSTNAT} meta nfproto ipv4 tcp dport {port} \
-                 mark and 0x{:08X} == 0 mark and 0x{:08X} == 0x{:08X} ip daddr {{ {ip_set} }} \
+                 mark and 0x{:08X} == 0 mark and 0x{:08X} != 0 ip daddr {{ {ip_set} }} \
                  ct original packets 1-{MAX_PKT_OUT} ct mark set mark or 0x{:08X} queue num {q}",
-                d.out.require_clear, d.out.require_set, d.out.require_set, d.out.ct_set_or
+                desync_mark(),
+                profile_mask(),
+                desync_mark()
             ),
             format!(
                 "add rule inet {t} {CHAIN_PRENAT} meta nfproto ipv4 tcp sport {port} \
                  tcp flags & (syn | ack) == (syn | ack) ct mark and 0x{:08X} == 0x{:08X} \
                  ip saddr {{ {ip_set} }} meta mark set ct mark and 0x{:08X} queue num {q}",
-                d.inc.ct_require_set, d.inc.ct_require_set, d.inc.mark_from_ct_and
+                desync_mark(),
+                desync_mark(),
+                profile_mask()
             ),
         ]))
         .await
@@ -160,13 +164,13 @@ mod dispatch_tests {
         assert_eq!(rules.len(), 2, "{cmds:?}");
     }
 
-    /// Ловушка §4 на уровне отрендеренного правила: маска обязана быть 0x2000FFFF.
+    /// Восстановление метки из ct mark — под маской поля стратегии.
     #[tokio::test]
     async fn the_incoming_rule_restores_the_mark_under_the_safe_mask() {
         let cmds = rendered(443).await;
         assert!(
             cmds.iter()
-                .any(|c| c.contains("meta mark set ct mark and 0x2000FFFF")),
+                .any(|c| c.contains("meta mark set ct mark and 0x3FC00000")),
             "{cmds:?}"
         );
     }
@@ -177,7 +181,7 @@ mod dispatch_tests {
         let cmds = rendered(443).await;
         assert!(
             cmds.iter()
-                .any(|c| c.contains("ct mark set mark or 0x10000000")),
+                .any(|c| c.contains("ct mark set mark or 0x00200000")),
             "{cmds:?}"
         );
     }

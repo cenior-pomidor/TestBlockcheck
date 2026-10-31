@@ -119,7 +119,7 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             worker_count: 8,
-            profiles_per_instance: 1024,
+            profiles_per_instance: MAX_PROFILES_PER_INSTANCE,
             base_qnum: qnum(),
             nft_table: nft_table(),
             nfqws2_path: nfqws2_path("/opt/zapret2"),
@@ -132,10 +132,9 @@ impl Default for CoreConfig {
     }
 }
 
-/// Потолок числа профилей в одном плане: марка профиля — младшие биты под
-/// `PROFILE_MASK`, и индекс, приведённый к `u16`, на границе маски даёт ноль —
-/// то есть «марки нет» (см. `nfqws2::mark::ProfileMark`).
-pub const MAX_PROFILES_PER_INSTANCE: usize = crate::nfqws2::mark::PROFILE_MASK as usize;
+/// Потолок числа профилей в одном плане: поле стратегии в метке — восемь бит, номера
+/// `1…254`, а `255` — метка контроля (`nfqws2::space`).
+pub const MAX_PROFILES_PER_INSTANCE: usize = crate::nfqws2::space::MAX_PROFILE_INDEX as usize;
 
 pub fn validate_parallelism(
     worker_count: usize,
@@ -177,8 +176,14 @@ mod parallelism_tests {
     use super::validate_parallelism;
 
     #[test]
+    fn the_profile_ceiling_is_254() {
+        assert!(validate_parallelism(8, 254).is_ok());
+        assert!(validate_parallelism(8, 255).is_err());
+    }
+
+    #[test]
     fn workers_may_not_exceed_loaded_profiles() {
-        assert!(validate_parallelism(1024, 512).is_err());
+        assert!(validate_parallelism(200, 100).is_err());
     }
 
     #[test]
@@ -202,7 +207,7 @@ mod parallelism_tests {
     fn defaults_are_consistent() {
         let c = super::CoreConfig::default();
         assert!(validate_parallelism(c.worker_count, c.profiles_per_instance).is_ok());
-        assert_eq!(c.profiles_per_instance, 1024);
+        assert_eq!(c.profiles_per_instance, 254);
     }
 }
 
