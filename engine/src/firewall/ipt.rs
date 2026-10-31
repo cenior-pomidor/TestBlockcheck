@@ -44,8 +44,6 @@ pub struct IptBatch {
 }
 
 impl IptBatch {
-    // Временно: потребитель — `firewall::rules` (Task 3), там атрибут снимается.
-    #[allow(dead_code)]
     pub(crate) fn new(table: Table, lines: Vec<String>) -> Self {
         IptBatch { table, lines }
     }
