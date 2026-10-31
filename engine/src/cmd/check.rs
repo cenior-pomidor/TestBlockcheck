@@ -5,6 +5,8 @@ use console::style;
 
 use blockcheckw::config::{CoreConfig, DnsMode, Protocol};
 use blockcheckw::dto::{BrokenReason, CheckReport, Outcome, RunProvenance};
+use blockcheckw::firewall::ipt::{SystemIpt, SystemIptSync};
+use blockcheckw::firewall::rules;
 use blockcheckw::network::patience::Patience;
 use blockcheckw::network::{dns, isp, via::Via};
 use blockcheckw::pipeline::{check, reference};
@@ -96,6 +98,23 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
         }
     };
     rank::sort_by_simplicity(&mut strategies);
+
+    // НАШИ ЦЕПОЧКИ — ДО ПЕРВОЙ ПРОБЫ (review C1): DoH и контроль несут метку контроля, а мимо
+    // чужих цепочек mangle их уводят только наши правила. Держим до конца прогона.
+    let chains = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
+        Ok(chains) => chains,
+        Err(e) => {
+            screen.error(&format!("iptables: {e}"));
+            fail_with(
+                BrokenReason::Firewall,
+                domain,
+                output,
+                &config,
+                &dns_mode.to_string(),
+                &screen,
+            );
+        }
+    };
 
     let mut flags = String::new();
     if take > 0 {
@@ -243,6 +262,7 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
 
     let report = check::run_check(
         &config,
+        &chains,
         &prereq.filter_mark,
         domain,
         &strategies,
@@ -341,6 +361,7 @@ pub async fn run_check_cmd(params: CheckParams<'_>) {
     if let Some(v) = via {
         v.cleanup().await;
     }
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
 }
 
 /// Записать отчёт о ПОЛОМКЕ ИНСТРУМЕНТА и выйти кодом этой поломки.
@@ -356,6 +377,11 @@ fn fail_with(
     dns: &str,
     screen: &ui::Console,
 ) -> ! {
+    // Наши цепочки могли уже встать: выход мимо деструкторов не вправе оставить их в ядре.
+    rules::drop_chains_sync(
+        &SystemIptSync,
+        &rules::OwnedChainsMarker::planned(&config.chain_prefix),
+    );
     let outcome = Outcome::Broken { reason };
     let code = outcome.exit_code();
     let report = CheckReport {

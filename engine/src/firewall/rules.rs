@@ -222,15 +222,17 @@ pub async fn prepare_chains<R: IptRun>(
     prefix: &str,
 ) -> Result<OwnedChains, BlockcheckError> {
     let names = ChainNames::new(prefix);
-    drop_chains(
-        r,
-        &OwnedChainsMarker {
-            names: names.clone(),
-        },
-    )
-    .await;
+    let marker = OwnedChainsMarker {
+        names: names.clone(),
+    };
+    drop_chains(r, &marker).await;
     for batch in static_batches(&names) {
-        r.restore(batch).await?;
+        if let Err(e) = r.restore(batch).await {
+            // Транзакции две, и первая (raw) уже могла встать: отказ второй не вправе
+            // оставить её в ядре до конца прогона — «ничего не применено частично».
+            drop_chains(r, &marker).await;
+            return Err(e);
+        }
     }
     Ok(OwnedChains { names })
 }
@@ -899,6 +901,32 @@ mod tests {
         assert_eq!(
             [n.raw(), n.out(), n.post(), n.pre(), n.q(), n.qin(), n.ctl()],
             ["bcw_raw", "bcw_out", "bcw_post", "bcw_pre", "bcw_q", "bcw_qin", "bcw_ctl"]
+        );
+    }
+
+    /// Review I1: сырая часть уже применена, mangle отказал — уйти без следа, а не оставить
+    /// `bcw_raw` и его переход до конца прогона.
+    #[tokio::test]
+    async fn prepare_failure_after_raw_drops_what_was_applied() {
+        let r = RecordingIpt::default();
+        r.fail_restore_from(1, "Couldn't load match `connbytes'");
+        let err = prepare_chains(&r, "bcw").await.expect_err("mangle отказал");
+        assert!(matches!(err, BlockcheckError::Iptables { .. }), "{err:?}");
+        let ops = r.ops();
+        let failed_at = ops
+            .iter()
+            .rposition(|op| op == "restore:mangle")
+            .expect("mangle отправлялся");
+        let after: Vec<&String> = ops[failed_at..].iter().collect();
+        assert!(
+            after
+                .iter()
+                .any(|op| op.starts_with("cmd:raw:-D OUTPUT -j bcw_raw")),
+            "после отказа не снят переход raw: {after:?}"
+        );
+        assert!(
+            after.iter().any(|op| op.as_str() == "cmd:raw:-X bcw_raw"),
+            "после отказа не снесена цепочка raw: {after:?}"
         );
     }
 }

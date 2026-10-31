@@ -230,6 +230,10 @@ pub(crate) mod testing {
         rules: HashMap<(Table, String), Vec<String>>,
         deletes_left: HashMap<(Table, String), usize>,
         fail_restore: Option<String>,
+        /// С какого по счёту `restore` (с нуля) начинать отказывать.
+        fail_from: Option<(usize, String)>,
+        /// Все операции подряд: `restore:<table>`, `test:<table>`, `cmd:<table>:<args>`.
+        ops: Vec<String>,
     }
 
     #[derive(Default)]
@@ -259,6 +263,16 @@ pub(crate) mod testing {
                 .insert((table, chain.to_string()), rules);
         }
 
+        /// Операции в порядке поступления — для утверждений о последовательности.
+        pub fn ops(&self) -> Vec<String> {
+            self.state.lock().unwrap().ops.clone()
+        }
+
+        /// `restore` с номером `n` (с нуля) и все следующие отказывают с этим stderr.
+        pub fn fail_restore_from(&self, n: usize, stderr: &str) {
+            self.state.lock().unwrap().fail_from = Some((n, stderr.to_string()));
+        }
+
         /// Каждый следующий `restore` (и `restore_test`) отказывает с этим stderr.
         pub fn fail_restore(&self, stderr: &str) {
             self.state.lock().unwrap().fail_restore = Some(stderr.to_string());
@@ -275,8 +289,21 @@ pub(crate) mod testing {
 
         fn record_restore(&self, batch: IptBatch, test: bool) -> Result<(), BlockcheckError> {
             let mut st = self.state.lock().unwrap();
-            let failure = st.fail_restore.clone();
+            let mut failure = st.fail_restore.clone();
+            if !test {
+                if let Some((from, stderr)) = &st.fail_from {
+                    if st.restores.len() >= *from {
+                        failure = Some(stderr.clone());
+                    }
+                }
+            }
             let command = batch.first_line();
+            let op = format!(
+                "{}:{}",
+                if test { "test" } else { "restore" },
+                batch.table().name()
+            );
+            st.ops.push(op);
             if test {
                 st.tests.push(batch);
             } else {
@@ -300,6 +327,8 @@ pub(crate) mod testing {
 
         async fn cmd(&self, table: Table, args: &[String]) -> Result<CmdOut, BlockcheckError> {
             let mut st = self.state.lock().unwrap();
+            st.ops
+                .push(format!("cmd:{}:{}", table.name(), args.join(" ")));
             st.cmds.push((table, args.to_vec()));
             let verb = args.first().map(String::as_str);
             let chain = args.get(1).cloned().unwrap_or_default();
@@ -335,6 +364,8 @@ pub(crate) mod testing {
     impl IptRunSync for RecordingIpt {
         fn cmd(&self, table: Table, args: &[String]) -> Result<bool, BlockcheckError> {
             let mut st = self.state.lock().unwrap();
+            st.ops
+                .push(format!("cmd:{}:{}", table.name(), args.join(" ")));
             st.cmds.push((table, args.to_vec()));
             if args.first().map(String::as_str) == Some("-D") {
                 let chain = args.get(1).cloned().unwrap_or_default();

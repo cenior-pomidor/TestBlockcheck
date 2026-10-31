@@ -5,6 +5,8 @@ use console::style;
 
 use blockcheckw::config::{CoreConfig, DnsMode, Protocol};
 use blockcheckw::error::TaskResult;
+use blockcheckw::firewall::ipt::SystemIpt;
+use blockcheckw::firewall::rules;
 use blockcheckw::network::{dns, via::Via};
 use blockcheckw::pipeline::report::{self, UniversalProtocolData};
 use blockcheckw::pipeline::runner::{run_parallel, RunParams};
@@ -100,6 +102,20 @@ pub async fn run_universal(
     // Check for conflicts
     handle_bypass_conflicts(&config.chain_prefix, &screen).await;
 
+    // Наши цепочки — до первой пробы (DoH), на весь прогон (review C1).
+    let chains = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
+        Ok(chains) => chains,
+        Err(e) => {
+            screen.error(&format!("iptables: {e}"));
+            std::process::exit(
+                blockcheckw::dto::Outcome::Broken {
+                    reason: blockcheckw::dto::BrokenReason::Firewall,
+                }
+                .exit_code(),
+            );
+        }
+    };
+
     // Shuffle domain list for random sampling
     let candidates = shuffle(&all_domains);
 
@@ -152,6 +168,7 @@ pub async fn run_universal(
 
             let (scan_results, _stats) = run_parallel(RunParams {
                 config: &config,
+                chains: &chains,
                 filter_mark: &prereq.filter_mark,
                 domain,
                 protocol,
@@ -340,6 +357,7 @@ pub async fn run_universal(
     if let Some(v) = via {
         v.cleanup().await;
     }
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
 }
 
 #[cfg(test)]

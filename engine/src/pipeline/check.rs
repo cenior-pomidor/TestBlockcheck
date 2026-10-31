@@ -46,6 +46,8 @@ use crate::ui;
 #[allow(clippy::too_many_arguments)] // две оси и их эталоны добавлены спекой §6-тер поверх уже широкого набора
 pub async fn run_check(
     config: &CoreConfig,
+    // Наши цепочки ставит команда до первой пробы (DNS) и держит до конца прогона.
+    table: &OwnedChains,
     witness: &FilterMark,
     domain: &str,
     strategies: &[TaggedStrategy],
@@ -65,34 +67,6 @@ pub async fn run_check(
     // Провенанс снимается ДО первой возможной поломки: отчёт об отказе обязан нести условия
     // прогона так же, как отчёт об успехе, — иначе о самой частой беде мы знаем меньше всего.
     let provenance = RunProvenance::of(config, "—", crate::nfqws2::mark::is_embedded());
-
-    let table = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
-        Ok(t) => t,
-        Err(e) => {
-            screen.println(&format!(
-                "  {} failed to prepare iptables chains: {e}",
-                style("ERROR:").red().bold(),
-            ));
-            // ПОЛОМКА ПРИБОРА, а не суждение о цели. Прежде здесь уходил отчёт с пустым
-            // списком и `inconclusive: false` — неотличимый от «перебрали и не нашли», по
-            // которому продукт снимал лечение из-за НАШЕЙ беды.
-            return CheckReport {
-                schema: crate::dto::SCHEMA,
-                outcome: Outcome::Broken {
-                    reason: BrokenReason::Firewall,
-                },
-                run: provenance.clone(),
-                domain: domain.to_string(),
-                timestamp: timestamp_iso(),
-                total: strategies.len(),
-                working: 0,
-                elapsed_secs: start.elapsed().as_secs_f64(),
-                strategies: vec![],
-                control: None,
-                inconclusive: false,
-            };
-        }
-    };
 
     // КОНТРОЛЬ. Профиль в марке НУЛЕВОЙ — ни одно наше правило его не выбирает, и проба
     // честно идёт мимо движка: это и есть «а что будет без десинка вообще». Без него всякое
@@ -165,6 +139,8 @@ pub async fn run_check(
     // где `verified.push`, иначе `zip` ниже разъедется.
     let mut judged: Vec<rank::Ranked> = Vec::new();
     let mut checked_count: usize = 0;
+    // Сколько кандидатов отпало на файрволе: все до одного — поломка прибора.
+    let mut firewall_failures: usize = 0;
     // Сколько строк ПРОШЛО (`working`) — это и есть `working` отчёта, а вовсе не длина
     // списка.
     let mut working_count: usize = 0;
@@ -238,7 +214,7 @@ pub async fn run_check(
             check_single_strategy(
                 config,
                 witness,
-                &table,
+                table,
                 domain,
                 tagged,
                 ips,
@@ -255,6 +231,9 @@ pub async fn run_check(
         .await;
 
         rows.push(outcomes);
+        if checked.failure.as_deref() == Some(FIREWALL_FAILURE) {
+            firewall_failures += 1;
+        }
 
         if checked.working {
             strategy_span.record("status", "working");
@@ -364,9 +343,6 @@ pub async fn run_check(
     order.sort_by(|a, b| rank::fate_order(&a.0, &b.0));
     let verified: Vec<VerifiedStrategy> = order.into_iter().map(|(_, s)| s).collect();
 
-    // Cleanup
-    rules::drop_chains(&SystemIpt, &table.marker()).await;
-
     let mut run = provenance;
     run.tried = checked_count;
     run.total = strategies.len();
@@ -382,6 +358,7 @@ pub async fn run_check(
             total: strategies.len(),
             take,
             ran_out_of_time,
+            firewall_failures,
         }),
         run,
         domain: domain.to_string(),
@@ -394,6 +371,9 @@ pub async fn run_check(
         inconclusive,
     }
 }
+
+/// Метка провала «правила плана не встали» в `CheckedStrategy::failure`.
+const FIREWALL_FAILURE: &str = "firewall";
 
 /// Из чего выводится исход прогона `check`.
 struct OutcomeInput {
@@ -409,6 +389,8 @@ struct OutcomeInput {
     take: usize,
     /// Перебор прекращён истёкшим сроком.
     ran_out_of_time: bool,
+    /// Сколько проверенных кандидатов отпало на файрволе (правила плана не встали).
+    firewall_failures: usize,
 }
 
 /// ИСХОД ПРОГОНА — то, по чему продукт решает, снимать ли лечение.
@@ -421,6 +403,13 @@ struct OutcomeInput {
 fn outcome_of(input: OutcomeInput) -> Outcome {
     if input.inconclusive {
         return Outcome::NotBlocked;
+    }
+    // Ни один кандидат не дошёл до замера из-за файрвола — это поломка прибора: «ничего не
+    // подошло» здесь было бы суждением о линии, которой мы не видели.
+    if input.working == 0 && input.checked > 0 && input.firewall_failures >= input.checked {
+        return Outcome::Broken {
+            reason: BrokenReason::Firewall,
+        };
     }
     if input.working > 0 {
         // Срок важнее `--take`: если оборвал нас он, читателю надо знать, что за обрывом
@@ -709,10 +698,10 @@ async fn check_single_strategy(
 
     // Движок не поднялся — значит мы не наблюдали ничего, и сужать не из чего.
     // Круг остаётся полным (то же самое, что `Observed::Unobserved.admits()`).
-    let make_failed = |error: String| {
+    let make_failed_as = |failure: &str, error: String| {
         (
             CheckedStrategy {
-                failure: Some("engine_error".to_string()),
+                failure: Some(failure.to_string()),
                 protocol: protocol.to_string(),
                 args: args_str.clone(),
                 working: false,
@@ -731,6 +720,7 @@ async fn check_single_strategy(
             Vec::new(),
         )
     };
+    let make_failed = |error: String| make_failed_as("engine_error", error);
 
     // 1. Собрать план из одного профиля и поднять движок
     let env = config.nfqws2_env();
@@ -764,7 +754,7 @@ async fn check_single_strategy(
         // остаться стоять без него до конца всего прогона.
         rules::remove_dispatch(&SystemIpt, table).await;
         SystemNfqws2::stop(instance).await;
-        return make_failed(format!("iptables: {e}"));
+        return make_failed_as(FIREWALL_FAILURE, format!("iptables: {e}"));
     }
 
     // 4. Обе пробы спеки §6-тер. `ips` гарантированно непусты: `apply_dispatch` выше уже
@@ -786,9 +776,19 @@ async fn check_single_strategy(
     )
     .await;
 
-    // 5. Cleanup: снять диспетчеризацию, затем убить nfqws2 (best-effort)
+    // 5. Изоляция обязана была устоять всё время замера: сторож обхода, вставший перед нами
+    //    посреди проб, увёл их в свою очередь — замер был о ЧУЖОМ обходе, засчитывать нельзя.
+    let isolated = crate::pipeline::guard::isolation_held(&SystemIpt, table).await;
+
+    // Cleanup: снять диспетчеризацию, затем убить nfqws2 (best-effort)
     rules::remove_dispatch(&SystemIpt, table).await;
     SystemNfqws2::stop(instance).await;
+    if !isolated {
+        return make_failed_as(
+            "isolation_broken",
+            "чужой переход встал перед нашим во время замера".to_string(),
+        );
+    }
 
     // 6. Свести обе пробы в строку отчёта.
     let outcomes: Vec<PassOutcome> = reading
@@ -1471,5 +1471,46 @@ mod tests {
     #[test]
     fn имя_причины_связности_падает_на_unknown_без_единой_улики() {
         assert_eq!(connectivity_cause_name(None, None), "unknown");
+    }
+
+    /// Review I2: ни один кандидат не дошёл до замера, потому что отказал файрвол, — это
+    /// поломка прибора, а не «ничего не подошло».
+    #[test]
+    fn every_candidate_failing_on_firewall_is_broken() {
+        let outcome = outcome_of(OutcomeInput {
+            inconclusive: false,
+            working: 0,
+            checked: 5,
+            total: 5,
+            take: 0,
+            ran_out_of_time: false,
+            firewall_failures: 5,
+        });
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Broken {
+                    reason: crate::dto::BrokenReason::Firewall
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn some_firewall_failures_do_not_hide_a_real_verdict() {
+        let outcome = outcome_of(OutcomeInput {
+            inconclusive: false,
+            working: 0,
+            checked: 5,
+            total: 5,
+            take: 0,
+            ran_out_of_time: false,
+            firewall_failures: 2,
+        });
+        assert!(
+            matches!(outcome, Outcome::NothingWorks { candidates: 5 }),
+            "{outcome:?}"
+        );
     }
 }

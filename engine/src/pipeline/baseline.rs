@@ -59,7 +59,9 @@ pub async fn test_baseline(
         }
     };
 
-    // fwmark=0 — no marking for baseline (no bypass, no dispatch rules).
+    // Метка КОНТРОЛЯ, не ноль (review C1): немаркированная проба пошла бы через обход
+    // пользователя, и «домен не режется» оказалось бы свойством его обхода, а не линии.
+    // `CONTROL` наши правила не ставят в очередь, но уводят мимо чужих цепочек mangle.
     //
     // HTTPS: GET, downloading up to the threshold. A DPI that caps data transfer
     // (while passing the handshake) registers as blocked, same as check/verify/
@@ -82,7 +84,17 @@ pub async fn test_baseline(
             )
             .await
         }
-        Protocol::Http => http_test(protocol, domain, ip, 0, timeout_secs, None).await,
+        Protocol::Http => {
+            http_test(
+                protocol,
+                domain,
+                ip,
+                crate::nfqws2::mark::ProbeMark::Control.so_mark(),
+                timeout_secs,
+                None,
+            )
+            .await
+        }
     };
     let verdict = interpret_baseline(&result, domain, protocol);
     BaselineResult { protocol, verdict }

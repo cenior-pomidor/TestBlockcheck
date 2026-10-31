@@ -469,6 +469,8 @@ pub enum BlockType {
     SniBlocked,
     /// DNS resolution failed
     DnsFailed,
+    /// Не проверялась: прибор отказал раньше первой пробы (например, не встали правила).
+    Unknown,
 }
 
 impl BlockType {
@@ -505,6 +507,7 @@ impl std::fmt::Display for BlockType {
             BlockType::HostDead => write!(f, "host dead"),
             BlockType::SniBlocked => write!(f, "SNI blocked"),
             BlockType::DnsFailed => write!(f, "DNS failed"),
+            BlockType::Unknown => write!(f, "not checked"),
         }
     }
 }

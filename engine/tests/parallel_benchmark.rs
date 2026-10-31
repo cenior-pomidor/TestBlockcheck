@@ -6,6 +6,8 @@
 use std::time::Instant;
 
 use blockcheckw::config::{set_paths, CoreConfig, Paths, Protocol};
+use blockcheckw::firewall::ipt::SystemIpt;
+use blockcheckw::firewall::rules;
 use blockcheckw::nfqws2::run::SystemNfqws2;
 use blockcheckw::pipeline::runner::{run_parallel, RunParams};
 use blockcheckw::pipeline::worker_task::HttpTestMode;
@@ -103,8 +105,13 @@ async fn parallel_scaling_bench() {
         eprintln!("\n--- Running with worker_count={wc}, strategies={strategy_count} ---");
         let start = Instant::now();
 
+        // Цепочки ставит вызывающий — как команды `bcw` (review C1).
+        let chains = rules::prepare_chains(&SystemIpt, &config.chain_prefix)
+            .await
+            .expect("prepare_chains");
         let (results, stats) = run_parallel(RunParams {
             config: &config,
+            chains: &chains,
             filter_mark: &filter_mark,
             domain,
             protocol,
@@ -119,6 +126,7 @@ async fn parallel_scaling_bench() {
         .await;
 
         let elapsed_ms = start.elapsed().as_millis();
+        rules::drop_chains(&SystemIpt, &chains.marker()).await;
 
         // Verify cleanup
         // Small delay to let processes terminate

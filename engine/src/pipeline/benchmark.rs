@@ -1,7 +1,6 @@
 use console::style;
 
 use crate::config::{CoreConfig, Protocol};
-use crate::network::dns;
 use crate::nfqws2::plan::FilterMark;
 use crate::pipeline::runner::{run_parallel, RunParams};
 use crate::pipeline::worker_task::HttpTestMode;
@@ -263,6 +262,7 @@ fn benchmark_core_config(worker_count: usize, profiles_per_instance: usize) -> C
     }
 }
 
+#[allow(clippy::too_many_arguments)] // цепочки ставит команда (review C1) — восьмой аргумент
 pub async fn run_benchmark(
     time_per_level: u64,
     max_workers: usize,
@@ -271,10 +271,13 @@ pub async fn run_benchmark(
     protocol: Protocol,
     profiles_per_instance: usize,
     filter_mark: &FilterMark,
+    chains: &crate::firewall::rules::OwnedChains,
 ) -> Option<BenchmarkResult> {
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-    let ips = match dns::resolve_ipv4(domain).await {
+    // Только DoH: системного резолвера на Android у статического бинаря нет (ни
+    // `/etc/resolv.conf`, ни `getent`/`nslookup`), а сокет DoH несёт метку контроля.
+    let ips = match crate::network::doh::resolve_ipv4_doh(domain).await {
         Ok(ips) => ips,
         Err(e) => {
             eprintln!("DNS resolve failed for {domain}: {e}");
@@ -367,6 +370,7 @@ pub async fn run_benchmark(
 
         let (_results, stats) = run_parallel(RunParams {
             config: &config,
+            chains,
             filter_mark,
             domain,
             protocol,
@@ -460,6 +464,25 @@ fn format_duration(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Замер на телефоне — шаг 2 приёмки: системного резолвера у статического бинаря на
+    /// Android нет (`/etc/resolv.conf`, `getent`, `nslookup`), поэтому имя цели — только DoH.
+    #[test]
+    fn benchmark_resolves_the_target_via_doh_only() {
+        const SOURCE: &str = include_str!("benchmark.rs");
+        let body = SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("тело отделено от тестов");
+        assert!(
+            !body.contains("dns::resolve_ipv4("),
+            "замер зовёт системный резолвер"
+        );
+        assert!(
+            body.contains("resolve_ipv4_doh("),
+            "замер не идёт через DoH"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -882,6 +882,8 @@ async fn capturing_probe_keeps_partial_on_stall() {
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Порт 80 делит с `scan_baseline_skips_foreign_chain` — по одному.
+    let _kernel = KERNEL.lock().await;
 
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:80").await {
         Ok(l) => l,
@@ -1126,5 +1128,76 @@ async fn control_probe_skips_foreign_chain() {
         after_plain.unwrap_or(0) > 0,
         "непомеченное соединение не засчитано чужой цепочкой — счётчик ничего не доказывает \
          ({after_plain:?})"
+    );
+}
+
+// ── Test 9: базовая проба scan минует чужие цепочки ─────────────────────────
+
+/// Review C1: базовая проба `scan` решает, режется ли домен вовсе. Пойди она через обход
+/// пользователя — домен «не режется», и перебор не начнётся. Поэтому она обязана нести
+/// метку контроля и идти мимо чужих цепочек, как контроль `check`.
+#[tokio::test]
+async fn scan_baseline_skips_foreign_chain() {
+    if !is_root() {
+        eprintln!("SKIPPED: requires root");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _kernel = KERNEL.lock().await;
+    e2e_paths();
+
+    const FOREIGN: &str = "foreign_cnt80";
+    const PREFIX: &str = "bcwt9";
+
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:80").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("SKIPPED: cannot bind :80 ({e})");
+            return;
+        }
+    };
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        }
+    });
+
+    ipt(&["-D", "OUTPUT", "-j", FOREIGN]).await;
+    ipt(&["-F", FOREIGN]).await;
+    ipt(&["-X", FOREIGN]).await;
+    for args in [
+        &["-N", FOREIGN][..],
+        &["-A", FOREIGN, "-p", "tcp", "--dport", "80", "-j", "RETURN"][..],
+        &["-A", "OUTPUT", "-j", FOREIGN][..],
+    ] {
+        assert_eq!(ipt(args).await, 0, "фикстура не создалась: {args:?}");
+    }
+    let chains = rules::prepare_chains(&SystemIpt, PREFIX)
+        .await
+        .expect("prepare_chains");
+
+    let _ = blockcheckw::pipeline::baseline::test_baseline(
+        "localhost",
+        Protocol::Http,
+        2,
+        &["127.0.0.1".to_string()],
+    )
+    .await;
+    let counted = first_rule_packets(FOREIGN).await;
+
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
+    ipt(&["-D", "OUTPUT", "-j", FOREIGN]).await;
+    ipt(&["-F", FOREIGN]).await;
+    ipt(&["-X", FOREIGN]).await;
+    server.abort();
+
+    assert_eq!(
+        counted,
+        Some(0),
+        "базовая проба HTTP прошла через чужую цепочку — её поймал бы обход пользователя"
     );
 }

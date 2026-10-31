@@ -414,14 +414,13 @@ pub async fn set_scan_progress(state: &CleanupState, progress: ScanProgressState
 
 // ── Instance lock ───────────────────────────────────────────────────────────
 
-/// Замок экземпляра в рабочем каталоге: на Android нет `/var/run`.
-pub fn lock_path(work_dir: &std::path::Path) -> std::path::PathBuf {
-    work_dir.join("bcw.lock")
-}
-
-/// Создать рабочий каталог (вместе с родителями), только для root.
+/// Создать рабочий каталог (вместе с родителями) с правами только для root. Существующий
+/// каталог — чужой (`--work-dir /data/local/tmp`): права на нём не трогаем (review M5).
 pub fn ensure_work_dir(work_dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    if work_dir.is_dir() {
+        return Ok(());
+    }
     std::fs::create_dir_all(work_dir)?;
     std::fs::set_permissions(work_dir, std::fs::Permissions::from_mode(0o700))
 }
@@ -446,66 +445,52 @@ pub fn default_report_path(name: &str) -> String {
     run_dir().join(name).to_string_lossy().into_owned()
 }
 
-/// Acquire an exclusive lock to prevent parallel blockcheckw execution.
-/// Opaque lock handle — keeps the flock alive until dropped.
-pub struct InstanceLock(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
+/// Куда `check` кладёт прочитанный из пайпа вход: каталог прогона, а не временный каталог.
+pub fn stdin_buffer_path() -> std::path::PathBuf {
+    run_dir().join("stdin.json")
+}
 
-/// Returns the lock handle (must be kept alive for the duration of the process).
-/// Exits if another instance is already running.
+/// Имя замка экземпляра в абстрактном пространстве unix-сокетов.
+const INSTANCE_LOCK_NAME: &str = "bcw.instance";
+
+/// Замок экземпляра — абстрактный unix-сокет: он общий на сетевое пространство имён, ровно
+/// как наши правила iptables и марки, и не зависит ни от `--work-dir`, ни от файловой
+/// системы (review I4). Освобождается ядром вместе с процессом — даже после `SIGKILL`.
+pub fn bind_instance_lock(name: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+    std::os::unix::net::UnixListener::bind_addr(&addr)
+}
+
+/// Opaque lock handle — keeps the abstract socket bound until dropped.
+pub struct InstanceLock(#[allow(dead_code)] std::os::unix::net::UnixListener);
+
+/// Взять замок экземпляра; если он занят — ждать (так работает пайп `scan | check`: `check`
+/// входит, когда `scan` завершился). Прочие ошибки — выход.
 pub fn acquire_instance_lock() -> InstanceLock {
-    use nix::fcntl::{Flock, FlockArg};
-    use std::io::Write;
-
-    let lock_file = lock_path(&blockcheckw::config::paths().work_dir);
-
-    // No truncate before flock — truncate would create a new file description
-    // and bypass the existing lock held by another process
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_file);
-
-    let file = match file {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "  {} cannot create lock file {}: {e}",
-                style("ERROR:").red().bold(),
-                lock_file.display(),
-            );
-            std::process::exit(1);
-        }
-    };
-
-    // Try non-blocking first
-    let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(lock) => lock,
-        Err((inner_file, _err)) => {
-            // Lock held by another instance — wait (supports pipe: universal | check)
-            let held_pid = std::fs::read_to_string(&lock_file).unwrap_or_default();
-            let held_pid = held_pid.trim();
-            eprintln!(
-                "  {} waiting for another bcw instance (PID {held_pid}) to finish...",
-                style("WAIT:").yellow().bold(),
-            );
-            match Flock::lock(inner_file, FlockArg::LockExclusive) {
-                Ok(lock) => lock,
-                Err(_) => {
-                    eprintln!("  {} failed to acquire lock", style("ERROR:").red().bold(),);
-                    std::process::exit(1);
+    let mut announced = false;
+    loop {
+        match bind_instance_lock(INSTANCE_LOCK_NAME) {
+            Ok(listener) => return InstanceLock(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if !announced {
+                    eprintln!(
+                        "  {} waiting for another bcw instance to finish...",
+                        style("WAIT:").yellow().bold(),
+                    );
+                    announced = true;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} cannot take the instance lock: {e}",
+                    style("ERROR:").red().bold(),
+                );
+                std::process::exit(1);
             }
         }
-    };
-
-    // Write PID for diagnostics (truncate after locking, not before)
-    // Flock<File> implements DerefMut<Target=File>, so we can write directly
-    let mut lock = lock;
-    let _ = lock.set_len(0);
-    let _ = write!(lock, "{}", std::process::id());
-
-    InstanceLock(lock)
+    }
 }
 
 // ── Prerequisites check ─────────────────────────────────────────────────────
@@ -775,12 +760,53 @@ mod conflict_tests {
 
 #[cfg(test)]
 mod work_dir_tests {
-    use super::{ensure_work_dir, lock_path};
-    use std::path::Path;
+    use super::{bind_instance_lock, ensure_work_dir, stdin_buffer_path};
 
+    /// Review I4: правила и движки у нас общие на всё ядро (сетевое пространство имён),
+    /// значит и замок обязан быть на всё ядро, а не на `--work-dir`.
     #[test]
-    fn lock_path_is_inside_work_dir() {
-        assert_eq!(lock_path(Path::new("/w")), Path::new("/w/bcw.lock"));
+    fn instance_lock_is_exclusive_regardless_of_work_dir() {
+        let name = format!("bcw.test.{}", std::process::id());
+        let first = bind_instance_lock(&name).expect("первый экземпляр");
+        assert!(
+            bind_instance_lock(&name).is_err(),
+            "второй экземпляр не должен войти"
+        );
+        drop(first);
+        assert!(
+            bind_instance_lock(&name).is_ok(),
+            "замок освобождается с владельцем"
+        );
+    }
+
+    /// Review I3: буфер `scan | check` — в каталоге прогона (рабочий каталог root), а не во
+    /// временном каталоге, которого на Android нет.
+    #[test]
+    fn stdin_buffer_lives_in_run_dir() {
+        let path = stdin_buffer_path();
+        assert!(
+            path.starts_with(blockcheckw::config::paths().work_dir),
+            "{path:?}"
+        );
+        assert_eq!(path.file_name().unwrap(), "stdin.json");
+    }
+
+    /// Review M5: существующий каталог пользователя (`--work-dir /data/local/tmp`) не наш —
+    /// права на нём не трогаем, иначе `adb push` перестанет туда писать.
+    #[test]
+    fn existing_work_dir_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bcw-wd-keep-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o771)).unwrap();
+        ensure_work_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o771);
     }
 
     #[test]

@@ -5,6 +5,10 @@ pub enum BlockcheckError {
     #[error("iptables command failed: {command}\nstderr: {stderr}")]
     Iptables { command: String, stderr: String },
 
+    /// Во время плана чужой переход встал перед нашим: пробы мерили чужой обход.
+    #[error("isolation broken: a foreign jump got ahead of ours during the plan")]
+    IsolationBroken,
+
     #[error("nfqws2 start failed: {reason}")]
     Nfqws2Start { reason: String },
 

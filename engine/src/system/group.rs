@@ -23,6 +23,23 @@ pub fn detach_into_own_group() -> std::io::Result<()> {
     }
 }
 
+/// Уходить ли в свою группу: НЕТ, если мы — передний план терминала (`fg_of_terminal` —
+/// группа переднего плана терминала на stderr, `own` — наша группа): тогда `Ctrl+C`
+/// приходит нашей группе, и уход отобрал бы его у человека. Во всех прочих случаях (экран
+/// модуля, `ksu.exec`, фон) — уходить: оркестратор снимает нас `kill(-pgid)`.
+pub fn should_detach(fg_of_terminal: Option<i32>, own: i32) -> bool {
+    fg_of_terminal != Some(own)
+}
+
+/// Группа переднего плана терминала на stderr; `None`, если stderr — не терминал.
+pub fn terminal_foreground_group() -> Option<i32> {
+    // SAFETY: `tcgetpgrp` читает свойство дескриптора 2 и ничего не пишет.
+    match unsafe { libc::tcgetpgrp(2) } {
+        pgrp if pgrp > 0 => Some(pgrp),
+        _ => None,
+    }
+}
+
 /// Номер группы процессов, в которой мы сейчас. Оркестратору его называет отчёт: по нему он и
 /// бьёт, когда подбор пора снимать.
 pub fn own_group() -> i32 {
@@ -40,6 +57,20 @@ mod tests {
     /// Тест НЕ возвращает прежнюю группу: обратного хода у `setpgid` нет (вернуться в чужую
     /// группу нельзя, если её лидер уже мёртв), и тестовый процесс живёт с новой группой до
     /// конца. Это безопасно — `cargo test` не шлёт сигналов по группе.
+    /// Review I6: на переднем плане терминала Ctrl+C приходит группе переднего плана —
+    /// уйти из неё значит оставить прогон работать после Ctrl+C человека.
+    #[test]
+    fn foreground_of_a_terminal_stays_in_its_group() {
+        assert!(!should_detach(Some(42), 42));
+    }
+
+    /// Без терминала (экран модуля, `ksu.exec`) или в фоне — своя группа для `kill(-pgid)`.
+    #[test]
+    fn without_a_foreground_terminal_we_detach() {
+        assert!(should_detach(None, 42));
+        assert!(should_detach(Some(7), 42));
+    }
+
     #[test]
     fn entering_our_own_group_makes_us_its_leader() {
         // Отказ возможен только у лидера сессии; в тестовом бинаре мы им не являемся.

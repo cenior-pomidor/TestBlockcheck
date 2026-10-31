@@ -264,6 +264,7 @@ pub async fn run_status_cmd(params: StatusParams<'_>) {
             BlockType::SynBlocked => 4,
             BlockType::HostDead => 5,
             BlockType::DnsFailed => 6,
+            BlockType::Unknown => 7,
         };
         order(&a.block_type)
             .cmp(&order(&b.block_type))
@@ -367,8 +368,8 @@ pub async fn run_status_cmd(params: StatusParams<'_>) {
                 format!("{} {}", CROSS, style("host dead").dim()),
                 String::new(),
             ),
-            BlockType::DnsFailed => (
-                format!("{} {}", CROSS, style("DNS failed").dim()),
+            BlockType::DnsFailed | BlockType::Unknown => (
+                format!("{} {}", CROSS, style(r.block_type.to_string()).dim()),
                 String::new(),
             ),
         };

@@ -96,7 +96,24 @@ pub async fn run_scan(params: ScanParams<'_>) {
 
     let mut screen = ui::Console::new();
 
-    // 0. ISP info
+    // 0. НАШИ ЦЕПОЧКИ — ДО ПЕРВОЙ ПРОБЫ (review C1). Базовая проба и DoH несут метку
+    // контроля, но мимо чужих цепочек mangle их уводят только наши правила: без них проба
+    // прошла бы через обход пользователя, и домен «не резался бы». Держим до конца прогона.
+    let chains = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
+        Ok(chains) => chains,
+        Err(e) => {
+            screen.error(&format!("iptables: {e}"));
+            fail_scan(
+                domain,
+                &config,
+                dns_mode,
+                BlockType::Unknown,
+                BrokenReason::Firewall,
+            );
+        }
+    };
+
+    // 0b. ISP info
     if let Some(info) = isp::detect_ip_info().await {
         screen.add_info_line(&format!("  ISP: {info}"));
     }
@@ -160,23 +177,14 @@ pub async fn run_scan(params: ScanParams<'_>) {
         }
         Err(e) => {
             screen.error(&e.to_string());
-            // ОТЧЁТ И ПРИ ОТКАЗЕ: молчаливый выход неотличим для продукта от «подбор идёт».
-            let outcome = Outcome::Broken {
-                reason: BrokenReason::DnsFailed,
-            };
-            let code = outcome.exit_code();
-            let (json, _) = report::build_scan_report(report::ScanReportInput {
+            rules::drop_chains(&SystemIpt, &chains.marker()).await;
+            fail_scan(
                 domain,
-                block_type: BlockType::DnsFailed,
-                dns_spoofed: DnsSpoofed::Unchecked,
-                blocked: &[],
-                summary: &[],
-                outcome,
-                run: RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
-            });
-            let _ = write_report(&super::default_report_path("scan.json"), &json);
-            // TODO(BL-041): process::exit минует force_flush в main → span'ы сбоя теряются.
-            std::process::exit(code);
+                &config,
+                dns_mode,
+                BlockType::DnsFailed,
+                BrokenReason::DnsFailed,
+            );
         }
     };
 
@@ -224,7 +232,8 @@ pub async fn run_scan(params: ScanParams<'_>) {
                     proto,
                     domain,
                     ip,
-                    0,
+                    // Метка контроля: проба мерит линию, а не обход пользователя (C1).
+                    blockcheckw::nfqws2::mark::ProbeMark::Control.so_mark(),
                     DATA_PROBE_TIMEOUT_SECS,
                     BodyMode::LimitedTo(DATA_TRANSFER_MIN_BYTES * 2),
                     None,
@@ -273,6 +282,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
         if let Some(v) = via {
             v.cleanup().await;
         }
+        rules::drop_chains(&SystemIpt, &chains.marker()).await;
         // Легитимный исход «ничего не заблокировано» — пишем found=0, иначе
         // span bcw.scan уходит без поля и неотличим от обрыва инструментации.
         tracing::Span::current().record("found", 0_usize);
@@ -344,6 +354,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
     // Сколько кандидатов реально проверено — идёт и в провенанс, и в исход: «перебрали всё и
     // не нашли» отличается от «не досмотрели» именно этим числом.
     let tried_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let firewall_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let scan_future = async {
         for &protocol in &blocked_protocols {
@@ -399,6 +410,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
             let sink = progress.lock().unwrap().begin_protocol(protocol);
             let (results, stats) = run_parallel(RunParams {
                 config: &config,
+                chains: &chains,
                 filter_mark: &prereq.filter_mark,
                 domain,
                 protocol,
@@ -414,6 +426,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
             .await;
             proto_span.record("total", stats.completed);
             tried_total.fetch_add(stats.completed, std::sync::atomic::Ordering::Relaxed);
+            firewall_total.fetch_add(stats.firewall_errors, std::sync::atomic::Ordering::Relaxed);
             proto_span.record("success", stats.successes);
             proto_span.record("failed", stats.failures);
 
@@ -550,7 +563,8 @@ pub async fn run_scan(params: ScanParams<'_>) {
     }
 
     let tried = tried_total.load(std::sync::atomic::Ordering::Relaxed);
-    let outcome = scan_outcome(timed_out, &summary, tried);
+    let firewall_failed = firewall_total.load(std::sync::atomic::Ordering::Relaxed);
+    let outcome = scan_outcome(timed_out, &summary, tried, firewall_failed);
     let (content, count) = report::build_scan_report(report::ScanReportInput {
         domain,
         block_type,
@@ -609,6 +623,32 @@ pub async fn run_scan(params: ScanParams<'_>) {
     if let Some(v) = via {
         v.cleanup().await;
     }
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
+}
+
+/// Отчёт о ПОЛОМКЕ до перебора и выход её кодом: молчаливый выход неотличим для продукта
+/// от «подбор идёт». Цепочки к этому моменту уже сняты вызывающим.
+fn fail_scan(
+    domain: &str,
+    config: &CoreConfig,
+    dns_mode: DnsMode,
+    block_type: BlockType,
+    reason: BrokenReason,
+) -> ! {
+    let outcome = Outcome::Broken { reason };
+    let code = outcome.exit_code();
+    let (json, _) = report::build_scan_report(report::ScanReportInput {
+        domain,
+        block_type,
+        dns_spoofed: DnsSpoofed::Unchecked,
+        blocked: &[],
+        summary: &[],
+        outcome,
+        run: RunProvenance::of(config, &dns_mode.to_string(), mark::is_embedded()),
+    });
+    let _ = write_report(&super::default_report_path("scan.json"), &json);
+    // TODO(BL-041): process::exit минует force_flush в main → span'ы сбоя теряются.
+    std::process::exit(code);
 }
 
 /// Сколько рабочих стратегий найдено суммарно по протоколам.
@@ -622,7 +662,18 @@ fn found_in(summary: &[ProtocolSummary]) -> usize {
 /// не доходит вовсе. Здесь различаются три оставшихся случая, и различает их полнота
 /// перебора: оборванный по сроку прогон, ничего не нашедший, НЕ вправе утверждать, что
 /// стратегий нет, — он не досмотрел.
-fn scan_outcome(timed_out: bool, summary: &[ProtocolSummary], tried: usize) -> Outcome {
+fn scan_outcome(
+    timed_out: bool,
+    summary: &[ProtocolSummary],
+    tried: usize,
+    firewall_failed: usize,
+) -> Outcome {
+    // Все перебранные отпали на файрволе — поломка прибора, а не суждение о линии (I2).
+    if found_in(summary) == 0 && tried > 0 && firewall_failed >= tried {
+        return Outcome::Broken {
+            reason: BrokenReason::Firewall,
+        };
+    }
     match (found_in(summary), timed_out) {
         (0, true) => Outcome::Censored {
             limit: Limit::Deadline,
@@ -706,6 +757,26 @@ mod tests {
     /// читает `pipeline::runner::run_parallel`. Ловим именно это — не то, что
     /// `scan_core_config` умеет строить структуру (это тривиально), а то, что
     /// значение не подменяется дефолтом по дороге.
+    /// Review I2: все кандидаты отпали на файрволе — поломка прибора, а не «ничего не
+    /// подошло», которое приёмка засчитала бы.
+    #[test]
+    fn firewall_failure_of_every_candidate_is_broken() {
+        let outcome = scan_outcome(false, &[], 10, 10);
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Broken {
+                    reason: BrokenReason::Firewall
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            scan_outcome(false, &[], 10, 3),
+            Outcome::NothingWorks { candidates: 10 }
+        ));
+    }
+
     #[test]
     fn profiles_per_instance_reaches_core_config() {
         let config = scan_core_config(8, 256);

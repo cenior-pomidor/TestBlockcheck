@@ -564,12 +564,21 @@ async fn main() {
     // Группа — чтобы `kill(-pgid)` снимал нас вместе с детьми одним вызовом. Отказ не
     // смертелен: детей всё равно снимет `PDEATHSIG`, и об отказе мы говорим вслух.
     if embedded {
-        if let Err(e) = blockcheckw::system::group::detach_into_own_group() {
-            eprintln!(
-                "{}не удалось уйти в свою группу процессов ({e}): оркестратору придётся бить \
+        // На переднем плане терминала остаёмся в его группе: иначе `Ctrl+C` человека в
+        // `su -c 'bcw scan | bcw check'` не дошёл бы до нас (review I6). Без терминала (экран
+        // модуля) — своя группа для `kill(-pgid)`.
+        let detach = blockcheckw::system::group::should_detach(
+            blockcheckw::system::group::terminal_foreground_group(),
+            blockcheckw::system::group::own_group(),
+        );
+        if detach {
+            if let Err(e) = blockcheckw::system::group::detach_into_own_group() {
+                eprintln!(
+                    "{}не удалось уйти в свою группу процессов ({e}): оркестратору придётся бить \
                  по pid, дети снимутся PDEATHSIG",
-                blockcheckw::ui::WARN,
-            );
+                    blockcheckw::ui::WARN,
+                );
+            }
         }
         let defaults = blockcheckw::config::CoreConfig::default();
         let signature = blockcheckw::system::orphans::Signature {
@@ -691,8 +700,9 @@ async fn main() {
                 let (source, stdin_tmp) = if let Some(path) = from_file {
                     (path, None)
                 } else if let Some(ref data) = stdin_data {
-                    // Write pre-read stdin to temp file for load_tagged_strategies
-                    let tmp = std::env::temp_dir().join("blockcheckw_stdin.json");
+                    // Буфер — в каталоге прогона (рабочий каталог root, 0700): временного
+                    // каталога на Android нет, а `/data/local/tmp` пишут все (review I3).
+                    let tmp = cmd::stdin_buffer_path();
                     if let Err(e) = std::fs::write(&tmp, data) {
                         eprintln!("ERROR: cannot write temp file: {e}");
                         std::process::exit(1);
