@@ -78,6 +78,8 @@ su -c '/data/local/tmp/bcw -w 64 scan -d rutracker.org -p tls12 | /data/local/tm
    во время прогона обход на телефоне продолжает работать.
 4. После прогона `iptables-save -t mangle` и `-t raw` не содержат `bcw_`.
 5. `kill -9` посреди прогона, повторный запуск — остатки сняты при старте.
+6. С включённым nfqws2-android: `su -c "iptables-save -t mangle | grep -E 'MARK|CONNMARK|NFQUEUE'"` —
+   проверить, что модуль обхода не пишет в метку ПАКЕТА биты 21–29 (на этом держится изоляция).
 
 ## Скорость
 
