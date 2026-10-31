@@ -15,7 +15,7 @@ pub struct ProcessResult {
 }
 
 /// Run a command synchronously (blocking), capturing stdout/stderr.
-/// Used for short-lived commands like nft, curl.
+/// Used for short-lived commands like iptables.
 pub async fn run_process(args: &[&str], timeout_ms: u64) -> Result<ProcessResult, BlockcheckError> {
     let (program, cmd_args) = args
         .split_first()
@@ -101,7 +101,7 @@ fn background_registry() -> &'static StdMutex<BackgroundRegistry> {
 }
 
 /// Началось ли снятие фоновых процессов. Пайплайн спрашивает об этом перед
-/// каждым батчем: после Ctrl+C cleanup сносит нашу nft-таблицу раньше, чем
+/// каждым батчем: после Ctrl+C cleanup сносит наши цепочки iptables раньше, чем
 /// пайплайн успевает остановиться (#66).
 pub fn background_shutdown_started() -> bool {
     background_registry().lock().unwrap().shutting_down

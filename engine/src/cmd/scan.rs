@@ -24,8 +24,8 @@ use blockcheckw::ui;
 use tracing::{info_span, Instrument};
 
 use super::{
-    chrono_local_prefix, handle_bypass_conflicts, resolve_bypass_conflicts_if_any, restore_service,
-    set_scan_progress, set_stopped_service, spawn_cleanup_handler, ScanProgress,
+    chrono_local_prefix, handle_bypass_conflicts, restore_service, set_scan_progress,
+    set_stopped_service, spawn_cleanup_handler, ScanProgress,
 };
 
 /// Timeout for the throttle data probe. Generous so a slow-but-honest link
@@ -363,9 +363,6 @@ pub async fn run_scan(params: ScanParams<'_>) {
 
     let scan_future = async {
         for &protocol in &blocked_protocols {
-            // Re-check for conflicts before each protocol scan
-            resolve_bypass_conflicts_if_any(&config.chain_prefix).await;
-
             screen.newline();
             screen.println(&ui::section(&format!("Scanning {protocol}")));
             let strategies = if let Some(path) = from_file {

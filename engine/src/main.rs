@@ -67,18 +67,9 @@ struct Cli {
     #[arg(long, default_value_t = 254)]
     profiles_per_instance: usize,
 
-    /// Auto-confirm all prompts (non-interactive mode)
-    #[arg(long, global = true)]
-    auto: bool,
-
     /// Route traffic through a gateway or proxy (e.g. 100.64.0.5, localhost:8888, socks5://host:1080)
     #[arg(long, global = true)]
     via: Option<String>,
-
-    /// Не трогать чужие nft-таблицы и процессы nfqws2 (их владелец — вызывающий).
-    /// УЗКИЙ ключ, только про уборку: всё остальное во встроенном режиме включает --embedded.
-    #[arg(long, global = true)]
-    no_conflict_cleanup: bool,
 
     /// ВСТРОЕННЫЙ РЕЖИМ: подбор поднят продуктом, а не человеком.
     ///
@@ -479,8 +470,6 @@ async fn main() {
     // молча у первого, кому понадобился один без другого: «не трогай чужие таблицы» — это про
     // уборку, «я поднят продуктом» — про марку проб, группу процессов, память и вопросы человеку.
     let embedded = cli.embedded;
-    cmd::set_auto_yes(cli.auto || embedded);
-    cmd::set_skip_conflict_cleanup(cli.no_conflict_cleanup || embedded);
     // Пробы без десинка несут собственную марку процесса, чтобы хозяин ядра отличил наш трафик
     // от трафика человека и не увёл его вместе с ним в карантин.
     blockcheckw::nfqws2::mark::set_embedded(embedded);

@@ -28,4 +28,4 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test --lib --bins
-      - run: cargo test --test orphan_reaping --test background_shutdown --test cli --test nft_isolation
+      - run: cargo test --test orphan_reaping --test background_shutdown --test cli --test ipt_isolation

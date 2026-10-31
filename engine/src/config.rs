@@ -93,7 +93,7 @@ pub fn smoke_qnum_base() -> u16 {
 /// Сколько очередей в дымовом диапазоне.
 pub const SMOKE_QUEUE_COUNT: u16 = 10;
 
-/// Имя нашей nft-таблицы в этом прогоне.
+/// Префикс наших цепочек iptables в этом прогоне.
 pub fn chain_prefix() -> String {
     kernel_keys::table()
 }

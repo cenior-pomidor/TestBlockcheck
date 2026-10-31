@@ -2,9 +2,6 @@ use std::fmt;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BlockcheckError {
-    #[error("nftables command failed: {command}\nstderr: {stderr}")]
-    Nftables { command: String, stderr: String },
-
     #[error("iptables command failed: {command}\nstderr: {stderr}")]
     Iptables { command: String, stderr: String },
 

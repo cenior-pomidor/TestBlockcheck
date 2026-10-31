@@ -5,14 +5,14 @@ pub mod scan;
 pub mod status;
 pub mod universal;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use console::style;
 use tokio::sync::Mutex;
 
-use blockcheckw::firewall::ipt::{SystemIpt, SystemIptSync};
-use blockcheckw::firewall::nft::{self, ForeignTable, NftRun, SystemNft, UserConsent};
+use blockcheckw::firewall::ipt::{
+    IptRun, IptRunSync, SystemIpt, SystemIptSync, Table, IPTABLES, IPTABLES_RESTORE,
+};
 use blockcheckw::firewall::rules::OwnedChainsMarker;
 use blockcheckw::ui::WARN;
 
@@ -30,27 +30,11 @@ pub fn print_stdout_graceful(data: &str, con: &blockcheckw::ui::Console) {
     }
 }
 
-/// Global flag: auto-confirm all prompts (set by --yes / -y).
-static AUTO_YES: AtomicBool = AtomicBool::new(false);
-
-/// Set auto-confirm mode (called from main).
-pub fn set_auto_yes(yes: bool) {
-    AUTO_YES.store(yes, Ordering::Relaxed);
-}
-
-/// Global flag: skip detection/cleanup of foreign DPI-bypass nft tables and nfqws2 processes.
-/// For embedded use (an orchestrator owns the nft state and installs its own queue tables);
-/// without it blockcheckw deletes any non-own table with queue rules on 443 + kills nfqws2.
-static SKIP_CONFLICT_CLEANUP: AtomicBool = AtomicBool::new(false);
-
-/// Enable embedded mode: leave foreign nft tables/processes untouched (called from main).
-pub fn set_skip_conflict_cleanup(skip: bool) {
-    SKIP_CONFLICT_CLEANUP.store(skip, Ordering::Relaxed);
-}
-
 // ── Zapret2 service management ──────────────────────────────────────────────
 
 /// How zapret2 service is managed on this system.
+// Временно: управление службой снимается целиком в Task 7.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ServiceManager {
     /// systemd: `systemctl stop/start zapret2`
@@ -69,6 +53,7 @@ impl std::fmt::Display for ServiceManager {
 }
 
 /// Detect how zapret2 is managed. Returns None if no service found.
+#[allow(dead_code)] // Task 7
 pub async fn detect_service_manager() -> Option<ServiceManager> {
     use blockcheckw::system::process::run_process;
 
@@ -95,6 +80,7 @@ pub async fn detect_service_manager() -> Option<ServiceManager> {
 }
 
 /// Stop zapret2 service. Returns true on success.
+#[allow(dead_code)] // Task 7
 pub async fn stop_service(mgr: &ServiceManager) -> bool {
     use blockcheckw::system::process::run_process;
 
@@ -126,223 +112,101 @@ pub async fn start_service(mgr: &ServiceManager) -> bool {
     }
 }
 
-// ── Bypass conflict detection & resolution ──────────────────────────────────
+// ── Соседи по ядру ──────────────────────────────────────────────────────────
 
+/// Кто рядом: чужие цепочки mangle с очередью и процессы nfqws2. Только наблюдение — на
+/// Android обходом владеет пользователь, и трогать его модуль мы не вправе.
 pub struct BypassConflicts {
     pub has_nfqws2_processes: bool,
-    pub conflicting_tables: Vec<ForeignTable>,
+    pub foreign_queue_chains: Vec<String>,
 }
 
 impl BypassConflicts {
     pub fn is_empty(&self) -> bool {
-        !self.has_nfqws2_processes && self.conflicting_tables.is_empty()
+        !self.has_nfqws2_processes && self.foreign_queue_chains.is_empty()
     }
 }
 
-/// Таблицы, которые могут принадлежать чужому bypass: всё, кроме нашей
-/// собственной и обвязки OpenWrt (fw4).
-fn foreign_table_candidates(tables: &[(String, String)], own_table: &str) -> Vec<ForeignTable> {
-    tables
-        .iter()
-        .filter(|(_, name)| name != own_table && name != "fw4")
-        .map(|(family, name)| ForeignTable::detected(family.clone(), name.clone()))
-        .collect()
-}
-
-/// Похоже ли содержимое таблицы на DPI bypass: очередь на HTTPS-порт.
-fn table_has_bypass_rules(table_content: &str) -> bool {
-    table_content.contains("queue")
-        && (table_content.contains("dport 443") || table_content.contains("dport { 80, 443"))
+/// Чужие цепочки с `-j NFQUEUE` по выводу `iptables -t mangle -S`: без своих, без повторов,
+/// в порядке появления.
+pub fn foreign_queue_chains(save: &str, own_prefix: &str) -> Vec<String> {
+    let own = format!("{own_prefix}_");
+    let mut found: Vec<String> = Vec::new();
+    for line in save.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("-A") {
+            continue;
+        }
+        let Some(chain) = words.next() else { continue };
+        let queues = line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w == ["-j", "NFQUEUE"]);
+        if queues && !chain.starts_with(&own) && !found.iter().any(|c| c == chain) {
+            found.push(chain.to_string());
+        }
+    }
+    found
 }
 
 fn pgrep_has_matches(exit_code: i32, stdout: &str) -> bool {
     exit_code == 0 && !stdout.trim().is_empty()
 }
 
-/// Detect conflicting DPI bypass processes and nftables tables.
-pub async fn detect_bypass_conflicts(own_table: &str) -> BypassConflicts {
+/// Посмотреть, кто рядом. Ничего не меняет.
+pub async fn detect_bypass_conflicts(own_prefix: &str) -> BypassConflicts {
     use blockcheckw::system::process::run_process;
 
     let mut conflicts = BypassConflicts {
         has_nfqws2_processes: false,
-        conflicting_tables: Vec::new(),
+        foreign_queue_chains: Vec::new(),
     };
 
-    // Check for other nfqws2 processes
     if let Ok(result) = run_process(&["pgrep", "-x", "nfqws2"], 3_000).await {
         conflicts.has_nfqws2_processes = pgrep_has_matches(result.exit_code, &result.stdout);
     }
 
-    // Check for other nftables tables with queue rules on ports 80/443
-    if let Ok(tables) = SystemNft.table_names().await {
-        for candidate in foreign_table_candidates(&tables, own_table) {
-            if let Ok(content) = SystemNft.dump_foreign(&candidate).await {
-                if table_has_bypass_rules(&content) {
-                    conflicts.conflicting_tables.push(candidate);
-                }
-            }
+    if let Ok(out) = SystemIpt.cmd(Table::Mangle, &["-S".to_string()]).await {
+        if out.ok {
+            conflicts.foreign_queue_chains = foreign_queue_chains(&out.stdout, own_prefix);
         }
     }
 
     conflicts
 }
 
-/// Разобраться с конфликтующим DPI-обходом. Возвращает `Some(ServiceManager)`,
-/// если сервис был остановлен (вызывающий обязан поднять его на выходе), или
-/// `None`, если сервиса не было. `Err(())` — пользователь отказался.
+/// Сказать о соседях: в консоль и машинно (`neighbours`). Наши пробы идут мимо их цепочек
+/// (изоляция по метке), но человеку и продукту полезно знать, что рядом работает обход.
 ///
-/// Снимка чужого состояния здесь нет намеренно (#66): сервис, который мы
-/// останавливаем его же init-скриптом, поднимает свои таблицы сам —
-/// `start` симметричен `stop`.
+/// Тип возврата сохранён для вызывающих: службу на Android мы не останавливаем никогда.
 pub async fn handle_bypass_conflicts(
-    own_table: &str,
+    own_prefix: &str,
     con: &blockcheckw::ui::Console,
 ) -> Result<Option<ServiceManager>, ()> {
-    // НАБЛЮДЕНИЕ ОТДЕЛЕНО ОТ ВМЕШАТЕЛЬСТВА. Во встроенном режиме чужое ядро принадлежит
-    // вызывающему, и трогать его нельзя — но и МОЛЧАТЬ о том, что мы видим, незачем: для
-    // продукта «на 443 сидит мой собственный слот» есть диагноз, объясняющий пустой подбор.
-    // Прежде этот метод выходил первой же строкой, и сказать ему было нечего.
-    let conflicts = detect_bypass_conflicts(own_table).await;
-
-    if SKIP_CONFLICT_CLEANUP.load(Ordering::Relaxed) {
-        if !conflicts.is_empty() {
-            let tables: Vec<String> = conflicts
-                .conflicting_tables
-                .iter()
-                .map(|t| format!("{} {}", t.family(), t.name()))
-                .collect();
-            con.warn(&format!(
-                "рядом работает чужой обход (таблиц: {}, процессы nfqws2: {}) — не трогаю,                  но подбор может мерить его, а не линию",
-                tables.len(),
-                if conflicts.has_nfqws2_processes { "есть" } else { "нет" },
-            ));
-            blockcheckw::machine::emit_neighbours(&tables, conflicts.has_nfqws2_processes);
-        }
-        return Ok(None); // embedded: оркестратор владеет nft-состоянием, чужие трубы не трогаем
-    }
-
-    if conflicts.is_empty() {
-        return Ok(None);
-    }
-
-    con.newline();
-    con.section("Conflicting DPI bypass");
-    if conflicts.has_nfqws2_processes {
-        con.warn("running nfqws2 processes found");
-    }
-    for table in &conflicts.conflicting_tables {
-        con.warn(&format!(
-            "nft table '{} {}' has queue rules on port 443",
-            table.family(),
-            table.name(),
-        ));
-    }
-
-    // Try to detect service manager
-    let service_mgr = detect_service_manager().await;
-
-    if let Some(ref mgr) = service_mgr {
-        con.println(&format!(
-            "  detected service: {}",
-            style(format!("{mgr}")).cyan().bold()
-        ));
-        con.newline();
-        eprint!(
-            "  Stop zapret2 via {mgr} for the duration of the scan? {} ",
-            style("[Y/n]").bold()
-        );
-
-        if !prompt_yes_no() {
-            con.println(&format!("  {}", style("Aborted.").red()));
-            return Err(());
-        }
-
-        if stop_service(mgr).await {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            con.ok(&format!("zapret2 stopped via {mgr}"));
-            con.info("will restart automatically when blockcheckw finishes");
-            Ok(Some(mgr.clone()))
-        } else {
-            con.error(&format!("failed to stop zapret2 via {mgr}"));
-            con.info("please stop it manually and re-run blockcheckw");
-            Err(())
-        }
-    } else {
-        con.warn("no systemd unit or init.d script found for zapret2");
-        con.newline();
-        eprint!(
-            "  Kill nfqws2 processes and drop conflicting nft tables? {} ",
-            style("[Y/n]").bold()
-        );
-
-        if !prompt_yes_no() {
-            con.println(&format!("  {}", style("Aborted.").red()));
-            return Err(());
-        }
-
-        resolve_bypass_conflicts_manual(&conflicts, &UserConsent::granted()).await;
-        con.ok("processes killed, nft tables dropped");
-        con.warn("you will need to restart DPI bypass manually afterwards");
-        Ok(None)
-    }
-}
-
-/// Fallback: kill nfqws2 by PID (not killall) and drop conflicting tables.
-async fn resolve_bypass_conflicts_manual(conflicts: &BypassConflicts, consent: &UserConsent) {
-    use blockcheckw::system::process::run_process;
-
-    if conflicts.has_nfqws2_processes {
-        // Kill by PID instead of killall — safer, only kills processes we detected
-        if let Ok(result) = run_process(&["pgrep", "-x", "nfqws2"], 3_000).await {
-            if result.exit_code == 0 {
-                for pid in result.stdout.lines() {
-                    let pid = pid.trim();
-                    if !pid.is_empty() {
-                        let _ = run_process(&["kill", pid], 3_000).await;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    for table in &conflicts.conflicting_tables {
-        let _ = SystemNft.run(table.delete_batch(consent)).await;
-    }
-}
-
-/// Re-check and resolve conflicts silently (used between protocol scans).
-pub async fn resolve_bypass_conflicts_if_any(own_table: &str) {
-    if SKIP_CONFLICT_CLEANUP.load(Ordering::Relaxed) {
-        return; // embedded: чужие трубы/процессы не трогаем
-    }
-    let conflicts = detect_bypass_conflicts(own_table).await;
+    let conflicts = detect_bypass_conflicts(own_prefix).await;
     if !conflicts.is_empty() {
-        resolve_bypass_conflicts_manual(&conflicts, &UserConsent::granted()).await;
+        con.warn(&format!(
+            "рядом работает обход (цепочек с очередью: {}, процессы nfqws2: {}) — не трогаю; \
+             наши пробы идут мимо его цепочек",
+            conflicts.foreign_queue_chains.len(),
+            if conflicts.has_nfqws2_processes {
+                "есть"
+            } else {
+                "нет"
+            },
+        ));
+        blockcheckw::machine::emit_neighbours(
+            &conflicts.foreign_queue_chains,
+            conflicts.has_nfqws2_processes,
+        );
     }
-}
-
-fn prompt_yes_no() -> bool {
-    if AUTO_YES.load(Ordering::Relaxed) {
-        eprintln!("(auto-confirmed by --auto)");
-        return true;
-    }
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        eprintln!("  non-interactive mode: use --auto to confirm automatically");
-        return false;
-    }
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-    let input = input.trim().to_lowercase();
-    input.is_empty() || input == "y" || input == "yes"
+    Ok(None)
 }
 
 // ── Shared cleanup state ────────────────────────────────────────────────────
 
-/// Shared state for Ctrl+C handler: nft table to drop + optional service to restart.
+/// Shared state for Ctrl+C handler: our iptables chains to drop + optional service to restart.
 pub type CleanupState = Arc<Mutex<CleanupInfo>>;
 
 pub struct CleanupInfo {
@@ -518,7 +382,7 @@ mod scan_progress_tests {
 }
 
 /// Create shared cleanup state and spawn signal handlers (SIGINT + SIGTERM) that will:
-/// 1. Drop our nft table
+/// 1. Drop our iptables chains
 /// 2. Restart zapret2 service if we stopped it
 pub fn spawn_cleanup_handler(chain_prefix: &str) -> CleanupState {
     let state = Arc::new(Mutex::new(CleanupInfo {
@@ -779,34 +643,29 @@ pub fn check_prerequisites(con: &blockcheckw::ui::Console) -> Prerequisites {
             "nfqws2 not found at {}",
             style(&config.nfqws2_path).cyan()
         ));
-        con.println(&format!(
-            "       run \"{}/install_bin.sh\" or check ZAPRET_BASE path",
-            config.zapret_base,
-        ));
+        con.println("       point to the binary with --nfqws2 <PATH>");
         ok = false;
     }
 
-    // nft binary
-    if which(nft::BINARY) {
-        con.ok(nft::BINARY);
-    } else {
-        con.error("nft not found in PATH");
-        con.println("       install nftables: apt install nftables / opkg install nftables");
-        ok = false;
-    }
-
-    // nft (наличие таблиц читаем, а не пытаемся судить про очереди —
-    // `is_available_sync()` зовёт `nft list tables` и про NFQUEUE ничего не
-    // знает; за очередь теперь по-настоящему ручается дымовой запуск ниже)
-    if ok {
-        if nft::is_available_sync() {
-            con.ok("nft");
+    // iptables: оба бинаря на месте и таблица mangle читается
+    for binary in [IPTABLES, IPTABLES_RESTORE] {
+        if which(binary) {
+            con.ok(binary);
         } else {
-            con.error("nft is not usable (`nft list tables` failed)");
-            con.println(
-                "       check that nftables is installed and you have permission to run it",
-            );
+            con.error(&format!("{binary} not found in PATH"));
             ok = false;
+        }
+    }
+    if ok {
+        match SystemIptSync.cmd(Table::Mangle, &["-S".to_string(), "OUTPUT".to_string()]) {
+            Ok(true) => con.ok("iptables -t mangle"),
+            _ => {
+                con.error("iptables is not usable (`iptables -w -t mangle -S OUTPUT` failed)");
+                con.println(
+                    "       run as root (su -c) and check that the kernel has iptable_mangle",
+                );
+                ok = false;
+            }
         }
     }
 
@@ -848,24 +707,16 @@ pub fn check_prerequisites(con: &blockcheckw::ui::Console) -> Prerequisites {
         std::process::exit(6);
     }
 
-    // 6. БОЕВАЯ очередь свободна — ТОЛЬКО во встроенном режиме.
+    // 6. БОЕВАЯ очередь свободна.
     //
     // Дымовой запуск (шаг 5) доказывает исправность бинаря на СВОЕЙ очереди из дальнего
     // диапазона и о боевой не говорит ничего. Занятая боевая очередь означала бы, что
     // правила поедут в очередь с чужим слушателем: пакеты уходят не нам, и подбор молча
-    // мерит чужой мир. Своих остатков здесь уже нет — их снял идемпотентный вход.
-    //
-    // ПОЧЕМУ НЕ ВСЕГДА. Вне встроенного режима занятую очередь разбирает разрешатель
-    // конфликтов (`handle_bypass_conflicts`), и работает он ПОЗЖЕ преflight'а. Откажи мы
-    // здесь — свой же осиротевший движок на боевой очереди запирал бы человека на КАЖДОМ
-    // следующем запуске, а снял бы его тот, до кого управление уже не дошло. Это ровно та
-    // ловушка, из-за которой дымовой запуск ходит по дальнему диапазону (см. `SMOKE_QUEUES`).
-    // Во встроенном режиме разрешателя нет по уговору с вызывающим — там отказ и уместен.
+    // мерит чужой мир. Своих остатков здесь уже нет — их снял идемпотентный вход. Чужой
+    // обход на Android не трогается никогда, поэтому отказ уместен всегда (лечится `--qnum`).
     //
     // Отказ машинный: оркестратору нужен КОД и ИМЯ занятой очереди, а не строка для глаз.
-    if SKIP_CONFLICT_CLEANUP.load(Ordering::Relaxed)
-        && queue_is_taken(blockcheckw::nfqws2::plan::QueueNum::new(config.base_qnum))
-    {
+    if queue_is_taken(blockcheckw::nfqws2::plan::QueueNum::new(config.base_qnum)) {
         con.error(&format!(
             "боевая очередь {} занята чужим слушателем",
             config.base_qnum
@@ -996,90 +847,24 @@ pub fn chrono_local_prefix() -> String {
 
 #[cfg(test)]
 mod conflict_tests {
-    use super::{
-        foreign_table_candidates, pgrep_has_matches, table_has_bypass_rules, ForeignTable,
-    };
-
-    /// Роутер с OpenWrt, zapret1 и zapret2 одновременно.
-    /// То, что вернул бы `nft list tables` на роутере с работающим zapret1.
-    fn table_list() -> Vec<(String, String)> {
-        [
-            ("inet", "fw4"),
-            ("inet", "zapret"),
-            ("inet", "zapret2"),
-            ("ip", "nat"),
-        ]
-        .iter()
-        .map(|(f, n)| (f.to_string(), n.to_string()))
-        .collect()
-    }
-
-    /// Есть ли среди кандидатов таблица с таким именем.
-    fn has(found: &[ForeignTable], family: &str, name: &str) -> bool {
-        found
-            .iter()
-            .any(|t| t.family() == family && t.name() == name)
-    }
-
-    /// Таблица zapret1: очередь на 80/443.
-    const ZAPRET1_TABLE: &str = "\
-table inet zapret {
-	chain postrouting {
-		type filter hook postrouting priority 101; policy accept;
-		meta l4proto tcp tcp dport { 80, 443 } queue num 200 bypass
-	}
-}
-";
+    use super::{foreign_queue_chains, pgrep_has_matches};
 
     #[test]
-    fn zapret1_table_is_foreign_when_we_use_our_own_name() {
-        let found = foreign_table_candidates(&table_list(), "blockcheckw");
-        assert!(
-            has(&found, "inet", "zapret"),
-            "таблица zapret1 должна попадать в кандидаты: {found:?}"
+    fn foreign_queue_chains_are_found_and_ours_are_skipped() {
+        let save = "-N nfqws_post\n-N bcw_q\n-A nfqws_post -p tcp -j NFQUEUE --queue-num 300\n\
+                    -A bcw_q -j NFQUEUE --queue-num 777\n-A nfqws_pre -j NFQUEUE --queue-num 300\n";
+        assert_eq!(
+            foreign_queue_chains(save, "bcw"),
+            ["nfqws_post", "nfqws_pre"]
         );
     }
 
     #[test]
-    fn own_table_is_never_reported_as_foreign() {
-        // issue #66: пока own_table == "zapret", таблица zapret1 невидима
-        // для детекта конфликтов — и молча сносится нашим cleanup
-        let found = foreign_table_candidates(&table_list(), "zapret");
-        assert!(
-            !has(&found, "inet", "zapret"),
-            "своя таблица не может быть чужой: {found:?}"
-        );
-    }
-
-    #[test]
-    fn openwrt_fw4_table_is_skipped() {
-        let found = foreign_table_candidates(&table_list(), "blockcheckw");
-        assert!(
-            !found.iter().any(|t| t.name() == "fw4"),
-            "fw4 — обвязка OpenWrt, не bypass: {found:?}"
-        );
-    }
-
-    #[test]
-    fn queue_on_https_port_looks_like_bypass() {
-        assert!(table_has_bypass_rules(ZAPRET1_TABLE));
-        assert!(table_has_bypass_rules(
-            "\t\ttcp dport 443 queue num 100 bypass\n"
-        ));
-    }
-
-    #[test]
-    fn table_without_queue_is_not_bypass() {
-        let nat =
-            "table ip nat {\n\tchain prerouting {\n\t\ttcp dport 443 dnat to 10.0.0.1\n\t}\n}\n";
-        assert!(!table_has_bypass_rules(nat));
-    }
-
-    #[test]
-    fn queue_on_other_port_is_not_bypass() {
-        let dns =
-            "table inet mydns {\n\tchain output {\n\t\tudp sport 53 queue num 300 bypass\n\t}\n}\n";
-        assert!(!table_has_bypass_rules(dns));
+    fn a_chain_is_listed_once_and_rules_without_queue_are_ignored() {
+        let save = "-A nfqws_post -p tcp --dport 80 -j NFQUEUE --queue-num 300\n\
+                    -A nfqws_post -p tcp --dport 443 -j NFQUEUE --queue-num 300\n\
+                    -A OUTPUT -j nfqws_post\n-A fw_OUTPUT -j ACCEPT\n";
+        assert_eq!(foreign_queue_chains(save, "bcw"), ["nfqws_post"]);
     }
 
     #[test]

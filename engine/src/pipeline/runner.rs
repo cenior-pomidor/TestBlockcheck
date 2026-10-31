@@ -376,7 +376,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
         pb.finish_and_clear();
     }
 
-    // Cleanup nftables table — хэндл потребляется, снести повторно нечем.
+    // Снести наши цепочки целиком.
     rules::drop_chains(&SystemIpt, &table.marker()).await;
 
     let elapsed = start.elapsed();

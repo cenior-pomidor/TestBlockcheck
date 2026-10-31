@@ -59,7 +59,7 @@ pub async fn test_baseline(
         }
     };
 
-    // fwmark=0 — no marking for baseline (no bypass, no nftables rules).
+    // fwmark=0 — no marking for baseline (no bypass, no dispatch rules).
     //
     // HTTPS: GET, downloading up to the threshold. A DPI that caps data transfer
     // (while passing the handshake) registers as blocked, same as check/verify/
