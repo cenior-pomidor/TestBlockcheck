@@ -7,6 +7,7 @@
 
 pub mod args;
 pub mod layout;
+pub mod network;
 pub mod ports;
 pub mod preset;
 pub mod rules;
