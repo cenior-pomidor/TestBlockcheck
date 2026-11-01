@@ -4,7 +4,9 @@
 //! которого сверяются тесты. Спецификация: `docs/superpowers/specs/2026-11-01-bcw-module-design.md`.
 
 pub mod layout;
+pub mod ports;
 pub mod preset;
+pub mod settings;
 
 /// Каталог модуля на телефоне.
 pub const MODULE_DIR: &str = "/data/adb/modules/bcw";
