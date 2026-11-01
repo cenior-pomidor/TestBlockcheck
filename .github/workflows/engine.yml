@@ -2,7 +2,7 @@ name: engine
 
 on:
   push:
-    branches: [main, stage1-engine]
+    branches: [main, stage1-engine, stage2-module]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -44,13 +44,16 @@ jobs:
         # первому правилу; провал здесь — предупреждение, а не отказ job.
         run: |
           for m in nfnetlink_queue ip_tables iptable_mangle iptable_raw xt_NFQUEUE \
-                   xt_connbytes xt_connmark xt_CT xt_mark xt_conntrack xt_multiport xt_tcpudp; do
+                   xt_connbytes xt_connmark xt_CT xt_mark xt_conntrack xt_multiport xt_tcpudp \
+                   iptable_nat iptable_filter xt_MASQUERADE xt_REJECT ipt_REJECT xt_TCPMSS; do
             sudo modprobe "$m" || echo "::warning::modprobe $m failed"
           done
       - name: Build integration image
         run: docker build -f docker/integration.Dockerfile -t bcw-it .
       - name: Run e2e_infra tests
         run: docker run --rm --privileged bcw-it --test e2e_infra -- --nocapture
+      - name: Run bypass_e2e tests
+        run: docker run --rm --privileged bcw-it --test bypass_e2e -- --nocapture --test-threads=1
       - name: Run parallel_benchmark tests
         continue-on-error: true
         run: docker run --rm --privileged bcw-it --test parallel_benchmark -- --nocapture
