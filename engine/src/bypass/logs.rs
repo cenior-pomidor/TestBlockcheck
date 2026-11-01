@@ -79,8 +79,63 @@ pub struct Journal {
     pub max_kb: u32,
 }
 
+/// Смещение от UTC в секундах, если известно (на Android — из `date +%z`: статический musl
+/// не видит базу часовых поясов Android и считал бы время в UTC).
+static UTC_OFFSET: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+
+pub fn set_utc_offset(secs: i64) {
+    if let Ok(mut o) = UTC_OFFSET.lock() {
+        *o = Some(secs);
+    }
+}
+
+/// `+0300` → 10800, `-0530` → −19800.
+pub fn parse_utc_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => return None,
+    };
+    if rest.len() != 4 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let h: i64 = rest[..2].parse().ok()?;
+    let m: i64 = rest[2..].parse().ok()?;
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// `YYYY-MM-DD HH:MM:SS` для момента `epoch` при смещении `offset`.
+pub fn format_stamp(epoch: i64, offset: i64) -> String {
+    let t = epoch + offset;
+    let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    // Гражданская дата из дней от 1970-01-01 (алгоритм Хиннанта).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
 /// Местное время `YYYY-MM-DD HH:MM:SS`.
 pub fn now_stamp() -> String {
+    if let Some(off) = UTC_OFFSET.lock().ok().and_then(|o| *o) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        return format_stamp(now, off);
+    }
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as libc::time_t)
@@ -107,10 +162,14 @@ impl Journal {
             Level::Info => "info",
             Level::Error => "error",
         };
+        // У простой ошибки вид события совпал бы с уровнем («error error …») — пропускаем его.
+        let kind_word = match kind {
+            EventKind::Error => String::new(),
+            k => format!(" {}", k.as_str()),
+        };
         let line = format!(
-            "{} {lv} {} {}",
+            "{} {lv}{kind_word} {}",
             now_stamp(),
-            kind.as_str(),
             text.replace('\n', " ")
         );
         let mut f = std::fs::OpenOptions::new()
@@ -198,6 +257,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Приёмка на телефоне: время журнала шло в UTC.
+    #[test]
+    fn stamps_use_the_given_offset() {
+        assert_eq!(parse_utc_offset("+0300"), Some(10800));
+        assert_eq!(parse_utc_offset("-0530\n"), Some(-19800));
+        assert_eq!(parse_utc_offset("MSK"), None);
+        assert_eq!(format_stamp(1_793_520_000, 10800), "2026-11-01 11:00:00");
+        assert_eq!(format_stamp(1_793_520_000, -19800), "2026-11-01 02:30:00");
+        assert_eq!(
+            format_stamp(951_782_400 + 23 * 3600, 0),
+            "2000-02-29 23:00:00"
+        );
+    }
+
+    /// Приёмка на телефоне: «error error …» — у ошибки вид события не повторяет уровень.
+    #[test]
+    fn error_line_has_no_doubled_word() {
+        let d = tmp("dbl");
+        let j = Journal {
+            dir: d.clone(),
+            max_kb: 512,
+        };
+        j.event(EventKind::Error, Level::Error, "nfqws2 упал")
+            .unwrap();
+        j.event(EventKind::Restart, Level::Error, "сторож").unwrap();
+        let text = std::fs::read_to_string(d.join("service.log")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(&lines[0][19..], " error nfqws2 упал");
+        assert_eq!(&lines[1][19..], " error restart сторож");
+        let s = stats(&d);
+        assert_eq!((s.errors, s.restarts), (2, 1));
+        std::fs::remove_dir_all(d).ok();
     }
 
     #[test]

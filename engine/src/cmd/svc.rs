@@ -29,6 +29,14 @@ pub async fn run(boot: bool) -> ! {
             std::process::exit(1);
         }
     };
+    // Часовой пояс: статический бинарь не видит базу Android, а `date` (bionic) — видит.
+    if let Ok(out) = std::process::Command::new("date").arg("+%z").output() {
+        if let Some(off) =
+            blockcheckw::bypass::logs::parse_utc_offset(&String::from_utf8_lossy(&out.stdout))
+        {
+            blockcheckw::bypass::logs::set_utc_offset(off);
+        }
+    }
     let (settings, _) = store.settings();
     let journal = Journal {
         dir: layout.logs_dir(),
