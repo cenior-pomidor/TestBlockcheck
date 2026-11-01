@@ -1,6 +1,7 @@
 // Вкладка «Стратегии»: список пресетов и редактор шести ключей.
-import { ctl, uploadText } from './bridge.js';
+import { LONG, ctl, uploadText } from './bridge.js';
 import { esc, button } from './util.js';
+import { cmd } from './commands.js';
 
 export const KEYS = ['NFQWS_BASE_ARGS', 'NFQWS_ARGS', 'NFQWS_ARGS_QUIC', 'NFQWS_ARGS_UDP', 'NFQWS_ARGS_IPSET', 'NFQWS_ARGS_CUSTOM'];
 const LABELS = {
@@ -54,13 +55,21 @@ export function renderEditor(s) {
     + `<div class="actions">${acts.join('')}</div></form>`;
 }
 
-/** Поля редактора → текст пресета: по ключу на строку, значение в двойных кавычках. */
-export function editorToText(fields) {
-  return KEYS.map((k) => {
+/** Строки лимитов пакетов пресета (`NFQWS2_{TCP,UDP}_PKT_{OUT,IN}`, в т. ч. закомментированные). */
+export function pktLines(text) {
+  return String(text || '').split('\n').filter((l) => /^[\s#]*NFQWS2_(TCP|UDP)_PKT_(OUT|IN)=/.test(l));
+}
+
+/** Поля редактора → текст пресета: по ключу на строку, значение в двойных кавычках.
+ *  Лимиты пакетов из исходного текста (`original`) переносятся без изменений. */
+export function editorToText(fields, original = '') {
+  const keys = KEYS.map((k) => {
     const v = String(fields[k] ?? '').replace(/\r\n?/g, '\n').trim();
     if (v.includes('"')) throw new Error(`${k}: двойная кавычка в значении не поддерживается`);
     return `${k}="${v}"\n`;
   }).join('');
+  const pkt = pktLines(original);
+  return pkt.length ? `${keys}\n${pkt.join('\n')}\n` : keys;
 }
 
 function readFields(form) {
@@ -70,7 +79,7 @@ function readFields(form) {
 }
 
 async function showList(root, toast) {
-  const [list, status] = await Promise.all([ctl(['strategies']), ctl(['status'])]);
+  const [list, status] = await Promise.all([ctl(cmd.strategies()), ctl(cmd.status())]);
   root.innerHTML = renderStrategies(list, status);
   root.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => showEditor(root, toast, b.dataset.open); });
   const n = root.querySelector('[data-act="new"]');
@@ -80,24 +89,33 @@ async function showList(root, toast) {
 async function showEditor(root, toast, name) {
   let s = null;
   if (name) {
-    s = await ctl(['strategy', 'get', name]);
+    s = await ctl(cmd.strategyGet(name));
     if (!s.ok) { toast(s.error); return; }
   }
   root.innerHTML = renderEditor(s);
   const form = root.querySelector('form');
   const errBox = root.querySelector('#editor-error');
   const fail = (msg) => { errBox.textContent = msg; errBox.hidden = false; };
-  const busy = (on) => form.querySelectorAll('button').forEach((b) => { b.disabled = on; });
+  let dirty = false;
+  const isApply = (b) => b.dataset.act === 'apply-network' || b.dataset.act === 'apply-default';
+  const busy = (on) => form.querySelectorAll('button').forEach((b) => { b.disabled = on || (dirty && isApply(b)); });
   const run = async (args, okMsg, after) => {
     busy(true);
     errBox.hidden = true;
-    const r = await ctl(args, { timeoutMs: 40000 });
+    const r = await ctl(args, { timeoutMs: LONG });
     busy(false);
     if (!r.ok) { fail(r.error); return; }
     toast(r.warning ? `${okMsg}. ${r.warning}` : okMsg);
     await after();
   };
   const target = () => (name || form.elements.name.value.trim());
+  // Применяется сохранённая версия: пока есть несохранённые правки, применять нельзя.
+  form.querySelectorAll('textarea').forEach((t) => {
+    t.oninput = () => {
+      dirty = true;
+      form.querySelectorAll('button').forEach((b) => { if (isApply(b)) { b.disabled = true; b.title = 'Сначала сохраните'; } });
+    };
+  });
   form.querySelectorAll('button[data-act]').forEach((b) => {
     b.onclick = async () => {
       switch (b.dataset.act) {
@@ -105,18 +123,23 @@ async function showEditor(root, toast, name) {
           let path;
           try {
             if (!target()) throw new Error('укажите имя');
+            if (!name) {
+              const list = await ctl(cmd.strategies());
+              const taken = list.ok && list.strategies.some((x) => x.name === target());
+              if (taken && globalThis.confirm && !confirm(`Стратегия «${target()}» уже есть. Заменить её?`)) return;
+            }
             busy(true);
-            path = await uploadText(editorToText(readFields(form)));
+            path = await uploadText(editorToText(readFields(form), s?.text));
           } catch (e) { busy(false); fail(e.message); return; }
-          await run(['strategy', 'save', target(), '--from', path], 'Сохранено', () => showEditor(root, toast, target()));
+          await run(cmd.strategySave(target(), path), 'Сохранено', () => showEditor(root, toast, target()));
           break;
         }
-        case 'apply-network': await run(['strategy', 'apply', name, '--network'], 'Применено для этой сети', () => showList(root, toast)); break;
-        case 'apply-default': await run(['strategy', 'apply', name, '--default'], 'Стратегия по умолчанию', () => showList(root, toast)); break;
-        case 'reset': await run(['strategy', 'reset', name], 'Возвращён исходник', () => showEditor(root, toast, name)); break;
+        case 'apply-network': await run(cmd.strategyApplyNetwork(name), 'Применено для этой сети', () => showList(root, toast)); break;
+        case 'apply-default': await run(cmd.strategyApplyDefault(name), 'Стратегия по умолчанию', () => showList(root, toast)); break;
+        case 'reset': await run(cmd.strategyReset(name), 'Возвращён исходник', () => showEditor(root, toast, name)); break;
         case 'delete':
           if (globalThis.confirm && !confirm(`Удалить «${name}»?`)) return;
-          await run(['strategy', 'delete', name], 'Удалено', () => showList(root, toast));
+          await run(cmd.strategyDelete(name), 'Удалено', () => showList(root, toast));
           break;
         default: await showList(root, toast);
       }

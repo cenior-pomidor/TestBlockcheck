@@ -1,6 +1,7 @@
 // Вкладка «Журналы».
 import { ctl } from './bridge.js';
 import { esc, button } from './util.js';
+import { cmd } from './commands.js';
 
 export const LOG_FILES = [['service', 'Служба'], ['nfqws2', 'nfqws2'], ['auto', 'Автосписок']];
 const TAIL = 500;
@@ -19,9 +20,7 @@ export function renderLogs(logs, stats, { file = 'service', errorsOnly = false }
 }
 
 export async function showLogs(root, toast, view = { file: 'service', errorsOnly: false }) {
-  const args = ['logs', view.file, '--tail', String(TAIL)];
-  if (view.errorsOnly) args.push('--errors');
-  const [logs, stats] = await Promise.all([ctl(args), ctl(['stats'])]);
+  const [logs, stats] = await Promise.all([ctl(cmd.logs(view.file, TAIL, view.errorsOnly)), ctl(cmd.stats())]);
   root.innerHTML = renderLogs(logs, stats, view);
   const again = () => showLogs(root, toast, {
     file: root.querySelector('input[name="file"]:checked').value,
@@ -31,7 +30,7 @@ export async function showLogs(root, toast, view = { file: 'service', errorsOnly
   root.querySelector('[data-act="refresh"]').onclick = again;
   root.querySelector('[data-act="clear"]').onclick = async () => {
     if (globalThis.confirm && !confirm('Очистить все журналы?')) return;
-    const r = await ctl(['logs', 'clear']);
+    const r = await ctl(cmd.logsClear());
     if (!r.ok) toast(r.error);
     await again();
   };

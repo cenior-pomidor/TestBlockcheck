@@ -1,6 +1,7 @@
 // Вкладка «Списки»: режим фильтрации и редактирование списков.
-import { ctl, uploadText } from './bridge.js';
+import { LONG, ctl, uploadText } from './bridge.js';
 import { esc, button } from './util.js';
+import { cmd } from './commands.js';
 
 const TITLES = {
   user: 'Сайты для обхода',
@@ -33,7 +34,7 @@ export function renderListEditor(l) {
 }
 
 async function showEditor(root, toast, name) {
-  const l = await ctl(['list', 'get', name], { timeoutMs: 30000 });
+  const l = await ctl(cmd.listGet(name), { timeoutMs: 30000 });
   if (!l.ok) { toast(l.error); return; }
   root.innerHTML = renderListEditor(l);
   const form = root.querySelector('form');
@@ -45,7 +46,7 @@ async function showEditor(root, toast, name) {
     let r;
     try {
       const path = await uploadText(form.elements.text.value.replace(/\r\n?/g, '\n'));
-      r = await ctl(['list', 'set', name, '--from', path], { timeoutMs: 60000 });
+      r = await ctl(cmd.listSet(name, path), { timeoutMs: LONG });
     } catch (e) { r = { ok: false, error: e.message }; }
     form.querySelectorAll('button').forEach((b) => { b.disabled = false; });
     if (!r.ok) { errBox.textContent = r.error; errBox.hidden = false; return; }
@@ -55,11 +56,11 @@ async function showEditor(root, toast, name) {
 }
 
 export async function showLists(root, toast) {
-  const [lists, settings] = await Promise.all([ctl(['lists']), ctl(['settings', 'get'])]);
+  const [lists, settings] = await Promise.all([ctl(cmd.lists()), ctl(cmd.settingsGet())]);
   root.innerHTML = renderLists(lists, settings);
   root.querySelectorAll('input[name="mode"]').forEach((i) => {
     i.onchange = async () => {
-      const r = await ctl(['settings', 'set', 'MODE', i.value], { timeoutMs: 40000 });
+      const r = await ctl(cmd.settingsSet('MODE', i.value), { timeoutMs: LONG });
       toast(r.ok ? (r.warning ? `Режим изменён. ${r.warning}` : 'Режим изменён') : r.error);
       await showLists(root, toast);
     };

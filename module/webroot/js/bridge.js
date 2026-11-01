@@ -1,5 +1,6 @@
 // Мост к KernelSU WebUI: запуск `bcw ctl` от root и передача больших данных.
 // API KernelSU: ksu.exec(cmd, options, callbackName) → callback(errno, stdout, stderr).
+import { cmd } from './commands.js';
 
 export const BCW = '/data/adb/modules/bcw/bin/bcw';
 const CHUNK = 48 * 1024; // кратно 3: каждая часть — самостоятельный base64 без «=» внутри
@@ -12,7 +13,7 @@ export function quote(a) {
 }
 
 /** Выполнить команду sh от root. Ответ: {errno, stdout, stderr}. */
-export function exec(cmd, timeoutMs = 15000) {
+export function exec(line, timeoutMs = 15000) {
   return new Promise((resolve) => {
     const ksu = globalThis.window && window.ksu;
     if (!ksu || typeof ksu.exec !== 'function') {
@@ -21,7 +22,8 @@ export function exec(cmd, timeoutMs = 15000) {
     }
     const name = `__bcw_cb_${Date.now()}_${seq++}`;
     const timer = setTimeout(() => {
-      delete window[name];
+      window[name] = () => { delete window[name]; }; // поздний ответ не должен падать
+
       resolve({ errno: -1, stdout: '', stderr: `команда не ответила за ${Math.round(timeoutMs / 1000)} с` });
     }, timeoutMs);
     window[name] = (errno, stdout, stderr) => {
@@ -30,7 +32,7 @@ export function exec(cmd, timeoutMs = 15000) {
       resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
     };
     try {
-      ksu.exec(cmd, '{}', name);
+      ksu.exec(line, '{}', name);
     } catch (e) {
       clearTimeout(timer);
       delete window[name];
@@ -38,6 +40,9 @@ export function exec(cmd, timeoutMs = 15000) {
     }
   });
 }
+
+/** Ожидание для команд, меняющих обход: проверка nfqws2 до 15 с + перезагрузка службы до 30 с. */
+export const LONG = 60000;
 
 /** `bcw ctl <args…>` → разобранный JSON; при сбое {ok:false, error}. */
 export async function ctl(args, { timeoutMs = 15000 } = {}) {
@@ -59,14 +64,14 @@ function b64(bytes) {
 
 /** Передать текст частями через `ctl upload`; вернуть путь к файлу или бросить ошибку. */
 export async function uploadText(text) {
-  const begin = await ctl(['upload', 'begin']);
+  const begin = await ctl(cmd.uploadBegin());
   if (!begin.ok) throw new Error(begin.error);
   const bytes = new TextEncoder().encode(text);
   for (let i = 0; i < bytes.length; i += CHUNK) {
-    const r = await ctl(['upload', 'chunk', begin.path, b64(bytes.subarray(i, i + CHUNK))]);
+    const r = await ctl(cmd.uploadChunk(begin.path, b64(bytes.subarray(i, i + CHUNK))));
     if (!r.ok) throw new Error(r.error);
   }
-  const end = await ctl(['upload', 'end', begin.path]);
+  const end = await ctl(cmd.uploadEnd(begin.path));
   if (!end.ok) throw new Error(end.error);
   return end.path;
 }

@@ -39,4 +39,6 @@ check(editorToText({ NFQWS_ARGS: 'x\r\ny' }).includes('NFQWS_ARGS="x\ny"'), 'CRL
 const { dedent } = await import('../../webroot/js/strategies.js');
 check(!/\n +--/.test(renderEditor(get)), 'отступы строк в редакторе убраны');
 check(dedent('a\n    b  ') === 'a\nb', 'dedent');
+const withPkt = editorToText(get.fields, 'X=1\nNFQWS2_TCP_PKT_OUT=20\n# NFQWS2_UDP_PKT_IN=5\n');
+check(withPkt.includes('\nNFQWS2_TCP_PKT_OUT=20\n# NFQWS2_UDP_PKT_IN=5\n') && !withPkt.includes('X=1'), 'лимиты пакетов переносятся');
 done('test_strategies');

@@ -1,6 +1,7 @@
 // Вкладка «Состояние».
-import { ctl } from './bridge.js';
+import { LONG, ctl } from './bridge.js';
 import { esc, button } from './util.js';
+import { cmd } from './commands.js';
 
 const capital = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 
@@ -46,18 +47,18 @@ export function renderStatus(s) {
     + (s.state === 'not_running' ? '<p class="hint">Служба стартует после загрузки телефона. Если её нет дольше минуты — смотрите журнал svc.out в /data/adb/bcw/logs.</p>' : '');
 }
 
-const ACTS = { start: ['start'], stop: ['stop'], restart: ['restart'], resume: ['home', 'resume'] };
+const ACTS = { start: cmd.start(), stop: cmd.stop(), restart: cmd.restart(), resume: cmd.homeResume() };
 
 /** Нарисовать вкладку и навесить кнопки. */
 export async function showStatus(root, toast) {
-  const s = await ctl(['status']);
+  const s = await ctl(cmd.status());
   root.innerHTML = renderStatus(s);
   root.querySelectorAll('button[data-act]').forEach((b) => {
     b.onclick = async () => {
       const act = b.dataset.act;
       if (ACTS[act]) {
         root.querySelectorAll('button').forEach((x) => { x.disabled = true; });
-        const r = await ctl(ACTS[act], { timeoutMs: 40000 });
+        const r = await ctl(ACTS[act], { timeoutMs: LONG });
         if (!r.ok) toast(r.error || 'не удалось');
       }
       await showStatus(root, toast);

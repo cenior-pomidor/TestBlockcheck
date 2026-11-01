@@ -1,6 +1,7 @@
 // Вкладка «Сети»: стратегии по сетям и домашние Wi-Fi.
-import { ctl } from './bridge.js';
+import { LONG, ctl } from './bridge.js';
 import { esc, button } from './util.js';
+import { cmd } from './commands.js';
 
 const WIFI_PREFIX = 'Wi-Fi «';
 
@@ -47,7 +48,7 @@ export function renderNetworks(n, settings, status) {
 }
 
 export async function showNetworks(root, toast) {
-  const [n, settings, status] = await Promise.all([ctl(['networks']), ctl(['settings', 'get']), ctl(['status'])]);
+  const [n, settings, status] = await Promise.all([ctl(cmd.networks()), ctl(cmd.settingsGet()), ctl(cmd.status())]);
   root.innerHTML = renderNetworks(n, settings, status);
   const after = async (r, msg) => {
     if (!r.ok) toast(r.error || 'не удалось');
@@ -56,14 +57,14 @@ export async function showNetworks(root, toast) {
     await showNetworks(root, toast);
   };
   root.querySelectorAll('input[data-setting]').forEach((i) => {
-    i.onchange = async () => after(await ctl(['settings', 'set', i.dataset.setting, i.checked ? '1' : '0'], { timeoutMs: 40000 }), 'Сохранено');
+    i.onchange = async () => after(await ctl(cmd.settingsSet(i.dataset.setting, i.checked ? '1' : '0'), { timeoutMs: LONG }), 'Сохранено');
   });
   const add = root.querySelector('[data-act="home-add"]');
-  if (add) add.onclick = async () => after(await ctl(['home', 'add', currentSsid(n)], { timeoutMs: 40000 }), 'Добавлено');
+  if (add) add.onclick = async () => after(await ctl(cmd.homeAdd(currentSsid(n)), { timeoutMs: LONG }), 'Добавлено');
   root.querySelectorAll('[data-net-del]').forEach((b) => {
-    b.onclick = async () => after(await ctl(['network', 'delete', b.dataset.netDel], { timeoutMs: 40000 }), 'Забыто');
+    b.onclick = async () => after(await ctl(cmd.networkDelete(b.dataset.netDel), { timeoutMs: LONG }), 'Забыто');
   });
   root.querySelectorAll('[data-home-del]').forEach((b) => {
-    b.onclick = async () => after(await ctl(['home', 'remove', b.dataset.homeDel], { timeoutMs: 40000 }), 'Убрано');
+    b.onclick = async () => after(await ctl(cmd.homeRemove(b.dataset.homeDel), { timeoutMs: LONG }), 'Убрано');
   });
 }

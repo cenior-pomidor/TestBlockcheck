@@ -252,6 +252,24 @@ fn upload_path(layout: &Layout, p: &Path) -> Result<PathBuf, String> {
 }
 
 /// Прочитать переданный файл и удалить его.
+/// Удалить брошенные передачи `upload-*` старше `age`.
+fn sweep_uploads(dir: &Path, age: Duration) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let stale = e.file_name().to_string_lossy().starts_with("upload-")
+            && e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|el| el > age);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn take_upload(layout: &Layout, p: &Path) -> Result<String, String> {
     let p = upload_path(layout, p)?;
     let text = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -425,8 +443,9 @@ pub async fn execute<E: CtlEnv>(cmd: &CtlCmd, store: &Store, env: &E) -> Out {
         }
         CtlCmd::Home { action } => match action {
             HomeAction::Add { ssid } | HomeAction::Remove { ssid } => {
-                let ssid = ssid.trim();
-                if ssid.is_empty() || ssid.contains('\n') {
+                // Пробелы по краям — часть SSID; без них пауза дома не совпала бы с сетью.
+                let ssid = ssid.as_str();
+                if ssid.trim().is_empty() || ssid.contains('\n') {
                     return Err("имя сети пустое или в несколько строк".into());
                 }
                 let r = if matches!(action, HomeAction::Add { .. }) {
@@ -473,6 +492,7 @@ pub async fn execute<E: CtlEnv>(cmd: &CtlCmd, store: &Store, env: &E) -> Out {
         CtlCmd::Upload { action } => match action {
             UploadAction::Begin => {
                 std::fs::create_dir_all(layout.tmp_dir()).map_err(|e| e.to_string())?;
+                sweep_uploads(&layout.tmp_dir(), Duration::from_secs(3600));
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
@@ -584,7 +604,15 @@ async fn strategy<E: CtlEnv>(action: &StrategyAction, store: &Store, env: &E) ->
                 s.set("DEFAULT_STRATEGY", name)?;
                 store.save_settings(&s).map_err(|e| e.to_string())?;
             }
-            let w = reload(env).await;
+            let mut w = reload(env).await;
+            if to_network && !s.net_strategy {
+                let note = "стратегия запомнена за сетью, но действует только при включённой \
+                            «Своя стратегия для каждой сети» (NET_STRATEGY)";
+                w = Some(match w {
+                    Some(x) => format!("{note}; {x}"),
+                    None => note.to_string(),
+                });
+            }
             ok(with_warning(
                 json!({ "name": name, "applied_to": if to_network { "network" } else { "default" } }),
                 w,
@@ -756,6 +784,118 @@ mod tests {
             ("stats", CtlCmd::Stats),
             ("version", CtlCmd::Version),
         ]
+    }
+
+    /// Все аргументы, которые шлёт WebUI (`module/webroot/js/commands.js`), разбирает clap,
+    /// и значения с «-» доходят как значения.
+    #[test]
+    fn webui_argv_parses() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct W {
+            #[command(subcommand)]
+            c: CtlCmd,
+        }
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../module/tests/webui/argv.json"
+        );
+        let all: serde_json::Map<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        let mut parsed = std::collections::HashMap::new();
+        for (name, argv) in &all {
+            let args: Vec<String> = argv
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect();
+            let w = W::try_parse_from(std::iter::once("ctl".to_string()).chain(args))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            parsed.insert(name.clone(), w.c);
+        }
+        assert!(
+            matches!(&parsed["homeAdd"], CtlCmd::Home { action: HomeAction::Add { ssid } } if ssid == "-кафе wifi")
+        );
+        assert!(
+            matches!(&parsed["strategySave"], CtlCmd::Strategy { action: StrategyAction::Save { name, from } } if name == "-x" && from.ends_with("upload-1-2"))
+        );
+        assert!(
+            matches!(&parsed["strategyApplyNetwork"], CtlCmd::Strategy { action: StrategyAction::Apply { name, network: true, default: false } } if name == "-x")
+        );
+        assert!(
+            matches!(&parsed["strategyApplyDefault"], CtlCmd::Strategy { action: StrategyAction::Apply { name, network: false, default: true } } if name == "-x")
+        );
+        assert!(
+            matches!(&parsed["settingsSet"], CtlCmd::Settings { action: SettingsAction::Set { key, value } } if key == "TCP_MSS_CLAMP" && value == "-1")
+        );
+        assert!(
+            matches!(&parsed["logs"], CtlCmd::Logs { file, errors: true, tail: Some(500) } if file == "service")
+        );
+        assert!(matches!(&parsed["logsClear"], CtlCmd::Logs { file, .. } if file == "clear"));
+        assert!(
+            matches!(&parsed["listSet"], CtlCmd::List { action: ListAction::Set { name, .. } } if name == "user")
+        );
+    }
+
+    /// SSID хранится как есть: пробелы по краям — часть имени сети.
+    #[tokio::test]
+    async fn home_add_keeps_ssid_spaces() {
+        let t = t("homesp");
+        let fake = Fake::down();
+        let v = run_json(
+            CtlCmd::Home {
+                action: HomeAction::Add {
+                    ssid: " Кафе ".into(),
+                },
+            },
+            &t.store,
+            &fake,
+        )
+        .await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(t.store.home(), vec![" Кафе ".to_string()]);
+        let v = run_json(
+            CtlCmd::Home {
+                action: HomeAction::Add { ssid: "  ".into() },
+            },
+            &t.store,
+            &fake,
+        )
+        .await;
+        assert_eq!(v["ok"], false);
+    }
+
+    /// Брошенные передачи старше часа удаляет следующий `upload begin`.
+    #[tokio::test]
+    async fn upload_begin_sweeps_stale() {
+        let t = t("sweep");
+        let fake = Fake::down();
+        let dir = t.store.layout.tmp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("upload-1-1");
+        let fresh = dir.join("upload-1-2");
+        let other = dir.join("keep.txt");
+        for p in [&old, &fresh, &other] {
+            std::fs::write(p, "x").unwrap();
+        }
+        let two_hours = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_hours)
+            .unwrap();
+        let v = run_json(
+            CtlCmd::Upload {
+                action: UploadAction::Begin,
+            },
+            &t.store,
+            &fake,
+        )
+        .await;
+        assert_eq!(v["ok"], true);
+        assert!(!old.exists() && fresh.exists() && other.exists());
     }
 
     #[tokio::test]
@@ -987,6 +1127,12 @@ mod tests {
         )
         .await;
         assert_eq!(v["applied_to"], "network", "{v}");
+        assert!(
+            v["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("Своя стратегия для каждой сети")),
+            "при выключенном NET_STRATEGY: {v}"
+        );
         let nets = t.store.networks().0;
         assert_eq!(nets[0].key, "wifi_Home");
         assert_eq!(nets[0].strategy, "alt");

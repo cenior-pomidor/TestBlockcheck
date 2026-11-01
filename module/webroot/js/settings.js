@@ -1,6 +1,7 @@
 // Вкладка «Настройки». Значения проверяет `bcw ctl settings set`; здесь своих проверок нет.
-import { ctl } from './bridge.js';
+import { LONG, ctl } from './bridge.js';
 import { esc, button } from './util.js';
+import { cmd } from './commands.js';
 
 export const settingControls = [
   { key: 'AUTOSTART', label: 'Запускать обход после загрузки', kind: 'bool' },
@@ -41,11 +42,11 @@ export function renderSettings(settings, version, errors = {}) {
 }
 
 export async function showSettings(root, toast, errors = {}) {
-  const [settings, version] = await Promise.all([ctl(['settings', 'get']), ctl(['version'])]);
+  const [settings, version] = await Promise.all([ctl(cmd.settingsGet()), ctl(cmd.version())]);
   root.innerHTML = renderSettings(settings, version, errors);
   const save = async (key, value) => {
     root.querySelectorAll('input,button').forEach((x) => { x.disabled = true; });
-    const r = await ctl(['settings', 'set', key, value], { timeoutMs: 40000 });
+    const r = await ctl(cmd.settingsSet(key, value), { timeoutMs: LONG });
     if (r.ok) toast(r.warning ? `Сохранено. ${r.warning}` : 'Сохранено');
     await showSettings(root, toast, r.ok ? {} : { [key]: r.error || 'не удалось' });
   };
