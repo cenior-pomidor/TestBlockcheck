@@ -83,6 +83,9 @@ pub struct Status {
 }
 
 struct Running {
+    /// Какую стратегию просили (её сравнивает `decide`): запущенная может быть запасной.
+    wanted: String,
+    /// Какая запущена на деле.
     strategy: String,
     args: Vec<String>,
     rules: RuleParams,
@@ -174,24 +177,26 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
     }
 
     /// Принять наблюдение сети; смена засчитывается после `STABLE_POLLS` одинаковых опросов.
-    fn observe(&mut self, n: Network) {
+    /// `true` — принята смена сети.
+    fn observe(&mut self, n: Network) -> bool {
         // Первое наблюдение и выход из «нет сети» принимаются сразу: дребезг — это метания
         // между сетями, а появление сети ждать незачем.
         if matches!(self.network, None | Some(Network::Offline)) && n != Network::Offline {
             if self.network.is_some() {
                 self.log(EventKind::NetworkChange, Level::Info, &n.title());
             }
+            let changed = self.network.is_some();
             self.network = Some(n);
             self.pending = None;
-            return;
+            return changed;
         }
         if self.network.is_none() {
             self.network = Some(n);
-            return;
+            return false;
         }
         if self.network.as_ref() == Some(&n) {
             self.pending = None;
-            return;
+            return false;
         }
         let count = match &self.pending {
             Some((p, c)) if *p == n => c + 1,
@@ -208,8 +213,10 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             }
             self.network = Some(n);
             self.pending = None;
+            true
         } else {
             self.pending = Some((n, count));
+            false
         }
     }
 
@@ -237,7 +244,7 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             self.state = State::Stopped;
         }
         let n = self.probe.network().await;
-        self.observe(n);
+        let changed = self.observe(n);
         if !self.desired_on {
             if self.running.is_some() {
                 self.halt().await;
@@ -246,8 +253,10 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             return;
         }
         if let State::Failed { retry_at, .. } = &self.state {
+            // Без повтора — до смены сети (там другая стратегия) или `Reload`.
             match retry_at {
                 Some(t) if now >= *t => self.state = State::Stopped,
+                None if changed => self.state = State::Stopped,
                 _ => return,
             }
         }
@@ -299,7 +308,9 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
                 );
                 let preset = self.store.load_preset(&lg.strategy).unwrap_or_default();
                 let params = rules::params(&settings, &preset);
-                let _ = self.launch(lg.strategy, lg.args, params, now).await;
+                let _ = self
+                    .launch(r.wanted, lg.strategy, lg.args, params, now)
+                    .await;
                 return;
             }
         }
@@ -330,7 +341,9 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             Level::Error,
             &format!("сторож: nfqws2 не работает, перезапуск №{}", self.fails),
         );
-        let _ = self.launch(r.strategy, r.args, r.rules, now).await;
+        let _ = self
+            .launch(r.wanted, r.strategy, r.args, r.rules, now)
+            .await;
     }
 
     fn saved(&self) -> Vec<(String, String)> {
@@ -353,7 +366,7 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             .clone()
             .unwrap_or(Network::Mobile { operator: None });
         let paused = matches!(self.state, State::PausedHome { .. });
-        let running = self.running.as_ref().map(|r| r.strategy.clone());
+        let running = self.running.as_ref().map(|r| r.wanted.clone());
         let d = network::decide(&DecisionInput {
             settings: &settings,
             network: &net,
@@ -384,8 +397,8 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
         }
     }
 
-    /// Собрать стратегию: имя → пресет (с запасом на умолчание) → аргументы и правила.
-    fn prepare(&self, wanted: &str) -> Result<(String, Vec<String>, RuleParams), String> {
+    /// Кого пробовать: просимую, затем `DEFAULT_STRATEGY`, затем «default».
+    fn candidates(&self, wanted: &str) -> Vec<String> {
         let (settings, _) = self.store.settings();
         let mut names = vec![wanted.to_string()];
         for n in [settings.default_strategy.as_str(), "default"] {
@@ -393,46 +406,76 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
                 names.push(n.to_string());
             }
         }
-        let mut last_err = String::new();
-        for name in names {
-            match self.store.load_preset(&name) {
-                Ok(preset) => {
-                    let calls = std::fs::read_to_string(
-                        self.store.layout.defaults_dir().join("calls-bypass.conf"),
-                    )
-                    .unwrap_or_default();
-                    let args = args::build(&ArgsInput {
-                        preset: &preset,
-                        settings: &settings,
-                        layout: &self.store.layout,
-                        ipset_nonempty: self.store.list_count("ipset") > 0,
-                        calls_conf: &calls,
-                    })?;
-                    return Ok((name, args, rules::params(&settings, &preset)));
-                }
+        names
+    }
+
+    /// Аргументы и правила одной стратегии.
+    fn build_one(&self, name: &str) -> Result<(Vec<String>, RuleParams), String> {
+        let (settings, _) = self.store.settings();
+        let preset = self.store.load_preset(name)?;
+        let calls =
+            std::fs::read_to_string(self.store.layout.defaults_dir().join("calls-bypass.conf"))
+                .unwrap_or_default();
+        let args = args::build(&ArgsInput {
+            preset: &preset,
+            settings: &settings,
+            layout: &self.store.layout,
+            ipset_nonempty: self.store.list_count("ipset") > 0,
+            calls_conf: &calls,
+        })?;
+        Ok((args, rules::params(&settings, &preset)))
+    }
+
+    /// Первая из кандидатов, что собирается (без проверки nfqws2) — для сравнения в `Reload`.
+    fn prepare(&self, wanted: &str) -> Option<(String, Vec<String>, RuleParams)> {
+        self.candidates(wanted)
+            .into_iter()
+            .find_map(|n| self.build_one(&n).ok().map(|(a, p)| (n, a, p)))
+    }
+
+    /// Запустить просимую стратегию; не собралась или не прошла `--dry-run` — запасную.
+    /// `Err` — просимая не запустилась (даже если работает запасная): текст уходит в `ctl`.
+    async fn start(&mut self, wanted: &str, now: Instant) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        for name in self.candidates(wanted) {
+            let (args, params) = match self.build_one(&name) {
+                Ok(x) => x,
                 Err(e) => {
                     self.log(
                         EventKind::Error,
                         Level::Error,
                         &format!("{e}; беру запасную стратегию"),
                     );
-                    last_err = e;
+                    first_err.get_or_insert(e);
+                    continue;
                 }
+            };
+            if let Err(e) = self.engine.dry_run(&args).await {
+                let msg = format!("стратегия «{name}» не прошла проверку nfqws2: {e}");
+                self.log(EventKind::Error, Level::Error, &msg);
+                first_err.get_or_insert(msg);
+                continue;
             }
+            // Запасная совпала с уже работающей — не дёргать nfqws2.
+            let same = self
+                .running
+                .as_ref()
+                .is_some_and(|r| r.args == args && r.rules == params);
+            if same {
+                if let Some(r) = &mut self.running {
+                    r.wanted = wanted.to_string();
+                }
+                self.state = State::Running;
+            } else {
+                self.launch(wanted.to_string(), name.clone(), args, params, now)
+                    .await?;
+            }
+            return match first_err {
+                Some(e) => Err(format!("{e}; работает «{name}»")),
+                None => Ok(()),
+            };
         }
-        Err(last_err)
-    }
-
-    async fn start(&mut self, wanted: &str, now: Instant) -> Result<(), String> {
-        let (name, args, params) = match self.prepare(wanted) {
-            Ok(x) => x,
-            Err(e) => return self.fail_start(e),
-        };
-        if let Err(e) = self.engine.dry_run(&args).await {
-            let msg = format!("стратегия «{name}» не прошла проверку nfqws2: {e}");
-            return self.fail_start(msg);
-        }
-        self.launch(name, args, params, now).await
+        self.fail_start(first_err.unwrap_or_else(|| format!("стратегия «{wanted}» не собралась")))
     }
 
     fn fail_start(&mut self, msg: String) -> Result<(), String> {
@@ -448,6 +491,7 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
 
     async fn launch(
         &mut self,
+        wanted: String,
         strategy: String,
         args: Vec<String>,
         params: RuleParams,
@@ -487,6 +531,7 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             &format!("стратегия «{strategy}», {title}"),
         );
         self.running = Some(Running {
+            wanted,
             strategy,
             args,
             rules: params,
@@ -553,7 +598,7 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
         let Some(r) = &self.running else {
             return self.decide_and_act(now).await;
         };
-        let current = (r.strategy.clone(), r.args.clone(), r.rules.clone());
+        let current = (r.wanted.clone(), r.args.clone(), r.rules.clone());
         // Сначала — не пора ли на паузу (домашние сети могли измениться).
         let (settings, _) = self.store.settings();
         let home = self.store.home();
@@ -575,15 +620,13 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             Decision::Restart { strategy } | Decision::Resume { strategy } => strategy,
             Decision::Pause { .. } | Decision::Nothing => return self.decide_and_act(now).await,
         };
-        let next = self.prepare(&wanted)?;
-        if next == current {
+        let next = self
+            .prepare(&wanted)
+            .map(|(_, a, p)| (wanted.clone(), a, p));
+        if next.as_ref() == Some(&current) {
             return Ok(());
         }
-        let (name, args, params) = next;
-        if let Err(e) = self.engine.dry_run(&args).await {
-            return self.fail_start(format!("стратегия «{name}» не прошла проверку nfqws2: {e}"));
-        }
-        self.launch(name, args, params, now).await
+        self.start(&wanted, now).await
     }
 
     /// Остановить обход, не меняя желаемого (SIGTERM службы).
@@ -988,6 +1031,79 @@ mod tests {
             Some("alt"),
             "сеть появилась — сразу её стратегия"
         );
+    }
+
+    /// Ревью 2а, Critical 2: запасная стратегия не должна перезапускаться на каждом тике.
+    #[tokio::test]
+    async fn fallback_is_stable_over_ticks() {
+        let mut e = env("fallback-stable", |s| {
+            std::fs::write(
+                s.layout.data_strategies().join("mine.conf"),
+                "NFQWS_ARGS=\"--x\n",
+            )
+            .unwrap();
+            set(s, "DEFAULT_STRATEGY", "mine");
+        });
+        for t in [0, 5, 10, 15, 20, 25] {
+            e.sup.tick(at(&e, t)).await;
+        }
+        assert_eq!(
+            e.w.lock().unwrap().spawned.len(),
+            1,
+            "запасная перезапускается по кругу"
+        );
+        assert_eq!(e.sup.status().strategy.as_deref(), Some("default"));
+    }
+
+    /// Ревью 2а, Critical 2: после отката — тишина, а не default, alt, default, alt…
+    #[tokio::test]
+    async fn rollback_is_stable_over_ticks() {
+        let mut e = env("rollback-stable", |_| {});
+        e.sup.tick(at(&e, 0)).await;
+        e.sup.tick(at(&e, 15)).await;
+        set(&e.sup.store, "DEFAULT_STRATEGY", "alt");
+        e.sup.command(Command::Reload, at(&e, 20)).await.unwrap();
+        e.w.lock().unwrap().alive = false;
+        e.sup.tick(at(&e, 25)).await; // откат
+        let n = e.w.lock().unwrap().spawned.len();
+        for t in [30, 35, 40, 45, 50] {
+            e.sup.tick(at(&e, t)).await;
+        }
+        assert_eq!(
+            e.w.lock().unwrap().spawned.len(),
+            n,
+            "после отката перезапуски по кругу"
+        );
+        assert_eq!(e.sup.status().state, "running");
+    }
+
+    /// Ревью 2а, Important 3: стратегия не прошла --dry-run — запас, как при ошибке разбора.
+    #[tokio::test]
+    async fn dry_run_failure_falls_back_to_default() {
+        let mut e = env("dryrun-fallback", |s| set(s, "DEFAULT_STRATEGY", "alt"));
+        e.w.lock().unwrap().dry_run_fail_if_contains = Some("quic_initial_www_google_com".into());
+        e.sup.tick(at(&e, 0)).await;
+        assert_eq!(e.sup.status().state, "running");
+        assert_eq!(e.sup.status().strategy.as_deref(), Some("default"));
+        e.sup.tick(at(&e, 5)).await;
+        assert_eq!(e.w.lock().unwrap().spawned.len(), 1);
+    }
+
+    /// Ревью 2а, Important 3: «failed» без повтора снимается сменой сети.
+    #[tokio::test]
+    async fn failed_recovers_on_network_change() {
+        let mut e = env("failed-net", |_| {});
+        e.w.lock().unwrap().dry_run_fail_if_contains = Some("--qnum".into());
+        e.sup.tick(at(&e, 0)).await;
+        assert_eq!(e.sup.status().state, "failed");
+        e.w.lock().unwrap().dry_run_fail_if_contains = None;
+        e.w.lock().unwrap().network = Some(Network::Wifi {
+            ssid: "Cafe".into(),
+        });
+        for t in [5, 10, 15] {
+            e.sup.tick(at(&e, t)).await;
+        }
+        assert_eq!(e.sup.status().state, "running");
     }
 
     #[tokio::test]
