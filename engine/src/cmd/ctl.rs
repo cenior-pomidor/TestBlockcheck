@@ -272,7 +272,7 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
         } as u32)
     }
     let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if clean.len() % 4 != 0 {
+    if !clean.len().is_multiple_of(4) {
         return Err("base64: длина не кратна 4".into());
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
