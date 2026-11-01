@@ -25,6 +25,8 @@ const SYNC_POLL_MS: u64 = 50;
 pub enum Table {
     Mangle,
     Raw,
+    Nat,
+    Filter,
 }
 
 impl Table {
@@ -32,6 +34,8 @@ impl Table {
         match self {
             Table::Mangle => "mangle",
             Table::Raw => "raw",
+            Table::Nat => "nat",
+            Table::Filter => "filter",
         }
     }
 }
