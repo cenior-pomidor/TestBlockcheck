@@ -1,0 +1,7 @@
+{
+  "errors_only": false,
+  "file": "service",
+  "ok": true,
+  "schema": 1,
+  "text": "2026-11-01 10:00:00 info start стратегия «default», Мобильная (MegaFon)\n2026-11-01 10:05:00 error restart сторож: nfqws2 не работает, перезапуск №1\n"
+}

@@ -1,0 +1,10 @@
+{
+  "desired": "unknown",
+  "network_key": null,
+  "network_title": null,
+  "ok": true,
+  "reason": "служба не запущена",
+  "schema": 1,
+  "state": "not_running",
+  "strategy": null
+}

@@ -219,12 +219,25 @@ async fn neighbours_check() -> Check {
     Check::new(
         "neighbours",
         Status::Ok,
-        format!(
-            "цепочки с очередью: [{}]; nfqws2 running: {}; занятые очереди: {:?}",
-            conflicts.foreign_queue_chains.join(", "),
+        neighbours_detail(
+            &conflicts.foreign_queue_chains,
             conflicts.has_nfqws2_processes,
-            queues,
+            &queues,
         ),
+    )
+}
+
+/// Текст проверки соседей; цепочки `dpi_*` — это обход самого модуля bcw.
+pub fn neighbours_detail(chains: &[String], nfqws2: bool, queues: &[u16]) -> String {
+    let own = chains.iter().any(|c| c.starts_with("dpi_"));
+    format!(
+        "цепочки с очередью: [{}]{}; nfqws2 running: {nfqws2}; занятые очереди: {queues:?}",
+        chains.join(", "),
+        if own {
+            " (dpi_* — обход bcw)"
+        } else {
+            ""
+        },
     )
 }
 
@@ -324,6 +337,15 @@ pub async fn run_doctor_cmd() -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn doctor_names_bcw_bypass_neighbour() {
+        let d = super::neighbours_detail(&["dpi_post".into(), "dpi_pre".into()], true, &[300]);
+        assert!(d.contains("обход bcw"), "{d}");
+        assert!(d.contains("dpi_post"), "{d}");
+        let other = super::neighbours_detail(&["nfqws_post".into()], true, &[300]);
+        assert!(!other.contains("обход bcw"), "{other}");
+    }
+
     use super::*;
 
     fn status_of<'a>(checks: &'a [Check], id: &str) -> &'a Status {

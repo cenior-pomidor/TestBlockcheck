@@ -63,11 +63,11 @@ struct Cli {
     #[arg(long, default_value_t = 254)]
     profiles_per_instance: usize,
 
-    /// Путь к nfqws2 (умолчание /data/adb/modules/nfqws2-android/bin/nfqws2).
+    /// Путь к nfqws2 (умолчание /data/adb/modules/bcw/bin/nfqws2).
     #[arg(long, global = true, value_name = "PATH")]
     nfqws2: Option<std::path::PathBuf>,
 
-    /// Каталог Lua-библиотек движка (умолчание /data/adb/modules/nfqws2-android/lua).
+    /// Каталог Lua-библиотек движка (умолчание /data/adb/modules/bcw/lua).
     #[arg(long, global = true, value_name = "PATH")]
     lua_dir: Option<std::path::PathBuf>,
 
@@ -112,6 +112,18 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum SvcAction {
+    /// Работать службой: правила, nfqws2, сторож, сеть, сокет для `bcw ctl`.
+    Run {
+        /// Первый запуск после загрузки: желаемое состояние берётся из AUTOSTART.
+        #[arg(long)]
+        boot: bool,
+    },
+    /// Снять правила обхода dpi_* и выйти.
+    Cleanup,
 }
 
 #[derive(Subcommand)]
@@ -259,6 +271,18 @@ enum Command {
     /// Проверить устройство перед первым прогоном: root, ядро, iptables, nfqws2, маршрут
     /// помеченных сокетов, DoH, соседи. JSON в stdout, таблица в stderr. Ничего не меняет.
     Doctor,
+
+    /// Команды для интерфейса модуля обхода: ответ — одна строка JSON. Требует root.
+    Ctl {
+        #[command(subcommand)]
+        cmd: cmd::ctl::CtlCmd,
+    },
+
+    /// Служба модуля обхода (запускает service.sh модуля). Требует root.
+    Svc {
+        #[command(subcommand)]
+        action: SvcAction,
+    },
 
     /// Show zapret2 effectiveness: compare access with and without the service
     Status {
@@ -493,6 +517,18 @@ async fn main() {
     // а замок, преflight и память прогона ему не нужны.
     if matches!(cli.command, Some(Command::Doctor)) {
         cmd::doctor::run_doctor_cmd().await;
+    }
+    if let Some(Command::Ctl { cmd }) = &cli.command {
+        blockcheckw::system::elevate::require_root();
+        cmd::ctl::run(cmd.clone()).await;
+    }
+    // Служба модуля: свой цикл, без замка поиска, preflight и памяти прогона.
+    if let Some(Command::Svc { action }) = &cli.command {
+        blockcheckw::system::elevate::require_root();
+        match action {
+            SvcAction::Run { boot } => cmd::svc::run(*boot).await,
+            SvcAction::Cleanup => cmd::svc::cleanup().await,
+        }
     }
 
     blockcheckw::system::elevate::require_root();
@@ -890,6 +926,8 @@ async fn main() {
                 .await;
             }
             Some(Command::Doctor) => unreachable!("doctor обрабатывается до elevation"),
+            Some(Command::Svc { .. }) => unreachable!("svc обрабатывается до elevation"),
+            Some(Command::Ctl { .. }) => unreachable!("ctl обрабатывается до elevation"),
             None => unreachable!("справка без команды печатается до elevation"),
         }
     }

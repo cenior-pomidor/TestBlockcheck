@@ -1,0 +1,203 @@
+{
+  "default_strategy": "default",
+  "ok": true,
+  "schema": 1,
+  "strategies": [
+    {
+      "author": "MartinBacker",
+      "builtin": true,
+      "modified": false,
+      "name": "MartinBacker",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Uvvi2",
+      "builtin": true,
+      "modified": false,
+      "name": "Uvvi2",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt10",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt11",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt12",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt13",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt2",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt3",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt4",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt4_mod",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt5",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt6",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt7",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt8",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "alt9",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "nfqws2-keenetic",
+      "builtin": true,
+      "modified": false,
+      "name": "default",
+      "source": "Dea1hwa1cher/nfqws2-android"
+    },
+    {
+      "author": "eduncey",
+      "builtin": true,
+      "modified": false,
+      "name": "eduncey",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "exp",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "fake_tls_auto",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "fake_tls_auto_alt",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "fake_tls_auto_alt2",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "fake_tls_auto_alt3",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "hardcorp74",
+      "builtin": true,
+      "modified": false,
+      "name": "hardcorp74",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "krushaaa",
+      "builtin": true,
+      "modified": false,
+      "name": "krushaaa",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "simple_fake",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "simple_fake_alt",
+      "source": "rndnaame/nfqws-menu"
+    },
+    {
+      "author": "Flowseal",
+      "builtin": true,
+      "modified": false,
+      "name": "simple_fake_alt2",
+      "source": "rndnaame/nfqws-menu"
+    }
+  ]
+}

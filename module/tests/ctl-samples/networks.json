@@ -1,0 +1,19 @@
+{
+  "current_key": "wifi_Home",
+  "current_title": "Wi-Fi «Home»",
+  "home": [
+    "Home"
+  ],
+  "home_wifi": false,
+  "net_strategy": false,
+  "networks": [
+    {
+      "key": "wifi_Home",
+      "strategy": "alt",
+      "title": "Wi-Fi «Home»"
+    }
+  ],
+  "ok": true,
+  "schema": 1,
+  "warnings": []
+}

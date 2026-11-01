@@ -1,0 +1,10 @@
+{
+  "desired": "unknown",
+  "network_key": "wifi_Home",
+  "network_title": "Wi-Fi «Home»",
+  "ok": true,
+  "reason": "nfqws2 падает: 5 раз подряд, новая попытка через 60 с",
+  "schema": 1,
+  "state": "failed",
+  "strategy": null
+}

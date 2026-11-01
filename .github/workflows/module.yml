@@ -1,0 +1,141 @@
+name: module
+
+on:
+  push:
+    branches: [main, stage2-module]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZAPRET2_SHA: f924d796b49da9e455c6bb09268298ef1471cd74
+
+jobs:
+  nfqws2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libcap-dev
+      - name: Build nfqws2 (android-arm64)
+        run: bash .github/scripts/build-nfqws2.sh android-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nfqws2-arm64
+          path: binaries/android-arm64/nfqws2
+          if-no-files-found: error
+
+  bcw:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+          key: aarch64-musl
+      - uses: taiki-e/install-action@cross
+      - run: cross build --release --target aarch64-unknown-linux-musl
+      - name: Verify static aarch64 binary
+        run: |
+          info="$(file target/aarch64-unknown-linux-musl/release/bcw)"
+          echo "$info"
+          echo "$info" | grep -q 'ARM aarch64'
+          echo "$info" | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcw-aarch64
+          path: engine/target/aarch64-unknown-linux-musl/release/bcw
+          if-no-files-found: error
+
+  package:
+    needs: [nfqws2, bcw]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nfqws2-arm64
+          path: dl/nfqws2
+      - uses: actions/download-artifact@v4
+        with:
+          name: bcw-aarch64
+          path: dl/bcw
+      - name: Module tests
+        run: |
+          sh module/tests/test_refs.sh
+          sh module/tests/test_scripts.sh
+          for t in module/tests/webui/test_*.mjs; do if [ -f "$t" ]; then node "$t"; fi; done
+      - name: Lua from zapret2 ${{ env.ZAPRET2_SHA }}
+        run: |
+          git init -q z2
+          git -C z2 fetch -q --depth 1 https://github.com/bol-van/zapret2.git "$ZAPRET2_SHA"
+          git -C z2 checkout -q FETCH_HEAD
+      - id: ver
+        name: Version
+        run: |
+          v=$(sed -n 's/^version=//p' module/module.prop)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          grep -qx 'id=bcw' module/module.prop
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            [ "$v" = "${GITHUB_REF_NAME}" ] || { echo "::error::module.prop $v, тег ${GITHUB_REF_NAME}"; exit 1; }
+            grep -q "\"version\": \"$v\"" module/update.json || { echo "::error::update.json не $v"; exit 1; }
+          fi
+      - name: Assemble
+        run: |
+          set -eu
+          mkdir dist
+          cp -r module/. dist/
+          rm -rf dist/tests dist/tools dist/webroot/js/package.json
+          mkdir -p dist/bin dist/lua
+          cp dl/bcw/bcw dl/nfqws2/nfqws2 dist/bin/
+          chmod 755 dist/bin/*
+          for f in zapret-lib.lua zapret-antidpi.lua zapret-auto.lua; do cp "z2/lua/$f" dist/lua/; done
+          cd dist && zip -q -r -9 -X "../bcw-module-${{ steps.ver.outputs.version }}.zip" .
+      - name: Verify archive
+        run: |
+          z="bcw-module-${{ steps.ver.outputs.version }}.zip"
+          unzip -l "$z"
+          for f in module.prop customize.sh service.sh uninstall.sh bin/bcw bin/nfqws2 \
+                   lua/zapret-lib.lua lua/zapret-antidpi.lua lua/zapret-auto.lua \
+                   strategies/default.conf defaults/calls-bypass.conf \
+                   webroot/index.html webroot/js/app.js webroot/js/bridge.js webroot/icon.png; do
+            unzip -l "$z" | grep -q " $f$" || { echo "::error::нет $f"; exit 1; }
+          done
+          unzip -l "$z" | grep -Eq ' (tests|tools)/' && { echo "::error::в архиве tests/ или tools/"; exit 1; } || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcw-module
+          path: bcw-module-${{ steps.ver.outputs.version }}.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bcw-module
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "bcw-module-${GITHUB_REF_NAME}.zip" \
+            --repo "${GITHUB_REPOSITORY}" --title "bcw ${GITHUB_REF_NAME}" \
+            --notes "Модуль KernelSU bcw ${GITHUB_REF_NAME}. Установка — через менеджер KernelSU."

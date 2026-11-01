@@ -1,3 +1,4 @@
+pub mod bypass;
 pub mod config;
 pub mod dto;
 pub mod error;

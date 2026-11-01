@@ -1,0 +1,144 @@
+{
+ "status": [
+  "status"
+ ],
+ "start": [
+  "start"
+ ],
+ "stop": [
+  "stop"
+ ],
+ "restart": [
+  "restart"
+ ],
+ "homeResume": [
+  "home",
+  "resume"
+ ],
+ "homeAdd": [
+  "home",
+  "add",
+  "--",
+  "-кафе wifi"
+ ],
+ "homeRemove": [
+  "home",
+  "remove",
+  "--",
+  " дом "
+ ],
+ "networks": [
+  "networks"
+ ],
+ "networkDelete": [
+  "network",
+  "delete",
+  "--",
+  "wifi_-x"
+ ],
+ "strategies": [
+  "strategies"
+ ],
+ "strategyGet": [
+  "strategy",
+  "get",
+  "--",
+  "-x"
+ ],
+ "strategySave": [
+  "strategy",
+  "save",
+  "--from",
+  "/data/adb/bcw/tmp/upload-1-2",
+  "--",
+  "-x"
+ ],
+ "strategyReset": [
+  "strategy",
+  "reset",
+  "--",
+  "-x"
+ ],
+ "strategyDelete": [
+  "strategy",
+  "delete",
+  "--",
+  "-x"
+ ],
+ "strategyApplyNetwork": [
+  "strategy",
+  "apply",
+  "--network",
+  "--",
+  "-x"
+ ],
+ "strategyApplyDefault": [
+  "strategy",
+  "apply",
+  "--default",
+  "--",
+  "-x"
+ ],
+ "settingsGet": [
+  "settings",
+  "get"
+ ],
+ "settingsSet": [
+  "settings",
+  "set",
+  "--",
+  "TCP_MSS_CLAMP",
+  "-1"
+ ],
+ "lists": [
+  "lists"
+ ],
+ "listGet": [
+  "list",
+  "get",
+  "--",
+  "user"
+ ],
+ "listSet": [
+  "list",
+  "set",
+  "--from",
+  "/data/adb/bcw/tmp/upload-1-2",
+  "--",
+  "user"
+ ],
+ "logs": [
+  "logs",
+  "--tail",
+  "500",
+  "--errors",
+  "--",
+  "service"
+ ],
+ "logsClear": [
+  "logs",
+  "--",
+  "clear"
+ ],
+ "stats": [
+  "stats"
+ ],
+ "version": [
+  "version"
+ ],
+ "uploadBegin": [
+  "upload",
+  "begin"
+ ],
+ "uploadChunk": [
+  "upload",
+  "chunk",
+  "/data/adb/bcw/tmp/upload-1-2",
+  "+/AA"
+ ],
+ "uploadEnd": [
+  "upload",
+  "end",
+  "/data/adb/bcw/tmp/upload-1-2"
+ ]
+}
