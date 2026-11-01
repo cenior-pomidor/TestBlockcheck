@@ -15,8 +15,8 @@
 - root (KernelSU, Magisk, APatch); запуск — через `su -c`;
 - ядро с NFQUEUE, connbytes, CONNMARK, CT, таблицами mangle и raw (проверяет `bcw doctor`);
 - nfqws2 не старше v1.0.5 (нужен `--filter-mark`) и его Lua-файлы `zapret-lib.lua`,
-  `zapret-antidpi.lua`. По умолчанию берутся из установленного модуля nfqws2-android:
-  `/data/adb/modules/nfqws2-android/bin/nfqws2` и `/data/adb/modules/nfqws2-android/lua`.
+  `zapret-antidpi.lua`. По умолчанию берутся из модуля bcw (`module/`):
+  `/data/adb/modules/bcw/bin/nfqws2` и `/data/adb/modules/bcw/lua`.
 
 ## Установка
 
@@ -43,8 +43,8 @@ su -c '/data/local/tmp/bcw -w 64 scan -d rutracker.org -p tls12 | /data/local/tm
 
 | Ключ | Умолчание | Что задаёт |
 |---|---|---|
-| `--nfqws2 <PATH>` | `/data/adb/modules/nfqws2-android/bin/nfqws2` | бинарь движка |
-| `--lua-dir <PATH>` | `/data/adb/modules/nfqws2-android/lua` | каталог Lua-библиотек движка |
+| `--nfqws2 <PATH>` | `/data/adb/modules/bcw/bin/nfqws2` | бинарь движка |
+| `--lua-dir <PATH>` | `/data/adb/modules/bcw/lua` | каталог Lua-библиотек движка |
 | `--work-dir <PATH>` | `/data/adb/bcw` | замок и отчёты прогонов |
 | `--chain-prefix <NAME>` | `bcw` | префикс наших цепочек iptables (`<p>_raw`, `<p>_out`, `<p>_post`, `<p>_pre`, `<p>_q`, `<p>_qin`, `<p>_ctl`) |
 | `--qnum <N>` | `777` | очередь NFQUEUE (не 200 и не 300 — их занимают magisk-zapret2 и nfqws2-android) |

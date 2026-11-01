@@ -63,11 +63,11 @@ struct Cli {
     #[arg(long, default_value_t = 254)]
     profiles_per_instance: usize,
 
-    /// Путь к nfqws2 (умолчание /data/adb/modules/nfqws2-android/bin/nfqws2).
+    /// Путь к nfqws2 (умолчание /data/adb/modules/bcw/bin/nfqws2).
     #[arg(long, global = true, value_name = "PATH")]
     nfqws2: Option<std::path::PathBuf>,
 
-    /// Каталог Lua-библиотек движка (умолчание /data/adb/modules/nfqws2-android/lua).
+    /// Каталог Lua-библиотек движка (умолчание /data/adb/modules/bcw/lua).
     #[arg(long, global = true, value_name = "PATH")]
     lua_dir: Option<std::path::PathBuf>,
 

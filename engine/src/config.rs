@@ -2,12 +2,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-/// nfqws2 по умолчанию — из установленного модуля nfqws2-android (собран из zapret2 v1.0.5.2,
-/// `--filter-mark` в нём есть).
-pub const DEFAULT_NFQWS2: &str = "/data/adb/modules/nfqws2-android/bin/nfqws2";
+/// nfqws2 по умолчанию — из модуля bcw (собран из zapret2 `f924d79`, `--filter-mark` в нём есть).
+pub const DEFAULT_NFQWS2: &str = "/data/adb/modules/bcw/bin/nfqws2";
 
 /// Lua-библиотеки движка по умолчанию — оттуда же.
-pub const DEFAULT_LUA_DIR: &str = "/data/adb/modules/nfqws2-android/lua";
+pub const DEFAULT_LUA_DIR: &str = "/data/adb/modules/bcw/lua";
 
 /// Рабочий каталог: замок, отчёты прогонов. На Android нет `/var/run` и `/tmp` у root-shell.
 pub const DEFAULT_WORK_DIR: &str = "/data/adb/bcw";
@@ -451,5 +450,14 @@ mod tests {
         );
         assert_eq!(env.uid, config.nfqws2_uid);
         assert_eq!(env.gid, config.nfqws2_gid);
+    }
+}
+
+#[cfg(test)]
+mod module_paths_tests {
+    #[test]
+    fn default_paths_point_into_bcw_module() {
+        assert_eq!(super::DEFAULT_NFQWS2, "/data/adb/modules/bcw/bin/nfqws2");
+        assert_eq!(super::DEFAULT_LUA_DIR, "/data/adb/modules/bcw/lua");
     }
 }
