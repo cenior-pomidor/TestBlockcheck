@@ -47,7 +47,7 @@ pub fn build_scan_report(input: ScanReportInput<'_>) -> (String, usize) {
         blocked,
         summary,
         outcome,
-        mut run,
+        run,
     } = input;
     let timestamp = test_report::chrono_like_timestamp();
     let mut total = 0;
@@ -82,8 +82,8 @@ pub fn build_scan_report(input: ScanReportInput<'_>) -> (String, usize) {
         })
         .collect();
 
-    run.total = total;
-    run.tried = total;
+    // `run.tried`/`run.total` — сколько кандидатов проверено и сколько было: их знает
+    // вызывающий. Число найденных — `working`.
     let report = ScanReport {
         schema: crate::dto::SCHEMA,
         outcome,
@@ -389,5 +389,31 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["blocked"], serde_json::json!(["HTTPS/TLS1.2"]));
         assert_eq!(v["strategies"].as_array().unwrap().len(), 1);
+    }
+
+    /// Приёмка на телефоне: `run.tried`/`run.total` показывали число НАЙДЕННЫХ («179 из
+    /// 179»), а сколько кандидатов проверено, из отчёта не узнать. Провенанс задаёт
+    /// вызывающий — сборщик отчёта его не переписывает.
+    #[test]
+    fn scan_report_keeps_tried_and_total_from_the_caller() {
+        let summary = vec![ProtocolSummary {
+            protocol: Protocol::HttpsTls12,
+            strategies: vec![vec!["--a".into()], vec!["--b".into()]],
+        }];
+        let mut report = input(
+            "example.com",
+            BlockType::SniBlocked,
+            DnsSpoofed::Clean,
+            &[Protocol::HttpsTls12],
+            &summary,
+        );
+        report.run.tried = 8000;
+        report.run.total = 8648;
+        let (json, count) = build_scan_report(report);
+        assert_eq!(count, 2);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["working"], 2);
+        assert_eq!(v["run"]["tried"], 8000);
+        assert_eq!(v["run"]["total"], 8648);
     }
 }

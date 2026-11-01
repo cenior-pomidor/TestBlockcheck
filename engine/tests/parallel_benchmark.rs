@@ -109,6 +109,9 @@ async fn parallel_scaling_bench() {
         let chains = rules::prepare_chains(&SystemIpt, &config.chain_prefix)
             .await
             .expect("prepare_chains");
+        // Сколько кандидатов исполнитель довёл до вердикта — живой счётчик: по нему
+        // `scan` пишет `run.tried` и тогда, когда прогон оборван `--timeout`.
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (results, stats) = run_parallel(RunParams {
             config: &config,
             chains: &chains,
@@ -122,6 +125,7 @@ async fn parallel_scaling_bench() {
             mode: HttpTestMode::Standard,
             deadline: None,
             success_sink: None,
+            completed: Some(completed.clone()),
         })
         .await;
 
@@ -156,6 +160,11 @@ async fn parallel_scaling_bench() {
             results.len(),
             strategy_count,
             "wrong result count for worker_count={wc}"
+        );
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::Relaxed),
+            strategy_count,
+            "счётчик проверенных не совпал с числом кандидатов для worker_count={wc}"
         );
     }
 

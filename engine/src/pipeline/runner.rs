@@ -80,6 +80,17 @@ pub struct RunParams<'a> {
     /// Optional sink that each AVAILABLE strategy's args are pushed into as soon
     /// as it is found, so an interrupt mid-run never loses results.
     pub success_sink: Option<Arc<std::sync::Mutex<Vec<Vec<String>>>>>,
+    /// Счётчик кандидатов, доведённых до вердикта (успех, провал, ошибка). Живой — растёт
+    /// по ходу прогона, поэтому `scan` знает, сколько проверено, и когда прогон оборван.
+    pub completed: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// Кандидат получил вердикт: шаг полосы и счётчик проверенных.
+fn tick(pb: &ProgressBar, completed: Option<&std::sync::atomic::AtomicUsize>) {
+    pb.inc(1);
+    if let Some(c) = completed {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn record_plan_failure(
@@ -89,6 +100,7 @@ fn record_plan_failure(
     errors: &mut usize,
     multi: Option<&MultiProgress>,
     pb: &ProgressBar,
+    completed: Option<&std::sync::atomic::AtomicUsize>,
 ) {
     let line = format!(
         "nfqws2 plan failed ({} {}): {error}",
@@ -106,7 +118,7 @@ fn record_plan_failure(
     }
     for strategy_args in chunk {
         *errors += 1;
-        pb.inc(1);
+        tick(pb, completed);
         all_results.push(StrategyResult {
             strategy_args: strategy_args.clone(),
             result: TaskResult::Error {
@@ -171,6 +183,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
         mode,
         deadline,
         success_sink,
+        completed,
     } = params;
 
     let start = Instant::now();
@@ -240,7 +253,15 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
         let mut instance = match SystemNfqws2::start(&env, &plan).await {
             Ok(i) => i,
             Err(e) => {
-                record_plan_failure(chunk, &e.into(), &mut all_results, &mut errors, multi, pb);
+                record_plan_failure(
+                    chunk,
+                    &e.into(),
+                    &mut all_results,
+                    &mut errors,
+                    multi,
+                    pb,
+                    completed.as_deref(),
+                );
                 continue;
             }
         };
@@ -255,7 +276,15 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
             Ok(r) => r,
             Err(e) => {
                 SystemNfqws2::stop(instance).await;
-                record_plan_failure(chunk, &e.into(), &mut all_results, &mut errors, multi, pb);
+                record_plan_failure(
+                    chunk,
+                    &e.into(),
+                    &mut all_results,
+                    &mut errors,
+                    multi,
+                    pb,
+                    completed.as_deref(),
+                );
                 continue;
             }
         };
@@ -271,7 +300,15 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
             rules::remove_dispatch(&SystemIpt, table).await;
             SystemNfqws2::stop(instance).await;
             firewall_errors += chunk.len();
-            record_plan_failure(chunk, &e, &mut all_results, &mut errors, multi, pb);
+            record_plan_failure(
+                chunk,
+                &e,
+                &mut all_results,
+                &mut errors,
+                multi,
+                pb,
+                completed.as_deref(),
+            );
             continue;
         }
         let plan_start = all_results.len();
@@ -350,7 +387,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
                     } else {
                         pb.suspend(|| println!("{line}"));
                     }
-                    pb.inc(1);
+                    tick(pb, completed.as_deref());
                     // МАШИННЫЙ ПРОГРЕСС — не каждый результат, а раз в двести пятьдесят:
                     // при корпусе в 14 тысяч построчная выдача сама стала бы работой, а
                     // читателю нужен ответ на «жив или встал», а не полная летопись.
@@ -376,7 +413,7 @@ pub async fn run_parallel(params: RunParams<'_>) -> (Vec<StrategyResult>, RunSta
                     } else {
                         pb.suspend(|| eprintln!("{line}"));
                     }
-                    pb.inc(1);
+                    tick(pb, completed.as_deref());
 
                     let strategy_args = pending_args.remove(&join_err.id()).unwrap_or_default();
                     all_results.push(StrategyResult {

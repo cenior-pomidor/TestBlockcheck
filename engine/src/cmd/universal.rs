@@ -179,6 +179,7 @@ pub async fn run_universal(
                 mode: HttpTestMode::Standard,
                 deadline: None,
                 success_sink: None,
+                completed: None,
             })
             .await;
 
@@ -345,11 +346,9 @@ pub async fn run_universal(
             .unwrap_or("<domain>");
         screen.println(&format!(
             "\n{}\n",
-            style(format!(
-                ">>> Next step: sudo blockcheckw check --from-file {path} -d {example_domain} <<<"
-            ))
-            .yellow()
-            .bold()
+            style(super::check_hint(&path, example_domain))
+                .yellow()
+                .bold()
         ));
     }
 

@@ -162,6 +162,10 @@ pub struct ScanProgress {
     blocked: Vec<blockcheckw::config::Protocol>,
     completed: Vec<blockcheckw::pipeline::report::ProtocolSummary>,
     current: Option<CurrentProto>,
+    /// Сколько кандидатов доведено до вердикта — наращивает исполнитель по ходу прогона.
+    tried: Arc<std::sync::atomic::AtomicUsize>,
+    /// Сколько кандидатов набрано по начатым протоколам.
+    candidates: usize,
 }
 
 impl ScanProgress {
@@ -174,6 +178,8 @@ impl ScanProgress {
             blocked: Vec::new(),
             completed: Vec::new(),
             current: None,
+            tried: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            candidates: 0,
         }))
     }
 
@@ -192,6 +198,24 @@ impl ScanProgress {
     /// Record the DNS-spoofing flag so an interrupted scan persists it too.
     pub fn set_dns_spoofed(&mut self, dns_spoofed: blockcheckw::dto::DnsSpoofed) {
         self.dns_spoofed = dns_spoofed;
+    }
+
+    /// Счётчик проверенных — отдаётся исполнителю (`RunParams::completed`).
+    pub fn tried_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.tried.clone()
+    }
+
+    /// Учесть корпус начатого протокола.
+    pub fn add_candidates(&mut self, n: usize) {
+        self.candidates += n;
+    }
+
+    /// `(проверено, всего)` — для `run.tried` / `run.total` отчёта.
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            self.tried.load(std::sync::atomic::Ordering::Relaxed),
+            self.candidates,
+        )
     }
 
     /// Start a protocol; returns the sink to hand to `run_parallel`.
@@ -280,6 +304,20 @@ mod scan_progress_tests {
         let p = ScanProgress::new("ex.com".into(), None);
         let _sink = p.lock().unwrap().begin_protocol(Protocol::HttpsTls12);
         assert!(p.lock().unwrap().snapshot().is_empty());
+    }
+
+    /// Приёмка на телефоне: в отчёте должно быть, сколько кандидатов проверено и сколько
+    /// было, — и у прогона, оборванного `--timeout` или сигналом, тоже. Счётчик живой:
+    /// его наращивает исполнитель, а не итог протокола.
+    #[test]
+    fn counts_track_the_live_counter_and_every_protocol_corpus() {
+        let p = ScanProgress::new("ex.com".into(), None);
+        let tried = p.lock().unwrap().tried_counter();
+        p.lock().unwrap().add_candidates(8648);
+        tried.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(p.lock().unwrap().counts(), (100, 8648));
+        p.lock().unwrap().add_candidates(10);
+        assert_eq!(p.lock().unwrap().counts(), (100, 8658));
     }
 }
 
@@ -373,7 +411,7 @@ async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i3
     // Persist partial results only after network state is safe. A second Ctrl+C
     // may skip the report, but must never leave queue rules behind.
     if let Some(progress) = &info.scan_progress {
-        let (domain, output, block_type, dns_spoofed, blocked, summary) = {
+        let (domain, output, block_type, dns_spoofed, blocked, summary, counts) = {
             let p = progress.lock().unwrap();
             (
                 p.domain.clone(),
@@ -382,6 +420,7 @@ async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i3
                 p.dns_spoofed,
                 p.blocked.clone(),
                 p.snapshot(),
+                p.counts(),
             )
         };
         if !summary.is_empty() {
@@ -392,6 +431,7 @@ async fn graceful_cleanup(signal_name: &str, state: &CleanupState, exit_code: i3
                 dns_spoofed,
                 &blocked,
                 &summary,
+                counts,
             ) {
                 Ok(w) => eprintln!(
                     "  {} partial results saved: {} strategies → {}",
@@ -423,6 +463,11 @@ pub fn ensure_work_dir(work_dir: &std::path::Path) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(work_dir)?;
     std::fs::set_permissions(work_dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Подсказка «что дальше» после `scan` / `universal`.
+pub fn check_hint(path: &str, domain: &str) -> String {
+    format!(">>> Next step: bcw check --from-file {path} -d {domain} <<<")
 }
 
 /// Каталог отчётов этого прогона: `<work_dir>/runs/<дата-время>/`, один на процесс.
@@ -824,5 +869,25 @@ mod work_dir_tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::check_hint;
+
+    /// Приёмка на телефоне: подсказка звала `sudo blockcheckw` — на Android нет ни `sudo`,
+    /// ни бинаря с таким именем; запускают `su -c` и `bcw`.
+    #[test]
+    fn check_hint_names_bcw_and_not_sudo() {
+        let hint = check_hint("/data/adb/bcw/runs/x/report_vanilla.txt", "rutracker.org");
+        assert!(
+            hint.contains(
+                "bcw check --from-file /data/adb/bcw/runs/x/report_vanilla.txt -d rutracker.org"
+            ),
+            "{hint}"
+        );
+        assert!(!hint.contains("sudo"), "{hint}");
+        assert!(!hint.contains("blockcheckw"), "{hint}");
     }
 }

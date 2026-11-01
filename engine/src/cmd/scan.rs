@@ -352,8 +352,9 @@ pub async fn run_scan(params: ScanParams<'_>) {
     let mut summary: Vec<ProtocolSummary> = Vec::new();
     let mut timed_out = false;
     // Сколько кандидатов реально проверено — идёт и в провенанс, и в исход: «перебрали всё и
-    // не нашли» отличается от «не досмотрели» именно этим числом.
-    let tried_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // не нашли» отличается от «не досмотрели» именно этим числом. Счётчик живой (его
+    // наращивает исполнитель), поэтому верен и для прогона, оборванного `--timeout`.
+    let tried_counter = progress.lock().unwrap().tried_counter();
     let firewall_total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let scan_future = async {
@@ -407,7 +408,11 @@ pub async fn run_scan(params: ScanParams<'_>) {
             );
             // Hand the sink to run_parallel so each AVAILABLE strategy is captured
             // the instant it is found, not only at the end of the protocol.
-            let sink = progress.lock().unwrap().begin_protocol(protocol);
+            let sink = {
+                let mut p = progress.lock().unwrap();
+                p.add_candidates(strategies.len());
+                p.begin_protocol(protocol)
+            };
             let (results, stats) = run_parallel(RunParams {
                 config: &config,
                 chains: &chains,
@@ -421,11 +426,11 @@ pub async fn run_scan(params: ScanParams<'_>) {
                 mode: HttpTestMode::Standard,
                 deadline: None,
                 success_sink: Some(sink),
+                completed: Some(tried_counter.clone()),
             })
             .instrument(proto_span.clone())
             .await;
             proto_span.record("total", stats.completed);
-            tried_total.fetch_add(stats.completed, std::sync::atomic::Ordering::Relaxed);
             firewall_total.fetch_add(stats.firewall_errors, std::sync::atomic::Ordering::Relaxed);
             proto_span.record("success", stats.successes);
             proto_span.record("failed", stats.failures);
@@ -562,9 +567,13 @@ pub async fn run_scan(params: ScanParams<'_>) {
         )),
     }
 
-    let tried = tried_total.load(std::sync::atomic::Ordering::Relaxed);
+    let (tried, candidates) = progress.lock().unwrap().counts();
     let firewall_failed = firewall_total.load(std::sync::atomic::Ordering::Relaxed);
     let outcome = scan_outcome(timed_out, &summary, tried, firewall_failed);
+    let run = with_counts(
+        RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
+        (tried, candidates),
+    );
     let (content, count) = report::build_scan_report(report::ScanReportInput {
         domain,
         block_type,
@@ -572,7 +581,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
         blocked: &blocked_protocols,
         summary: &summary,
         outcome: outcome.clone(),
-        run: RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
+        run: run.clone(),
     });
     let scan_path = super::default_report_path("scan.json");
     match write_report(&scan_path, &content) {
@@ -596,7 +605,7 @@ pub async fn run_scan(params: ScanParams<'_>) {
         blocked: &blocked_protocols,
         summary: &summary,
         outcome,
-        run: RunProvenance::of(&config, &dns_mode.to_string(), mark::is_embedded()),
+        run,
     });
     super::print_stdout_graceful(&scan_json, &screen);
     screen.newline();
@@ -604,11 +613,9 @@ pub async fn run_scan(params: ScanParams<'_>) {
     if count > 0 {
         screen.println(&format!(
             "\n{}\n",
-            style(format!(
-                ">>> Next step: sudo blockcheckw -w {workers} check --from-file {vanilla_path} -d {domain} <<<"
-            ))
-            .yellow()
-            .bold()
+            style(super::check_hint(&vanilla_path, domain))
+                .yellow()
+                .bold()
         ));
     }
 
@@ -688,6 +695,13 @@ fn scan_outcome(
 
 // ── Report I/O ──────────────────────────────────────────────────────────────
 
+/// Провенанс с числом проверенных и числом кандидатов (`ScanProgress::counts`).
+fn with_counts(mut run: RunProvenance, (tried, total): (usize, usize)) -> RunProvenance {
+    run.tried = tried;
+    run.total = total;
+    run
+}
+
 fn write_report(path: &str, content: &str) -> std::io::Result<()> {
     // Атомарно (tmp + rename): отчёт читает продукт, поднявший подбор, и половина файла
     // даёт ему `Unreadable` — то есть человека, который ждёт, не зная чего.
@@ -710,6 +724,7 @@ pub(crate) fn write_scan_reports(
     dns_spoofed: DnsSpoofed,
     blocked: &[blockcheckw::config::Protocol],
     summary: &[ProtocolSummary],
+    counts: (usize, usize),
 ) -> std::io::Result<WrittenReports> {
     if let Some(path) = output {
         let (content, _) = report::build_strategies_file(domain, summary);
@@ -736,10 +751,13 @@ pub(crate) fn write_scan_reports(
                 stopped_at: Some(Limit::Deadline),
             },
         },
-        run: RunProvenance::of(
-            &blockcheckw::config::CoreConfig::default(),
-            "—",
-            mark::is_embedded(),
+        run: with_counts(
+            RunProvenance::of(
+                &blockcheckw::config::CoreConfig::default(),
+                "—",
+                mark::is_embedded(),
+            ),
+            counts,
         ),
     });
     let scan_path = super::default_report_path("scan.json");

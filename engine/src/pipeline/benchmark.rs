@@ -203,6 +203,19 @@ fn build_table_styled(header: &str, points: &[BenchmarkPoint], base_throughput: 
     lines.join("\n")
 }
 
+/// Строка рекомендации под таблицей замера.
+fn recommendation_line(workers: usize) -> String {
+    format!(">>> Recommended: bcw -w {workers} scan <<<")
+}
+
+/// Итог замера текстом, когда терминала нет: полоса indicatif тогда скрыта, и без этого
+/// таблица не попала бы ни в файл, ни в пайп. На терминале таблицу показывает полоса.
+fn write_plain_final(raw: bool, out: &mut impl std::io::Write, table: &str) {
+    if raw {
+        let _ = writeln!(out, "{table}");
+    }
+}
+
 fn build_table_text(header: &str, points: &[BenchmarkPoint], base_throughput: f64) -> String {
     let mut lines = Vec::new();
     lines.push(header.to_string());
@@ -315,7 +328,7 @@ pub async fn run_benchmark(
              {time_per_level}s per level, {level_count} levels ({} total est.)\n\
              Press Ctrl+C to stop\n",
             profile.format_styled(),
-            style("=== blockcheckw benchmark ===").bold().cyan(),
+            style("=== bcw benchmark ===").bold().cyan(),
             format_duration(time_per_level * level_count as u64),
         )
     };
@@ -381,6 +394,7 @@ pub async fn run_benchmark(
             mode: HttpTestMode::Standard,
             deadline: Some(deadline),
             success_sink: None,
+            completed: None,
         })
         .await;
 
@@ -435,15 +449,16 @@ pub async fn run_benchmark(
     } else {
         build_table_styled(&header, &points, base_throughput.unwrap_or(1.0))
     };
-    let recommendation = format!(">>> Recommended: blockcheckw -w {recommended_workers} scan <<<");
+    let recommendation = recommendation_line(recommended_workers);
     if !raw {
         final_table.push_str(&format!("\n\n{}", style(recommendation).yellow().bold()));
     } else {
         final_table.push_str(&format!("\n\n{recommendation}"));
     }
+    write_plain_final(raw, &mut std::io::stderr(), &final_table);
     table_bar.finish_with_message(final_table);
 
-    // stdout: recommended workers (for pipe: benchmark | xargs -I{} blockcheckw -w {} scan)
+    // stdout: recommended workers (for pipe: benchmark | xargs -I{} bcw -w {} scan)
     println!("{recommended_workers}");
 
     Some(BenchmarkResult {
@@ -484,6 +499,33 @@ mod tests {
     }
 
     use super::*;
+
+    /// Приёмка: рекомендация звала бинарь старым именем.
+    #[test]
+    fn recommendation_names_the_bcw_binary() {
+        let line = recommendation_line(254);
+        assert!(line.contains("bcw -w 254 scan"), "{line}");
+        assert!(!line.contains("blockcheckw"), "{line}");
+    }
+
+    /// Приёмка: `benchmark 2>&1 | tee` оставил в файле одно число. Таблица рисуется
+    /// полосой indicatif, а полоса без терминала скрыта — значит, без терминала итог
+    /// печатается текстом.
+    #[test]
+    fn without_a_terminal_the_final_table_is_written_as_text() {
+        let mut out = Vec::new();
+        write_plain_final(true, &mut out, "TABLE\n\n>>> Recommended <<<");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("TABLE"), "{text}");
+        assert!(text.contains("Recommended"), "{text}");
+    }
+
+    #[test]
+    fn on_a_terminal_the_bar_alone_shows_the_table() {
+        let mut out = Vec::new();
+        write_plain_final(false, &mut out, "TABLE");
+        assert!(out.is_empty(), "таблица была бы напечатана дважды");
+    }
 
     #[test]
     fn profiles_per_instance_reaches_core_config() {
