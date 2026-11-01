@@ -78,7 +78,7 @@ jobs:
         run: |
           sh module/tests/test_refs.sh
           sh module/tests/test_scripts.sh
-          for t in module/tests/webui/*.mjs; do if [ -f "$t" ]; then node "$t"; fi; done
+          for t in module/tests/webui/test_*.mjs; do if [ -f "$t" ]; then node "$t"; fi; done
       - name: Lua from zapret2 ${{ env.ZAPRET2_SHA }}
         run: |
           git init -q z2
