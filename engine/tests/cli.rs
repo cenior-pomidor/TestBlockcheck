@@ -90,3 +90,25 @@ fn doctor_subcommand_exists() {
     assert!(ok, "doctor --help обязан работать:\n{output}");
     assert!(output.contains("Usage:"), "{output}");
 }
+
+/// `bcw svc` без root не трогает iptables, а просит `su -c`.
+#[test]
+fn svc_cleanup_requires_root() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIPPED: запущено от root");
+        return;
+    }
+    let (output, ok) = run(&["svc", "cleanup"]);
+    assert!(!ok, "{output}");
+    assert!(output.contains("su -c"), "{output}");
+}
+
+#[test]
+fn svc_subcommand_exists() {
+    let (output, ok) = run(&["svc", "--help"]);
+    assert!(ok, "{output}");
+    assert!(
+        output.contains("run") && output.contains("cleanup"),
+        "{output}"
+    );
+}

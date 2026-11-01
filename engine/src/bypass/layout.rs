@@ -18,6 +18,19 @@ impl Layout {
         }
     }
 
+    /// Раскладка телефона с переопределением `BCW_MODULE_DIR` / `BCW_DATA_DIR` (стенд, тесты).
+    pub fn from_env() -> Layout {
+        let d = Layout::device();
+        Layout {
+            module_dir: std::env::var_os("BCW_MODULE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or(d.module_dir),
+            data_dir: std::env::var_os("BCW_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or(d.data_dir),
+        }
+    }
+
     pub fn nfqws2(&self) -> PathBuf {
         self.module_dir.join("bin/nfqws2")
     }

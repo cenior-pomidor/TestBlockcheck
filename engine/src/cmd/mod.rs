@@ -3,6 +3,7 @@ pub mod check;
 pub mod doctor;
 pub mod scan;
 pub mod status;
+pub mod svc;
 pub mod universal;
 
 use std::sync::Arc;

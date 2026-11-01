@@ -115,6 +115,18 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum SvcAction {
+    /// Работать службой: правила, nfqws2, сторож, сеть, сокет для `bcw ctl`.
+    Run {
+        /// Первый запуск после загрузки: желаемое состояние берётся из AUTOSTART.
+        #[arg(long)]
+        boot: bool,
+    },
+    /// Снять правила обхода dpi_* и выйти.
+    Cleanup,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Run parallel scaling benchmark to find optimal worker count
     Benchmark {
@@ -259,6 +271,12 @@ enum Command {
     /// Проверить устройство перед первым прогоном: root, ядро, iptables, nfqws2, маршрут
     /// помеченных сокетов, DoH, соседи. JSON в stdout, таблица в stderr. Ничего не меняет.
     Doctor,
+
+    /// Служба модуля обхода (запускает service.sh модуля). Требует root.
+    Svc {
+        #[command(subcommand)]
+        action: SvcAction,
+    },
 
     /// Show zapret2 effectiveness: compare access with and without the service
     Status {
@@ -493,6 +511,14 @@ async fn main() {
     // а замок, преflight и память прогона ему не нужны.
     if matches!(cli.command, Some(Command::Doctor)) {
         cmd::doctor::run_doctor_cmd().await;
+    }
+    // Служба модуля: свой цикл, без замка поиска, preflight и памяти прогона.
+    if let Some(Command::Svc { action }) = &cli.command {
+        blockcheckw::system::elevate::require_root();
+        match action {
+            SvcAction::Run { boot } => cmd::svc::run(*boot).await,
+            SvcAction::Cleanup => cmd::svc::cleanup().await,
+        }
     }
 
     blockcheckw::system::elevate::require_root();
@@ -890,6 +916,7 @@ async fn main() {
                 .await;
             }
             Some(Command::Doctor) => unreachable!("doctor обрабатывается до elevation"),
+            Some(Command::Svc { .. }) => unreachable!("svc обрабатывается до elevation"),
             None => unreachable!("справка без команды печатается до elevation"),
         }
     }

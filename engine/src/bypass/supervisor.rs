@@ -175,6 +175,16 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
 
     /// Принять наблюдение сети; смена засчитывается после `STABLE_POLLS` одинаковых опросов.
     fn observe(&mut self, n: Network) {
+        // Первое наблюдение и выход из «нет сети» принимаются сразу: дребезг — это метания
+        // между сетями, а появление сети ждать незачем.
+        if matches!(self.network, None | Some(Network::Offline)) && n != Network::Offline {
+            if self.network.is_some() {
+                self.log(EventKind::NetworkChange, Level::Info, &n.title());
+            }
+            self.network = Some(n);
+            self.pending = None;
+            return;
+        }
         if self.network.is_none() {
             self.network = Some(n);
             return;
@@ -951,6 +961,33 @@ mod tests {
         }
         let w = e.w.lock().unwrap();
         assert_eq!((w.spawned.len(), w.stops), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn boot_without_network_still_starts_and_leaving_offline_is_immediate() {
+        let mut e = env("boot-offline", |s| {
+            set(s, "NET_STRATEGY", "1");
+            s.set_network(
+                &Network::Wifi {
+                    ssid: "Cafe".into(),
+                },
+                "alt",
+            )
+            .unwrap();
+        });
+        e.w.lock().unwrap().network = Some(Network::Offline);
+        e.sup.tick(at(&e, 0)).await;
+        assert_eq!(e.sup.status().state, "running");
+        assert_eq!(e.sup.status().strategy.as_deref(), Some("default"));
+        e.w.lock().unwrap().network = Some(Network::Wifi {
+            ssid: "Cafe".into(),
+        });
+        e.sup.tick(at(&e, 5)).await;
+        assert_eq!(
+            e.sup.status().strategy.as_deref(),
+            Some("alt"),
+            "сеть появилась — сразу её стратегия"
+        );
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod args;
+pub mod ipc;
 pub mod layout;
 pub mod logs;
 pub mod network;
@@ -15,6 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod store;
 pub mod supervisor;
+pub mod system;
 
 /// Каталог модуля на телефоне.
 pub const MODULE_DIR: &str = "/data/adb/modules/bcw";

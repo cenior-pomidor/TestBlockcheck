@@ -120,7 +120,15 @@ pub struct DecisionInput<'a> {
 /// Что делать при этой сети.
 pub fn decide(i: &DecisionInput) -> Decision {
     if *i.network == Network::Offline {
-        return Decision::Nothing;
+        // Без сети обходить нечего, но и останавливать незачем; не работающий обход
+        // (загрузка раньше сети) запускается со стратегией по умолчанию.
+        return if i.running_strategy.is_some() || i.paused {
+            Decision::Nothing
+        } else {
+            Decision::Restart {
+                strategy: i.settings.default_strategy.clone(),
+            }
+        };
     }
     if let Network::Wifi { ssid } = i.network {
         let at_home = i.settings.home_wifi
@@ -365,6 +373,21 @@ mod tests {
                 &saved
             )),
             Decision::Nothing
+        );
+        // Обход не работает и сети нет — запустить по умолчанию (загрузка до сети).
+        assert_eq!(
+            decide(&input(
+                &s,
+                &Network::Offline,
+                None,
+                false,
+                &home,
+                None,
+                &saved
+            )),
+            Decision::Restart {
+                strategy: "default".into()
+            }
         );
     }
 }
