@@ -296,4 +296,27 @@ mod tests {
         let p = parse_preset("NFQWS_BASE_ARGS=\"--lua-init=@$LUA_DIR/zapret-lib.lua\"\n").unwrap();
         assert_eq!(p.base, "--lua-init=@$LUA_DIR/zapret-lib.lua");
     }
+
+    /// Текст из редактора WebUI (`editorToText`) разбирается в те же поля, что отдал `ctl strategy get`.
+    #[test]
+    fn editor_roundtrip() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../module/tests");
+        let text = std::fs::read_to_string(format!("{dir}/webui/editor-roundtrip.conf")).unwrap();
+        let get: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/ctl-samples/strategy-get.json")).unwrap(),
+        )
+        .unwrap();
+        let p = parse_preset(&text).unwrap();
+        let f = &get["fields"];
+        for (key, got) in [
+            ("NFQWS_BASE_ARGS", &p.base),
+            ("NFQWS_ARGS", &p.tcp),
+            ("NFQWS_ARGS_QUIC", &p.quic),
+            ("NFQWS_ARGS_UDP", &p.udp),
+            ("NFQWS_ARGS_IPSET", &p.ipset),
+            ("NFQWS_ARGS_CUSTOM", &p.custom),
+        ] {
+            assert_eq!(f[key].as_str().unwrap(), got, "{key}");
+        }
+    }
 }

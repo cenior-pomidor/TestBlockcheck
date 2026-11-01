@@ -45,3 +45,14 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.4 ui-monospac
   position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
   background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 10px;
 }
+.list { display: flex; flex-direction: column; gap: 6px; }
+.row {
+  text-align: left; width: 100%; background: var(--card); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+}
+.tag { font-size: 12px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); }
+.tag.good { color: var(--good); border-color: currentColor; } .tag.warn { color: var(--warn); border-color: currentColor; }
+.editor label { display: block; margin: 0 0 12px; }
+.editor h2 { font-size: 18px; margin: 0 0 12px; }
+.editor textarea { min-height: 6em; }
+.error { color: var(--bad); white-space: pre-wrap; }

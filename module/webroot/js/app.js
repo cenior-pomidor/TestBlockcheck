@@ -1,5 +1,6 @@
 // Вкладки и общий каркас WebUI.
 import { showStatus } from './status.js';
+import { showStrategies } from './strategies.js';
 
 const tabs = [];
 
@@ -30,6 +31,7 @@ async function open(id) {
 }
 
 registerTab('status', 'Состояние', showStatus);
+registerTab('strategies', 'Стратегии', showStrategies);
 
 function start() {
   const nav = document.getElementById('tabs');
