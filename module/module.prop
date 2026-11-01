@@ -1,0 +1,8 @@
+id=bcw
+name=bcw — обход DPI
+version=v0.1.0
+versionCode=100
+author=cenior-pomidor
+description=Обход DPI на nfqws2 и поиск стратегий
+updateJson=https://raw.githubusercontent.com/cenior-pomidor/TestBlockcheck/main/module/update.json
+webuiIcon=webroot/icon.png
