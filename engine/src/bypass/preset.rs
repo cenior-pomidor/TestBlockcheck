@@ -121,9 +121,13 @@ fn substitute(
 
 fn pkt_value(line: usize, raw: &str) -> Result<u16, PresetError> {
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits
-        .parse()
-        .map_err(|_| err(line, format!("лимит пакетов не число: {raw}")))
+    match digits.parse::<u16>() {
+        Ok(n) if (1..=100).contains(&n) => Ok(n),
+        _ => Err(err(
+            line,
+            format!("лимит пакетов — число от 1 до 100: {raw}"),
+        )),
+    }
 }
 
 /// Разобрать текст пресета.
@@ -270,6 +274,14 @@ mod tests {
         assert_eq!(p.limits.tcp_out, Some(8));
         assert_eq!(p.limits.udp_in, Some(3));
         assert_eq!(p.limits.tcp_in, None);
+    }
+
+    /// Ревью 2а: лимит 0 дал бы `--connbytes 1:0`.
+    #[test]
+    fn pkt_override_out_of_range_is_an_error() {
+        let e = parse_preset("NFQWS2_TCP_PKT_OUT=0\nNFQWS_ARGS=\"--x\"\n").unwrap_err();
+        assert_eq!(e.line, 1);
+        assert!(parse_preset("NFQWS2_UDP_PKT_IN=101\n").is_err());
     }
 
     #[test]

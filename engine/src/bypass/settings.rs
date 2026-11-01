@@ -112,23 +112,23 @@ fn number<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
 }
 
 fn port_list(key: &str, v: &str) -> Result<String, String> {
+    // Порт 1–65535 или диапазон a:b / a-b с a ≤ b. Длина списка не ограничена: правила
+    // режутся на части по 15 портов (`ports::chunks`).
     let ok = !v.is_empty()
         && v.split(',').all(|p| {
-            let parts: Vec<&str> = p.split([':', '-']).collect();
-            (1..=2).contains(&parts.len())
-                && parts
-                    .iter()
-                    .all(|x| x.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n)))
+            let parts: Vec<Option<u32>> = p
+                .split([':', '-'])
+                .map(|x| x.parse::<u32>().ok().filter(|n| (1..=65535).contains(n)))
+                .collect();
+            match parts.as_slice() {
+                [Some(_)] => true,
+                [Some(a), Some(b)] => a <= b,
+                _ => false,
+            }
         });
     if !ok {
         return Err(format!(
-            "{key}: список портов через запятую, диапазон — a:b, получено «{v}»"
-        ));
-    }
-    let w = super::ports::weight(v);
-    if w > 15 {
-        return Err(format!(
-            "{key}: не больше 15 портов в правиле (диапазон считается за два), здесь {w}"
+            "{key}: список портов через запятую, диапазон — a:b (a ≤ b), получено «{v}»"
         ));
     }
     Ok(v.to_string())
@@ -337,12 +337,15 @@ mod tests {
         assert_eq!(s, Settings::default(), "отвергнутое не меняет настройки");
     }
 
+    /// Ревью 2а: правила режут порты на части по 15, поэтому длинный список допустим;
+    /// а перевёрнутый диапазон уронил бы `iptables-restore`.
     #[test]
-    fn set_rejects_more_than_15_multiport_weight() {
+    fn long_lists_accepted_reversed_range_rejected() {
         let mut s = Settings::default();
-        let ports: Vec<String> = (1000..1016).map(|p| p.to_string()).collect();
-        assert!(s.set("TCP_PORTS", &ports.join(",")).is_err());
-        assert!(s.set("TCP_PORTS", &ports[..15].join(",")).is_ok());
+        let ports: Vec<String> = (1000..1030).map(|p| p.to_string()).collect();
+        assert!(s.set("TCP_PORTS", &ports.join(",")).is_ok());
+        assert!(s.set("UDP_PORTS", "443,600:590").is_err());
+        assert!(s.set("UDP_PORTS", "443,590-600").is_ok());
     }
 
     #[test]
