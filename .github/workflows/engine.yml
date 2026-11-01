@@ -1,0 +1,83 @@
+name: engine
+
+on:
+  push:
+    branches: [main, stage1-engine]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test --lib --bins
+      - run: cargo test --test orphan_reaping --test background_shutdown --test cli --test ipt_isolation
+
+  integration:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Load kernel modules
+        # По одному и без падения: имя цели CONNMARK живёт в модуле xt_connmark, а часть
+        # модулей бывает встроена в ядро раннера. Недостающее ядро догрузит само по
+        # первому правилу; провал здесь — предупреждение, а не отказ job.
+        run: |
+          for m in nfnetlink_queue ip_tables iptable_mangle iptable_raw xt_NFQUEUE \
+                   xt_connbytes xt_connmark xt_CT xt_mark xt_conntrack xt_multiport xt_tcpudp; do
+            sudo modprobe "$m" || echo "::warning::modprobe $m failed"
+          done
+      - name: Build integration image
+        run: docker build -f docker/integration.Dockerfile -t bcw-it .
+      - name: Run e2e_infra tests
+        run: docker run --rm --privileged bcw-it --test e2e_infra -- --nocapture
+      - name: Run parallel_benchmark tests
+        continue-on-error: true
+        run: docker run --rm --privileged bcw-it --test parallel_benchmark -- --nocapture
+
+  build-android:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+          key: aarch64-musl
+      - uses: taiki-e/install-action@cross
+      # Статически, без UPX: упакованные бинарники на Android — лишний риск.
+      - run: cross build --release --target aarch64-unknown-linux-musl
+      - name: Verify static aarch64 binary
+        run: |
+          info="$(file target/aarch64-unknown-linux-musl/release/bcw)"
+          echo "$info"
+          echo "$info" | grep -q 'ARM aarch64'
+          echo "$info" | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcw-aarch64
+          path: engine/target/aarch64-unknown-linux-musl/release/bcw
+          if-no-files-found: error

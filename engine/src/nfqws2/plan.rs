@@ -1,0 +1,284 @@
+use std::path::PathBuf;
+
+use crate::nfqws2::mark::{desync_mark, ProfileMark};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueNum(u16);
+
+impl QueueNum {
+    pub fn new(n: u16) -> Self {
+        QueueNum(n)
+    }
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Env {
+    pub binary: PathBuf,
+    pub lua: Vec<PathBuf>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Debug)]
+pub struct FilterMark(());
+
+impl FilterMark {
+    /// Единственный производственный конструктор — вызывать только после
+    /// реальной проверки `--help`. См. `capability::grant_from_help`.
+    pub(crate) fn evidenced() -> Self {
+        FilterMark(())
+    }
+
+    /// Только для тестов внутри крейта: тестовый ярлык на месте настоящей
+    /// проверки `grant_from_help`. В боевой сборке не существует вовсе.
+    #[cfg(test)]
+    pub(crate) fn granted() -> Self {
+        FilterMark(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub mark: ProfileMark,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Plan {
+    queue: QueueNum,
+    profiles: Vec<Profile>,
+}
+
+impl Plan {
+    /// Стратегии → профили с марками 1..=N.
+    ///
+    /// Стратегий больше `PROFILE_MASK` быть не может — марка не влезет; вызывающий
+    /// режет корпус на планы по `profiles_per_instance`, который заведомо меньше.
+    pub fn from_strategies(
+        _witness: &FilterMark,
+        queue: QueueNum,
+        strategies: &[Vec<String>],
+    ) -> Self {
+        let profiles = strategies
+            .iter()
+            .enumerate()
+            .map(|(i, args)| Profile {
+                mark: ProfileMark::new((i + 1) as u16)
+                    .expect("индекс профиля начинается с единицы"),
+                args: args.clone(),
+            })
+            .collect();
+        Plan { queue, profiles }
+    }
+
+    /// План из одной стратегии — короткий путь для вызывающих, у которых уже
+    /// есть готовый `&[String]` (`check.rs`, `test_runner.rs`) и которым не
+    /// нужно заворачивать его в `&Vec<String>` только ради
+    /// `std::slice::from_ref` под `from_strategies`.
+    pub fn from_one(_witness: &FilterMark, queue: QueueNum, args: &[String]) -> Self {
+        Plan {
+            queue,
+            profiles: vec![Profile {
+                mark: ProfileMark::new(1).expect("единица — валидный индекс профиля"),
+                args: args.to_vec(),
+            }],
+        }
+    }
+
+    pub fn queue(&self) -> QueueNum {
+        self.queue
+    }
+
+    pub fn profiles(&self) -> &[Profile] {
+        &self.profiles
+    }
+
+    /// Командная строка процесса.
+    ///
+    /// `--new` РАЗДЕЛЯЕТ профили: первый профиль движок создаёт сам при старте,
+    /// и общая секция принадлежит именно ему. Поставить `--new` перед первым
+    /// значило бы завести профиль без `--filter-mark`, у которого
+    /// `filter_mark_mask = 0` — он матчит любой пакет и выигрывает как первый.
+    pub fn argv(&self, env: &Env) -> Vec<String> {
+        let mut argv = vec![
+            env.binary.to_string_lossy().into_owned(),
+            format!("--uid={}:{}", env.uid, env.gid),
+            queue_arg(self.queue),
+            fwmark_arg(desync_mark()),
+        ];
+        argv.extend(
+            env.lua
+                .iter()
+                .map(|p| format!("--lua-init=@{}", p.to_string_lossy())),
+        );
+
+        for (i, profile) in self.profiles.iter().enumerate() {
+            if i > 0 {
+                argv.push("--new".to_string());
+            }
+            argv.push(profile.mark.filter_arg());
+            argv.extend(profile.args.iter().cloned());
+        }
+        argv
+    }
+}
+
+/// Как в командной строке движка пишется НОМЕР ОЧЕРЕДИ.
+///
+/// Публично и отдельно от [`Plan::argv`], потому что этот же токен ищет уборщик своих
+/// остатков (`system::orphans`): он узнаёт наш осиротевший движок по его командной строке.
+/// Пока написание жило в двух местах, смена формата здесь молча лишала уборщика зрения —
+/// он переставал узнавать своих, а на очереди оставался живой процесс.
+pub fn queue_arg(queue: QueueNum) -> String {
+    format!("--qnum={}", queue.get())
+}
+
+/// Как в командной строке движка пишется МАРКА РЕИНЖЕКТА. Второй признак «своего» там же.
+pub fn fwmark_arg(mark: u32) -> String {
+    format!("--fwmark=0x{mark:08X}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env() -> Env {
+        Env {
+            binary: "/opt/zapret2/binaries/linux-x86_64/nfqws2".into(),
+            lua: vec![
+                "/opt/zapret2/lua/zapret-lib.lua".into(),
+                "/opt/zapret2/lua/zapret-antidpi.lua".into(),
+            ],
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
+    fn plan_of(strategies: &[&str]) -> Plan {
+        let owned: Vec<Vec<String>> = strategies
+            .iter()
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .collect();
+        Plan::from_strategies(&FilterMark::granted(), QueueNum::new(200), &owned)
+    }
+
+    /// `--new` РАЗДЕЛЯЕТ профили, а не открывает их: первый профиль неявный.
+    #[test]
+    fn new_separates_profiles_so_there_are_k_minus_one() {
+        let argv = plan_of(&["--a", "--b", "--c"]).argv(&env());
+        assert_eq!(argv.iter().filter(|a| *a == "--new").count(), 2);
+    }
+
+    /// САМЫЙ ДОРОГОЙ ОТКАЗ. Профиль без `--filter-mark` имеет filter_mark_mask = 0,
+    /// то есть матчит ЛЮБОЙ пакет, и как первый в списке выигрывает всегда —
+    /// ни одна стратегия не применилась бы, при полном молчании движка.
+    #[test]
+    fn the_first_profile_carries_a_filter_mark() {
+        let argv = plan_of(&["--a", "--b"]).argv(&env());
+        let first_new = argv.iter().position(|a| a == "--new").expect("есть --new");
+        assert!(
+            argv[..first_new]
+                .iter()
+                .any(|a| a.starts_with("--filter-mark=")),
+            "до первого --new обязан стоять --filter-mark: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn every_profile_gets_its_own_mark_and_args_in_order() {
+        let argv = plan_of(&["--a", "--b", "--c"]).argv(&env());
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("--filter-mark=0x00400000/0x3FC00000 --a"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--new --filter-mark=0x00800000/0x3FC00000 --b"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--new --filter-mark=0x00C00000/0x3FC00000 --c"),
+            "{joined}"
+        );
+    }
+
+    /// Общие флаги — по одному разу и ДО первого --new (иначе уедут в профиль).
+    #[test]
+    fn global_flags_appear_once_before_the_first_profile_separator() {
+        let argv = plan_of(&["--a", "--b"]).argv(&env());
+        let first_new = argv.iter().position(|a| a == "--new").expect("есть --new");
+        for prefix in ["--uid=", "--qnum=", "--fwmark=", "--lua-init=@"] {
+            let all = argv.iter().filter(|a| a.starts_with(prefix)).count();
+            let before = argv[..first_new]
+                .iter()
+                .filter(|a| a.starts_with(prefix))
+                .count();
+            let expected = if prefix == "--lua-init=@" { 2 } else { 1 };
+            assert_eq!(all, expected, "{prefix} встречается {all} раз");
+            assert_eq!(before, expected, "{prefix} должен стоять до первого --new");
+        }
+        assert_eq!(argv[0], "/opt/zapret2/binaries/linux-x86_64/nfqws2");
+        assert!(argv.contains(&fwmark_arg(desync_mark())));
+    }
+
+    #[test]
+    fn a_single_profile_plan_has_no_separator_at_all() {
+        let argv = plan_of(&["--a"]).argv(&env());
+        assert!(!argv.iter().any(|a| a == "--new"));
+        assert!(argv.contains(&"--filter-mark=0x00400000/0x3FC00000".to_string()));
+    }
+
+    #[test]
+    fn marks_are_numbered_from_one_and_are_distinct() {
+        let plan = plan_of(&["--a", "--b", "--c"]);
+        let marks: Vec<u16> = plan.profiles().iter().map(|p| p.mark.index()).collect();
+        assert_eq!(marks, vec![1, 2, 3]);
+    }
+
+    /// Связка с `config::MAX_PROFILES_PER_INSTANCE` (= 254): план на потолке строится без
+    /// паники, последний профиль — 254, а 255-го не существует (это метка контроля).
+    #[test]
+    fn a_plan_at_the_mark_ceiling_does_not_panic_and_the_last_mark_is_254() {
+        use crate::nfqws2::space::MAX_PROFILE_INDEX;
+
+        let ceiling = MAX_PROFILE_INDEX as usize;
+        let strategies: Vec<Vec<String>> = (0..ceiling).map(|_| vec!["--a".to_string()]).collect();
+
+        let plan = Plan::from_strategies(&FilterMark::granted(), QueueNum::new(200), &strategies);
+
+        assert_eq!(plan.profiles().len(), 254);
+        let last_mark = plan.profiles().last().expect("план непуст").mark.index();
+        assert_eq!(last_mark, 254);
+        assert!(ProfileMark::new(255).is_none());
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    /// ОДИН ПИСАТЕЛЬ НА ОДНО ЗНАНИЕ. Уборщик остатков узнаёт наш движок по этим самым
+    /// токенам; собирай он их сам — смена написания здесь оставила бы его слепым, а на
+    /// очереди остался бы живой процесс, которого никто больше не считает своим.
+    #[test]
+    fn the_argv_is_spelled_by_the_same_code_that_recognises_it() {
+        let env = Env {
+            binary: "/opt/zapret2/nfq2/nfqws2".into(),
+            lua: vec![],
+            uid: 65534,
+            gid: 65534,
+        };
+        let plan = Plan::from_strategies(
+            &FilterMark::granted(),
+            QueueNum::new(200),
+            &[vec!["--a".to_string()]],
+        );
+        let argv = plan.argv(&env);
+
+        assert!(argv.contains(&queue_arg(QueueNum::new(200))));
+        assert!(argv.contains(&fwmark_arg(desync_mark())));
+    }
+}

@@ -1,0 +1,73 @@
+[package]
+name = "blockcheckw"
+version = "0.12.1"
+edition = "2021"
+description = "blockcheck.sh wrapper for better scanning speed"
+
+[[bin]]
+name = "bcw"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "signal", "macros", "net", "io-util"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# СЛОВАРЬ СУДЬБЫ И ПАРК ПРИБОРОВ. Зависит только от `reflex-core`: ни nfq, ни conntrack,
+# ни Linux, ни C-библиотек — берётся на всех девяти целях. `ring` у core `optional` (за
+# QUIC) и НЕ включается: он единственный с ассемблером и убил бы mips64/riscv64.
+# Пин на ревизию, не на ветку: воспроизводимость сборки важнее свежести (ср. zapret2).
+#
+# «На всех девяти» — теперь под охраной, а не на слово: на `a2ee7e9` эта строчка была
+# неправдой (`AtomicU64` в тестовых часах core уносил mips, mipsel и ppc), и узналось это
+# только когда v0.11.0 уехал с шестью архивами из девяти. Сторожат двое: `check-exotic`
+# в ci.yml на нашей стороне и `scripts/portable.sh` на стороне reflex.
+reflex-instrument = { git = "https://github.com/rcd27/reflex", rev = "08bc0b4" }
+reflex-core = { git = "https://github.com/rcd27/reflex", rev = "08bc0b4" }
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "1"
+socket2 = { version = "0.5", features = ["all"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+indicatif = "0.17"
+console = "0.15"
+clap = { version = "4", features = ["derive", "color"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+nix = { version = "0.29", features = ["user", "resource", "fs", "process"] }
+
+# OTLP/gRPC-стек (tonic/tower) выключен по умолчанию: на router-таргетах
+# (mips/ppc/riscv через -Zbuild-std) tonic не компилируется и не нужен.
+# Родительские проекты включают `otel` явно.
+[features]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
+[dev-dependencies]
+
+[[test]]
+name = "parallel_benchmark"
+path = "tests/parallel_benchmark.rs"
+
+[[test]]
+name = "e2e_infra"
+path = "tests/e2e_infra.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+panic = "abort"

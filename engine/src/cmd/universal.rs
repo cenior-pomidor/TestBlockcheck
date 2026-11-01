@@ -1,0 +1,379 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use console::style;
+
+use blockcheckw::config::{CoreConfig, DnsMode, Protocol};
+use blockcheckw::error::TaskResult;
+use blockcheckw::firewall::ipt::SystemIpt;
+use blockcheckw::firewall::rules;
+use blockcheckw::network::{dns, via::Via};
+use blockcheckw::pipeline::report::{self, UniversalProtocolData};
+use blockcheckw::pipeline::runner::{run_parallel, RunParams};
+use blockcheckw::pipeline::worker_task::HttpTestMode;
+use blockcheckw::strategy::generator;
+use blockcheckw::ui;
+
+use super::{handle_bypass_conflicts, spawn_cleanup_handler};
+
+/// Load domain list from file, filtering out invalid entries.
+fn load_domain_list(path: &str) -> Result<Vec<String>, String> {
+    let data = std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    let domains: Vec<String> = data
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !l.starts_with('.')) // skip TLD masks like ".ua"
+        .filter(|l| l.contains('.')) // must have at least one dot
+        .map(String::from)
+        .collect();
+    if domains.is_empty() {
+        return Err(format!("no valid domains found in {path}"));
+    }
+    Ok(domains)
+}
+
+/// Simple deterministic shuffle (Fisher-Yates with LCG PRNG seeded from system time).
+fn shuffle(domains: &[String]) -> Vec<String> {
+    let mut result: Vec<String> = domains.to_vec();
+    let mut rng = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    for i in (1..result.len()).rev() {
+        // LCG step
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let j = (rng >> 33) as usize % (i + 1);
+        result.swap(i, j);
+    }
+    result
+}
+
+fn universal_core_config(workers: usize, profiles_per_instance: usize) -> CoreConfig {
+    CoreConfig {
+        worker_count: workers,
+        profiles_per_instance,
+        ..CoreConfig::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // prereq/profiles_per_instance добавлены задачей 8 поверх уже широкого набора параметров
+pub async fn run_universal(
+    workers: usize,
+    profiles_per_instance: usize,
+    domain_list: &str,
+    protocols: &[Protocol],
+    dns_mode: DnsMode,
+    sample: usize,
+    output: Option<&str>,
+    via: Option<&Via>,
+    prereq: &super::Prerequisites,
+) {
+    let config = Arc::new(universal_core_config(workers, profiles_per_instance));
+
+    let _cleanup = spawn_cleanup_handler(&config.chain_prefix);
+
+    let mut screen = ui::Console::new();
+
+    // Load domain list
+    let all_domains = match load_domain_list(domain_list) {
+        Ok(d) => d,
+        Err(e) => {
+            screen.error(&e.to_string());
+            std::process::exit(1);
+        }
+    };
+
+    screen.println(&format!(
+        "{} {} domains from {}, target sample {}",
+        style("universal").bold().cyan(),
+        style(all_domains.len()).bold(),
+        style(domain_list).cyan(),
+        style(sample).bold(),
+    ));
+
+    // Remote gateway check
+    if let Some(v) = via {
+        if !v.check_reachable(&screen).await {
+            std::process::exit(1);
+        }
+    }
+
+    // Check for conflicts
+    handle_bypass_conflicts(&config.chain_prefix, &screen).await;
+
+    // Наши цепочки — до первой пробы (DoH), на весь прогон (review C1).
+    let chains = match rules::prepare_chains(&SystemIpt, &config.chain_prefix).await {
+        Ok(chains) => chains,
+        Err(e) => {
+            screen.error(&format!("iptables: {e}"));
+            std::process::exit(
+                blockcheckw::dto::Outcome::Broken {
+                    reason: blockcheckw::dto::BrokenReason::Firewall,
+                }
+                .exit_code(),
+            );
+        }
+    };
+
+    // Shuffle domain list for random sampling
+    let candidates = shuffle(&all_domains);
+
+    // Full brute-force scan per protocol
+    let mut results: Vec<UniversalProtocolData> = Vec::new();
+
+    for &protocol in protocols {
+        screen.newline();
+        screen.println(&ui::section(&format!("Universal scan ({protocol})")));
+
+        let corpus = generator::generate_strategies(protocol);
+        screen.println(&format!(
+            "  corpus: {} strategies, target: {} domains, workers={}",
+            style(corpus.len()).bold(),
+            style(sample).bold(),
+            style(config.worker_count).bold(),
+        ));
+
+        let mut hits: HashMap<String, usize> = HashMap::new();
+        let mut tested_domains: Vec<String> = Vec::new();
+        let mut excluded_domains: Vec<String> = Vec::new();
+
+        screen.add_info_line(&format!("  domains: 0/{sample} tested, 0 excluded"));
+
+        for domain in &candidates {
+            if tested_domains.len() >= sample {
+                break;
+            }
+
+            // Resolve
+            let ips = match dns::resolve_domain(domain, dns_mode).await {
+                Ok(r) => r.ips,
+                Err(_) => {
+                    excluded_domains.push(domain.to_string());
+                    screen.update_info_line(&format!(
+                        "  domains: {}/{sample} tested, {} excluded",
+                        tested_domains.len(),
+                        excluded_domains.len(),
+                    ));
+                    continue;
+                }
+            };
+
+            // Add routes for this domain's IPs
+            if let Some(v) = via {
+                v.add_routes(&ips).await;
+            }
+
+            screen.begin_progress_with_prefix(corpus.len() as u64, domain);
+
+            let (scan_results, _stats) = run_parallel(RunParams {
+                config: &config,
+                chains: &chains,
+                filter_mark: &prereq.filter_mark,
+                domain,
+                protocol,
+                strategies: &corpus,
+                ips: &ips,
+                multi: Some(screen.multi()),
+                external_pb: Some(screen.pb()),
+                mode: HttpTestMode::Standard,
+                deadline: None,
+                success_sink: None,
+                completed: None,
+            })
+            .await;
+
+            screen.finish_progress();
+
+            // Remove routes for this domain's IPs
+            if let Some(v) = via {
+                v.remove_routes(&ips).await;
+            }
+
+            let working: Vec<&Vec<String>> = scan_results
+                .iter()
+                .filter(|r| matches!(r.result, TaskResult::Success { .. }))
+                .map(|r| &r.strategy_args)
+                .collect();
+
+            if working.is_empty() {
+                excluded_domains.push(domain.to_string());
+                screen.update_info_line(&format!(
+                    "  domains: {}/{sample} tested, {} excluded",
+                    tested_domains.len(),
+                    excluded_domains.len(),
+                ));
+                continue;
+            }
+
+            tested_domains.push(domain.to_string());
+            screen.update_info_line(&format!(
+                "  domains: {}/{sample} tested, {} excluded",
+                tested_domains.len(),
+                excluded_domains.len(),
+            ));
+
+            for args in &working {
+                *hits.entry(args.join(" ")).or_insert(0) += 1;
+            }
+        }
+
+        screen.finish_info();
+
+        if tested_domains.is_empty() {
+            screen.println(&format!(
+                "  {}",
+                style("no domains with working strategies").yellow()
+            ));
+            results.push(UniversalProtocolData {
+                protocol,
+                strategies: vec![],
+                tested_domains,
+                excluded_domains,
+            });
+            continue;
+        }
+
+        // Sort by coverage descending
+        let ranked = report::rank_by_coverage(hits);
+
+        screen.println(&format!(
+            "  Result: {} strategies across {} domains ({} excluded)",
+            style(ranked.len()).bold(),
+            style(tested_domains.len()).green(),
+            excluded_domains.len(),
+        ));
+
+        results.push(UniversalProtocolData {
+            protocol,
+            strategies: ranked,
+            tested_domains,
+            excluded_domains,
+        });
+    }
+
+    // Summary
+    screen.newline();
+    screen.println(&ui::section("Universal scan summary"));
+
+    for res in &results {
+        let tested = res.tested_domains.len();
+        if res.strategies.is_empty() {
+            screen.println(&format!(
+                "  {}: {}",
+                res.protocol,
+                style("no strategies found").red(),
+            ));
+        } else {
+            let best_hits = res.strategies.first().map(|(_, c)| *c).unwrap_or(0);
+            let perfect_count = res.strategies.iter().filter(|(_, c)| *c == tested).count();
+            screen.println(&format!(
+                "  {}: {} strategies, best coverage {}/{} domains, {} with 100%",
+                res.protocol,
+                style(res.strategies.len()).bold(),
+                style(best_hits).green().bold(),
+                tested,
+                style(perfect_count).green().bold(),
+            ));
+        }
+    }
+
+    // Save report
+    let report = report::build_universal_report(sample, &results);
+    let json = serde_json::to_string_pretty(&report).expect("report serialization");
+
+    // Save artifacts BEFORE writing to stdout — stdout may break (pipe closed)
+    let path = output
+        .map(String::from)
+        .unwrap_or_else(|| super::default_report_path("universal.json"));
+
+    match std::fs::write(&path, &json) {
+        Ok(()) => {
+            blockcheckw::system::elevate::chown_to_caller(&path);
+            screen.println(&format!(
+                "  {} JSON report → {}",
+                style("OK").green().bold(),
+                style(&path).cyan(),
+            ));
+        }
+        Err(e) => {
+            screen.println(&format!(
+                "  {} failed to write report: {e}",
+                style("ERROR:").red().bold(),
+            ));
+        }
+    }
+
+    // Save cleaned domain list (original minus all excluded domains)
+    if let Some(cleaned) = report::build_cleaned_domain_list(&all_domains, &results) {
+        let base = domain_list.strip_suffix(".cleaned").unwrap_or(domain_list);
+        let cleaned_path = format!("{base}.cleaned");
+        let excluded_count = results
+            .iter()
+            .flat_map(|r| &r.excluded_domains)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        match std::fs::write(&cleaned_path, &cleaned) {
+            Ok(()) => {
+                blockcheckw::system::elevate::chown_to_caller(&cleaned_path);
+                screen.println(&format!(
+                    "  {} cleaned domain list ({} excluded) → {}",
+                    style("OK").green().bold(),
+                    excluded_count,
+                    style(&cleaned_path).cyan(),
+                ));
+            }
+            Err(e) => {
+                screen.println(&format!(
+                    "  {} failed to write cleaned list: {e}",
+                    style("ERROR:").red().bold(),
+                ));
+            }
+        }
+    }
+
+    // JSON to stdout (for pipe support) — after artifacts are saved
+    super::print_stdout_graceful(&json, &screen);
+    screen.newline();
+
+    // Hint for next step
+    let has_strategies = results.iter().any(|r| !r.strategies.is_empty());
+    if has_strategies {
+        let example_domain = results
+            .iter()
+            .find_map(|r| r.tested_domains.first())
+            .map(|s| s.as_str())
+            .unwrap_or("<domain>");
+        screen.println(&format!(
+            "\n{}\n",
+            style(super::check_hint(&path, example_domain))
+                .yellow()
+                .bold()
+        ));
+    }
+
+    // Cleanup routes
+    if let Some(v) = via {
+        v.cleanup().await;
+    }
+    rules::drop_chains(&SystemIpt, &chains.marker()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #68 fix round 1: то же самое, что `scan_core_config`'s test — значение
+    /// `--profiles-per-instance` не должно теряться по дороге до `CoreConfig`.
+    #[test]
+    fn profiles_per_instance_reaches_core_config() {
+        let config = universal_core_config(8, 256);
+        assert_eq!(config.profiles_per_instance, 256);
+        assert_eq!(config.worker_count, 8);
+        assert_ne!(
+            config.profiles_per_instance,
+            CoreConfig::default().profiles_per_instance,
+            "тест бесполезен, если переданное значение совпадает с дефолтом"
+        );
+    }
+}
