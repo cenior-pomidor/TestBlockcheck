@@ -3,7 +3,34 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-pub const FILES: [&str; 3] = ["service.log", "nfqws2.log", "auto.log"];
+pub const FILES: [&str; 4] = ["service.log", "nfqws2.log", "nfqws2-debug.log", "auto.log"];
+/// Файлы, которые пишет nfqws2 (`--debug=@…`, `--hostlist-auto-debug=…`).
+pub const NFQWS2_FILES: [&str; 3] = ["nfqws2.log", "nfqws2-debug.log", "auto.log"];
+
+/// Обрезать файл, открытый другим процессом на дозапись: на месте, без подмены.
+pub fn trim_in_place(path: &Path, max_kb: u32) -> io::Result<()> {
+    let limit = max_kb as usize * 1024;
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if data.len() <= limit {
+        return Ok(());
+    }
+    let start = data.len() - limit / 2;
+    let start = data[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| start + i + 1)
+        .unwrap_or(data.len());
+    // Тот же inode: открыть с усечением и записать хвост. nfqws2 пишет с O_APPEND.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(&data[start..])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -206,6 +233,25 @@ mod tests {
         std::fs::write(&small, "a\n").unwrap();
         trim(&small, 16).unwrap();
         assert_eq!(std::fs::read_to_string(&small).unwrap(), "a\n");
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    /// Ревью 2а, Important 4: файлы nfqws2 держит открытыми — обрезать на месте, без
+    /// подмены файла (иначе nfqws2 пишет в удалённый inode).
+    #[test]
+    fn trim_in_place_keeps_the_same_file() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmp("inplace");
+        let p = d.join("nfqws2.log");
+        let text: String = (0..3000).map(|i| format!("line {i:05}\n")).collect();
+        std::fs::write(&p, &text).unwrap();
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        trim_in_place(&p, 16).unwrap();
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino, "файл подменён");
+        assert!(after.len() <= 16 * 1024 / 2 + 16);
+        assert!(after.starts_with("line ") && after.ends_with("line 02999\n"));
+        assert!(NFQWS2_FILES.contains(&"nfqws2-debug.log"));
         std::fs::remove_dir_all(d).ok();
     }
 

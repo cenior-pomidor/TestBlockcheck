@@ -18,6 +18,8 @@ pub const MAX_FAILS: u32 = 5;
 pub const FAIL_PAUSE: Duration = Duration::from_secs(60);
 pub const ROLLBACK_WINDOW: Duration = Duration::from_secs(10);
 pub const STABLE_POLLS: u32 = 2;
+/// Раз в сколько тиков (по 5 с) обрезать журналы nfqws2: минута.
+pub const LOG_TRIM_TICKS: u64 = 12;
 
 pub trait Engine {
     async fn dry_run(&self, args: &[String]) -> Result<(), String>;
@@ -106,6 +108,10 @@ pub struct Supervisor<E, F, P> {
     running: Option<Running>,
     fails: u32,
     resumed_ssid: Option<String>,
+    ticks: u64,
+    /// Последние предупреждения о данных по источнику — пишутся в журнал только новые.
+    warned_settings: Vec<String>,
+    warned_networks: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -140,6 +146,9 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             running: None,
             fails: 0,
             resumed_ssid: None,
+            ticks: 0,
+            warned_settings: Vec::new(),
+            warned_networks: Vec::new(),
         };
         sup.write_desired();
         sup
@@ -228,6 +237,17 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
     }
 
     pub async fn tick(&mut self, now: Instant) {
+        self.ticks += 1;
+        if self.ticks.is_multiple_of(LOG_TRIM_TICKS) {
+            let (settings, _) = self.store.settings();
+            self.journal.max_kb = settings.log_max_kb;
+            for f in super::logs::NFQWS2_FILES {
+                let p = self.journal.dir.join(f);
+                if let Err(e) = super::logs::trim_in_place(&p, settings.log_max_kb) {
+                    tracing::warn!(error = %e, file = f, "не удалось обрезать журнал");
+                }
+            }
+        }
         if self.probe.neighbour_active() {
             if self.state != State::BlockedNeighbour {
                 self.halt().await;
@@ -346,19 +366,24 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             .await;
     }
 
-    fn saved(&self) -> Vec<(String, String)> {
-        let (nets, warns) = self.store.networks();
-        for w in warns {
-            self.log(EventKind::Error, Level::Error, &w);
+    /// Записать предупреждения, которых не было в прошлый раз.
+    fn warn_new(&self, before: &[String], now: &[String]) {
+        for w in now.iter().filter(|w| !before.contains(w)) {
+            self.log(EventKind::Error, Level::Error, w);
         }
+    }
+
+    fn saved(&mut self) -> Vec<(String, String)> {
+        let (nets, warns) = self.store.networks();
+        self.warn_new(&self.warned_networks, &warns);
+        self.warned_networks = warns;
         nets.into_iter().map(|n| (n.key, n.strategy)).collect()
     }
 
     async fn decide_and_act(&mut self, now: Instant) -> Result<(), String> {
         let (settings, warns) = self.store.settings();
-        for w in warns {
-            self.log(EventKind::Error, Level::Error, &w);
-        }
+        self.warn_new(&self.warned_settings, &warns);
+        self.warned_settings = warns;
         let home = self.store.home();
         let saved = self.saved();
         let net = self
@@ -1104,6 +1129,38 @@ mod tests {
             e.sup.tick(at(&e, t)).await;
         }
         assert_eq!(e.sup.status().state, "running");
+    }
+
+    /// Ревью 2а, Important 4: журналы nfqws2 обрезаются по LOG_MAX_KB раз в минуту.
+    #[tokio::test]
+    async fn nfqws2_logs_are_trimmed() {
+        let mut e = env("trim", |s| set(s, "LOG_MAX_KB", "64"));
+        let p = e.sup.store.layout.logs_dir().join("nfqws2.log");
+        std::fs::write(&p, "x".repeat(200 * 1024) + "\n").unwrap();
+        for t in 0..13 {
+            e.sup.tick(at(&e, t * 5)).await;
+        }
+        assert!(
+            std::fs::metadata(&p).unwrap().len() <= 64 * 1024,
+            "не обрезан"
+        );
+    }
+
+    /// Ревью 2а, Important 5: одна битая строка — одна запись в журнале, а не каждые 5 с.
+    #[tokio::test]
+    async fn data_warnings_are_logged_once() {
+        let mut e = env("warn-once", |s| {
+            let mut t = std::fs::read_to_string(s.layout.settings_file()).unwrap();
+            t.push_str("мусор\n");
+            std::fs::write(s.layout.settings_file(), t).unwrap();
+            std::fs::write(s.layout.networks_file(), "битая строка\n").unwrap();
+        });
+        for t in [0, 5, 10, 15] {
+            e.sup.tick(at(&e, t)).await;
+        }
+        let log = log(&e);
+        assert_eq!(log.matches("settings.conf").count(), 1, "{log}");
+        assert_eq!(log.matches("networks.tsv").count(), 1, "{log}");
     }
 
     #[tokio::test]
