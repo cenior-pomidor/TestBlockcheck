@@ -84,14 +84,7 @@ impl SystemProfile {
             })
             .unwrap_or(0.0);
 
-        // min: at least 4, scale with cores
-        let estimated_min = 4usize.max(cpu_cores);
-        // Round down to nearest power of 2 for clean levels
-        let estimated_min = 1 << (usize::BITS - 1 - estimated_min.leading_zeros());
-        // `peak_mem_mb` измеряет каждый уровень бенчмарка по факту, не по догадке
-        let estimated_max = (cpu_cores * 64).min(1024).max(estimated_min);
-        // Round down to nearest power of 2
-        let estimated_max = 1 << (usize::BITS - 1 - estimated_max.leading_zeros());
+        let (estimated_min, estimated_max) = estimate_range(cpu_cores);
 
         Self {
             cpu_cores,
@@ -129,6 +122,21 @@ impl SystemProfile {
             self.estimated_max,
         )
     }
+}
+
+/// Диапазон уровней замера по числу ядер: степени двойки.
+fn estimate_range(cpu_cores: usize) -> (usize, usize) {
+    // min: at least 4, scale with cores
+    let estimated_min = 4usize.max(cpu_cores);
+    // Round down to nearest power of 2 for clean levels
+    let estimated_min = 1 << (usize::BITS - 1 - estimated_min.leading_zeros());
+    // `peak_mem_mb` измеряет каждый уровень бенчмарка по факту, не по догадке
+    let estimated_max = (cpu_cores * 64).min(1024).max(estimated_min);
+    // Round down to nearest power of 2
+    let estimated_max: usize = 1 << (usize::BITS - 1 - estimated_max.leading_zeros());
+    // Потолок — номера стратегии в метке (1…254): больше воркеров одному плану не дать.
+    let ceiling = crate::config::MAX_PROFILES_PER_INSTANCE;
+    (estimated_min.min(ceiling), estimated_max.min(ceiling))
 }
 
 pub fn default_max_workers() -> usize {
@@ -317,7 +325,7 @@ pub async fn run_benchmark(
     let header = if raw {
         format!(
             "{}\n\
-             domain={domain}  protocol={protocol}  corpus={corpus_size}  time_per_level={time_per_level}s  max_workers={max_workers}",
+             domain={domain}  protocol={protocol}  corpus={corpus_size}  time_per_level={time_per_level}s  max_workers={capped_max_workers}",
             profile.format_raw(),
         )
     } else {
@@ -499,6 +507,16 @@ mod tests {
     }
 
     use super::*;
+
+    /// Приёмка на телефоне: на 8 ядрах шапка писала «8 - 512 workers», а уровни шли до
+    /// 254 — больше номеров стратегии в метке нет. Оценка не выходит за этот потолок.
+    #[test]
+    fn estimated_range_never_exceeds_the_mark_ceiling() {
+        assert_eq!(estimate_range(8), (8, 254));
+        assert_eq!(estimate_range(2), (4, 128));
+        let (_, max) = estimate_range(64);
+        assert_eq!(max, crate::config::MAX_PROFILES_PER_INSTANCE);
+    }
 
     /// Приёмка: рекомендация звала бинарь старым именем.
     #[test]
