@@ -3,6 +3,8 @@ import { showStatus } from './status.js';
 import { showStrategies } from './strategies.js';
 import { showNetworks } from './networks.js';
 import { showLists } from './lists.js';
+import { showLogs } from './logs.js';
+import { showSettings } from './settings.js';
 
 const tabs = [];
 
@@ -36,6 +38,8 @@ registerTab('status', 'Состояние', showStatus);
 registerTab('strategies', 'Стратегии', showStrategies);
 registerTab('networks', 'Сети', showNetworks);
 registerTab('lists', 'Списки', showLists);
+registerTab('logs', 'Журналы', showLogs);
+registerTab('settings', 'Настройки', showSettings);
 
 function start() {
   const nav = document.getElementById('tabs');

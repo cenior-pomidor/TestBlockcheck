@@ -62,3 +62,8 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.4 ui-monospac
 .item:first-of-type { border-top: 0; }
 .toggle { display: flex; align-items: center; gap: 8px; margin: 6px 0 0; }
 .toggle input { width: auto; }
+.setting { padding: 8px 0; border-top: 1px solid var(--line); }
+.setting:first-child { border-top: 0; }
+.setting > label { display: block; }
+.field { display: flex; gap: 8px; margin-top: 4px; }
+.field input { flex: 1; }
