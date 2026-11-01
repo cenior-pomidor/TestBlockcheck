@@ -111,7 +111,8 @@ jobs:
           unzip -l "$z"
           for f in module.prop customize.sh service.sh uninstall.sh bin/bcw bin/nfqws2 \
                    lua/zapret-lib.lua lua/zapret-antidpi.lua lua/zapret-auto.lua \
-                   strategies/default.conf defaults/calls-bypass.conf; do
+                   strategies/default.conf defaults/calls-bypass.conf \
+                   webroot/index.html webroot/js/app.js webroot/js/bridge.js webroot/icon.png; do
             unzip -l "$z" | grep -q " $f$" || { echo "::error::нет $f"; exit 1; }
           done
           unzip -l "$z" | grep -Eq ' (tests|tools)/' && { echo "::error::в архиве tests/ или tools/"; exit 1; } || true
