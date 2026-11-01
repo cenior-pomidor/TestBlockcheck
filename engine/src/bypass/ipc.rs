@@ -89,6 +89,32 @@ async fn connect(name: &str) -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::from_std(s)
 }
 
+/// Как `handle_conn`, но сначала спросить `allowed` про uid собеседника (`SO_PEERCRED`);
+/// отказ — ответ «только root» без вызова `f`.
+pub async fn handle_conn_checked<F, Fut>(
+    stream: tokio::net::UnixStream,
+    allowed: impl Fn(Option<u32>) -> bool,
+    f: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(Result<Request, String>) -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
+    let uid = stream.peer_cred().ok().map(|c| c.uid());
+    if allowed(uid) {
+        handle_conn(stream, f).await
+    } else {
+        handle_conn(stream, |_| async {
+            Response {
+                ok: false,
+                error: Some("служба принимает команды только от root".into()),
+                status: None,
+            }
+        })
+        .await
+    }
+}
+
 /// Запрос службе по имени сокета.
 pub async fn call_at(name: &str, req: &Request, timeout: Duration) -> Result<Response, CallError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -174,6 +200,33 @@ mod tests {
         server.await.unwrap();
         assert!(r.ok);
         assert_eq!(r.status.unwrap().state, "running");
+    }
+
+    /// Ревью 2а, Important 6: у абстрактного сокета нет прав файла — проверяем uid.
+    #[tokio::test]
+    async fn foreign_uid_is_refused() {
+        let name = format!("bcw.svc.uid.{}", std::process::id());
+        let listener = bind(&name).unwrap();
+        let me = unsafe { libc::geteuid() };
+        let server = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            handle_conn_checked(
+                s,
+                move |uid| {
+                    assert_eq!(uid, Some(me), "uid собеседника");
+                    false
+                },
+                |_| async { panic!("запрос чужого uid выполнен") },
+            )
+            .await
+            .unwrap();
+        });
+        let r = call_at(&name, &Request::Stop, Duration::from_secs(2))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("root"));
     }
 
     #[tokio::test]

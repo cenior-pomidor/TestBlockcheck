@@ -53,7 +53,7 @@ pub async fn run(boot: bool) -> ! {
             conn = listener.accept() => {
                 let Ok((stream, _)) = conn else { continue };
                 let sup_ref = &mut sup;
-                let _ = ipc::handle_conn(stream, |req| async move {
+                let _ = ipc::handle_conn_checked(stream, |uid| uid == Some(0), |req| async move {
                     match req {
                         Err(e) => Response { ok: false, error: Some(e), status: None },
                         Ok(r) => match r.command() {
