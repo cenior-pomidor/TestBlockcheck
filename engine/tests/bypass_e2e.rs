@@ -45,8 +45,8 @@ async fn ours_everywhere() -> Vec<String> {
     out
 }
 
-/// Пакеты первого правила цепочки `dpi_post`.
-async fn first_rule_packets(chain: &str) -> Option<u64> {
+/// Пакеты правила `n` (с 1) цепочки.
+async fn rule_packets(chain: &str, n: usize) -> Option<u64> {
     let out = run_process(
         &[
             "iptables", "-w", "-t", "mangle", "-L", chain, "-v", "-x", "-n",
@@ -57,11 +57,56 @@ async fn first_rule_packets(chain: &str) -> Option<u64> {
     .ok()?;
     out.stdout
         .lines()
-        .nth(2)?
+        .nth(1 + n)?
         .split_whitespace()
         .next()?
         .parse()
         .ok()
+}
+
+async fn first_rule_packets(chain: &str) -> Option<u64> {
+    rule_packets(chain, 1).await
+}
+
+/// Ревью 2а, Critical 1: пакет, выпущенный nfqws2 (метка 0x40000000), возвращается из
+/// `dpi_post` третьим правилом — раньше исключений интерфейсов и очереди, — а метку с него
+/// снимает `dpi_unmark`.
+#[tokio::test]
+async fn nfqws2_packets_return_before_queue_and_are_unmarked_after() {
+    if !is_root() {
+        eprintln!("SKIPPED: requires root");
+        return;
+    }
+    let _k = KERNEL.lock().await;
+    // Одна UDP-датаграмма с меткой nfqws2 и без ответа: считаются только её проходы.
+    let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dst = rx.local_addr().unwrap();
+    let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mark: libc::c_int = 0x4000_0000;
+    let rc = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::setsockopt(
+            tx.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &mark as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_MARK");
+    rules::apply(&SystemIpt, &params()).await.expect("apply");
+    tx.send_to(b"x", dst).unwrap();
+    let returned = rule_packets(POST, 3).await;
+    let lo_excluded = rule_packets(POST, 4).await;
+    let unmarked = rule_packets("dpi_unmark", 2).await;
+    rules::remove(&SystemIpt).await;
+    assert_eq!(returned, Some(1), "пакет nfqws2 не вернулся по метке");
+    assert_eq!(
+        lo_excluded,
+        Some(0),
+        "пакет nfqws2 прошёл дальше возврата по метке"
+    );
+    assert_eq!(unmarked, Some(1), "метку не сняли");
 }
 
 #[tokio::test]
@@ -112,8 +157,9 @@ async fn ten_restarts_no_duplicates() {
     rules::remove(&SystemIpt).await;
     assert_eq!(count("-A POSTROUTING -j dpi_post"), 1, "{mangle}");
     assert_eq!(count("-A PREROUTING -j dpi_pre"), 1, "{mangle}");
+    assert_eq!(count("-A POSTROUTING -j dpi_unmark"), 1, "{mangle}");
     assert_eq!(
-        count("-A dpi_post -m mark --mark 0x40000000/0x40000000 -j MARK"),
+        count("-A dpi_unmark -m mark --mark 0x40000000/0x40000000 -j MARK"),
         1,
         "{mangle}"
     );

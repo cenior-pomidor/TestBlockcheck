@@ -17,18 +17,22 @@ pub const POST: &str = "dpi_post";
 pub const PRE: &str = "dpi_pre";
 pub const NAT: &str = "dpi_nat";
 pub const MQUIC: &str = "dpi_mquic";
+/// Снятие бита 30 (и `NAT_FIX`) — после `dpi_post`, когда пакеты nfqws2 уже вернулись.
+pub const UNMARK: &str = "dpi_unmark";
 
 /// Наши цепочки.
-pub const CHAINS: [(Table, &str); 4] = [
+pub const CHAINS: [(Table, &str); 5] = [
     (Table::Mangle, POST),
+    (Table::Mangle, UNMARK),
     (Table::Mangle, PRE),
     (Table::Nat, NAT),
     (Table::Filter, MQUIC),
 ];
 
 /// Переходы: таблица, стандартная цепочка, наша цепочка.
-const JUMPS: [(Table, &str, &str); 4] = [
+const JUMPS: [(Table, &str, &str); 5] = [
     (Table::Mangle, "POSTROUTING", POST),
+    (Table::Mangle, "POSTROUTING", UNMARK),
     (Table::Mangle, "PREROUTING", PRE),
     (Table::Nat, "POSTROUTING", NAT),
     (Table::Filter, "OUTPUT", MQUIC),
@@ -102,21 +106,27 @@ fn port_rules(out: &mut Vec<String>, chain: &str, proto: &str, dir: &str, list: 
 
 /// Цепочки и их содержимое, без переходов.
 pub fn batches(p: &RuleParams) -> Vec<IptBatch> {
-    let mut m = vec![format!(":{POST} - [0:0]"), format!(":{PRE} - [0:0]")];
+    let mut m = vec![
+        format!(":{POST} - [0:0]"),
+        format!(":{UNMARK} - [0:0]"),
+        format!(":{PRE} - [0:0]"),
+    ];
+    // `NAT_FIX` и сброс бита 30 — в своей цепочке: в `dpi_post` пакеты nfqws2 должны
+    // вернуться по метке ДО сброса (`_firewall_start` оригинала, POSTROUTING 2/3).
+    if p.nat_fix {
+        m.push(format!(
+            "-A {UNMARK} {PROCESSED} -j CONNMARK --set-xmark {RENAT}"
+        ));
+    }
+    m.push(format!(
+        "-A {UNMARK} {PROCESSED} -j MARK --set-xmark 0x0/0x40000000"
+    ));
     for c in [POST, PRE] {
         m.push(format!("-A {c} {ISOLATE_MARK}"));
         m.push(format!("-A {c} {ISOLATE_CONNMARK}"));
     }
     // Порядок строк важен: изоляция обеих цепочек первой, но `-A` к разным цепочкам
     // независимы, поэтому дальше пишем цепочки по очереди.
-    if p.nat_fix {
-        m.push(format!(
-            "-A {POST} {PROCESSED} -j CONNMARK --set-xmark {RENAT}"
-        ));
-    }
-    m.push(format!(
-        "-A {POST} {PROCESSED} -j MARK --set-xmark 0x0/0x40000000"
-    ));
     m.push(format!("-A {POST} {PROCESSED} -j RETURN"));
     m.push(format!("-A {PRE} {PROCESSED} -j RETURN"));
     for i in IFACE_EXCLUDE {
@@ -282,7 +292,18 @@ pub async fn apply<R: IptRun>(r: &R, p: &RuleParams) -> Result<(), BlockcheckErr
             if jt != t {
                 continue;
             }
-            let pos = if t == Table::Mangle {
+            let pos = if ours == UNMARK {
+                // Сразу за переходом в `dpi_post`, вставленным строкой выше в этой же транзакции.
+                let post = lines
+                    .iter()
+                    .find_map(|l: &String| {
+                        l.strip_prefix("-I POSTROUTING ")
+                            .and_then(|r| r.split_whitespace().next())
+                            .and_then(|n| n.parse::<usize>().ok())
+                    })
+                    .unwrap_or(1);
+                post + 1
+            } else if t == Table::Mangle {
                 let listing = r.cmd(t, &["-S".to_string(), builtin.to_string()]).await?;
                 jump_position(&listing.stdout)
             } else {
@@ -352,21 +373,28 @@ mod tests {
         }
     }
 
+    /// Ревью 2а, Critical 1: пакеты nfqws2 (бит 30) обязаны вернуться ДО того, как метку
+    /// сбросят, — иначе они снова уходят в очередь. Сброс — в своей цепочке за `dpi_post`.
     #[test]
-    fn processed_mark_handled_right_after_isolation() {
+    fn processed_mark_returns_right_after_isolation() {
         let post = chain(&p(), Table::Mangle, POST);
-        assert_eq!(
-            post[2],
-            format!("{PROCESSED} -j CONNMARK --set-xmark {RENAT}"),
-            "NAT_FIX включён по умолчанию"
+        assert_eq!(post[2], format!("{PROCESSED} -j RETURN"));
+        assert!(
+            !post
+                .iter()
+                .any(|l| l.contains("CONNMARK") || l.contains("--set-xmark")),
+            "{post:#?}"
         );
-        assert_eq!(
-            post[3],
-            format!("{PROCESSED} -j MARK --set-xmark 0x0/0x40000000")
-        );
-        assert_eq!(post[4], format!("{PROCESSED} -j RETURN"));
         let pre = chain(&p(), Table::Mangle, PRE);
         assert_eq!(pre[2], format!("{PROCESSED} -j RETURN"));
+        let un = chain(&p(), Table::Mangle, UNMARK);
+        assert_eq!(
+            un,
+            vec![
+                format!("{PROCESSED} -j CONNMARK --set-xmark {RENAT}"),
+                format!("{PROCESSED} -j MARK --set-xmark 0x0/0x40000000"),
+            ]
+        );
     }
 
     #[test]
@@ -377,12 +405,10 @@ mod tests {
         let mut off = on.clone();
         off.nat_fix = false;
         assert!(lines(&off, Table::Nat).is_empty());
-        let post = chain(&off, Table::Mangle, POST);
         assert_eq!(
-            post[2],
-            format!("{PROCESSED} -j MARK --set-xmark 0x0/0x40000000")
+            chain(&off, Table::Mangle, UNMARK),
+            vec![format!("{PROCESSED} -j MARK --set-xmark 0x0/0x40000000")]
         );
-        assert_eq!(post[3], format!("{PROCESSED} -j RETURN"));
     }
 
     #[test]
@@ -570,7 +596,8 @@ mod tests {
                 *t == Table::Mangle && a[..2] == ["-D".to_string(), "POSTROUTING".to_string()]
             })
             .count();
-        assert_eq!(deletes, 4, "три успешных и одна неуспешная");
+        // Три успешных снятия `dpi_post`, одно неуспешное — и одно неуспешное `dpi_unmark`.
+        assert_eq!(deletes, 5);
         for (t, c) in CHAINS {
             assert!(
                 r.cmds()
