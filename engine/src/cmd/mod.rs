@@ -1,5 +1,6 @@
 pub mod benchmark;
 pub mod check;
+pub mod ctl;
 pub mod doctor;
 pub mod scan;
 pub mod status;

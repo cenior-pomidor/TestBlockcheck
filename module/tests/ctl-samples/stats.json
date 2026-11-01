@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "schema": 1,
+  "stats": {
+    "auto_added": 0,
+    "errors": 1,
+    "restarts": 1,
+    "starts": 1
+  }
+}

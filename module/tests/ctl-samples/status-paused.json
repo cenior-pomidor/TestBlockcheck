@@ -1,0 +1,10 @@
+{
+  "desired": "unknown",
+  "network_key": "wifi_Home",
+  "network_title": "Wi-Fi «Home»",
+  "ok": true,
+  "reason": "домашний Wi-Fi «Home»",
+  "schema": 1,
+  "state": "paused_home",
+  "strategy": null
+}

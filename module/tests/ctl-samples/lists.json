@@ -1,0 +1,27 @@
+{
+  "lists": [
+    {
+      "count": 375,
+      "name": "user"
+    },
+    {
+      "count": 0,
+      "name": "auto"
+    },
+    {
+      "count": 284,
+      "name": "exclude"
+    },
+    {
+      "count": 28418,
+      "name": "ipset"
+    },
+    {
+      "count": 646,
+      "name": "ipset_exclude"
+    }
+  ],
+  "mode": "auto",
+  "ok": true,
+  "schema": 1
+}

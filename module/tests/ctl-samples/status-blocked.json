@@ -1,0 +1,10 @@
+{
+  "desired": "unknown",
+  "network_key": "wifi_Home",
+  "network_title": "Wi-Fi «Home»",
+  "ok": true,
+  "reason": "включён nfqws2-android",
+  "schema": 1,
+  "state": "blocked_neighbour",
+  "strategy": null
+}

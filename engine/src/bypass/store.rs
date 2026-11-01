@@ -277,12 +277,16 @@ impl Store {
     }
 
     pub fn set_network(&self, net: &Network, strategy: &str) -> io::Result<()> {
+        self.set_network_entry(&net.key(), &net.title(), strategy)
+    }
+
+    /// Запись сети по ключу и подписи (из `ctl`, где известен только статус службы).
+    pub fn set_network_entry(&self, key: &str, title: &str, strategy: &str) -> io::Result<()> {
         let (mut nets, _) = self.networks();
-        let key = net.key();
         nets.retain(|n| n.key != key);
         nets.push(SavedNetwork {
-            key,
-            title: net.title(),
+            key: key.into(),
+            title: title.into(),
             strategy: strategy.into(),
         });
         self.save_networks(&nets)

@@ -272,6 +272,12 @@ enum Command {
     /// помеченных сокетов, DoH, соседи. JSON в stdout, таблица в stderr. Ничего не меняет.
     Doctor,
 
+    /// Команды для интерфейса модуля обхода: ответ — одна строка JSON. Требует root.
+    Ctl {
+        #[command(subcommand)]
+        cmd: cmd::ctl::CtlCmd,
+    },
+
     /// Служба модуля обхода (запускает service.sh модуля). Требует root.
     Svc {
         #[command(subcommand)]
@@ -511,6 +517,10 @@ async fn main() {
     // а замок, преflight и память прогона ему не нужны.
     if matches!(cli.command, Some(Command::Doctor)) {
         cmd::doctor::run_doctor_cmd().await;
+    }
+    if let Some(Command::Ctl { cmd }) = &cli.command {
+        blockcheckw::system::elevate::require_root();
+        cmd::ctl::run(cmd.clone()).await;
     }
     // Служба модуля: свой цикл, без замка поиска, preflight и памяти прогона.
     if let Some(Command::Svc { action }) = &cli.command {
@@ -917,6 +927,7 @@ async fn main() {
             }
             Some(Command::Doctor) => unreachable!("doctor обрабатывается до elevation"),
             Some(Command::Svc { .. }) => unreachable!("svc обрабатывается до elevation"),
+            Some(Command::Ctl { .. }) => unreachable!("ctl обрабатывается до elevation"),
             None => unreachable!("справка без команды печатается до elevation"),
         }
     }
