@@ -3,6 +3,7 @@
 //! Поведение повторяет nfqws2-android v2.0.4 (коммит `8e916c8`, MIT) — эталон, против
 //! которого сверяются тесты. Спецификация: `docs/superpowers/specs/2026-11-01-bcw-module-design.md`.
 
+pub mod args;
 pub mod layout;
 pub mod ports;
 pub mod preset;

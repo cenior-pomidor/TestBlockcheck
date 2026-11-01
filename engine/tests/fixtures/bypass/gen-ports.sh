@@ -8,6 +8,7 @@ for f in "$PRESETS"/*.conf; do
   name=$(basename "$f" .conf)
   for auto in 0 1; do for bq in 0 1; do for calls in 0 1; do
     (
+      set +eu  # код оригинала не рассчитан на nounset/errexit
       export MODDIR="$UP" CONFDIR="$(mktemp -d)"
       . "$UP/lib/common.sh"
       set_defaults >/dev/null 2>&1 || true
