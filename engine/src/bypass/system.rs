@@ -84,6 +84,16 @@ impl Engine for SystemEngine {
             .is_some_and(pid_alive)
     }
 
+    fn last_output(&self) -> String {
+        let tail = self
+            .proc
+            .as_ref()
+            .map(BackgroundProcess::stderr_tail)
+            .unwrap_or_default();
+        let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
+        lines[lines.len().saturating_sub(8)..].join(" | ")
+    }
+
     async fn stop(&mut self) {
         if let Some(mut p) = self.proc.take() {
             p.kill().await;

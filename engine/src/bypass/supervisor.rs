@@ -26,6 +26,8 @@ pub trait Engine {
     async fn spawn(&mut self, args: &[String]) -> Result<(), String>;
     fn alive(&mut self) -> bool;
     async fn stop(&mut self);
+    /// Последние строки вывода nfqws2 (причина падения).
+    fn last_output(&self) -> String;
 }
 
 pub trait Firewall {
@@ -315,6 +317,14 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
 
     async fn on_death(&mut self, now: Instant) {
         let Some(r) = self.running.take() else { return };
+        let out = self.engine.last_output();
+        if !out.is_empty() {
+            self.log(
+                EventKind::Error,
+                Level::Error,
+                &format!("nfqws2 завершился: {out}"),
+            );
+        }
         let (settings, _) = self.store.settings();
         if !r.good {
             if let Some(lg) = self.last_good().filter(|lg| lg.args != r.args) {
@@ -678,6 +688,7 @@ mod tests {
         dry_run_fail_if_contains: Option<String>,
         network: Option<Network>,
         neighbour: bool,
+        stderr: String,
     }
     type W = Arc<Mutex<World>>;
 
@@ -703,6 +714,9 @@ mod tests {
         }
         fn alive(&mut self) -> bool {
             self.0.lock().unwrap().alive
+        }
+        fn last_output(&self) -> String {
+            self.0.lock().unwrap().stderr.clone()
         }
         async fn stop(&mut self) {
             let mut w = self.0.lock().unwrap();
@@ -1161,6 +1175,21 @@ mod tests {
         let log = log(&e);
         assert_eq!(log.matches("settings.conf").count(), 1, "{log}");
         assert_eq!(log.matches("networks.tsv").count(), 1, "{log}");
+    }
+
+    /// Ревью 2а (Minor 11, повышен): причина падения nfqws2 попадает в журнал службы.
+    #[tokio::test]
+    async fn crash_reason_is_logged() {
+        let mut e = env("stderr", |_| {});
+        e.sup.tick(at(&e, 0)).await;
+        e.sup.tick(at(&e, 15)).await;
+        {
+            let mut w = e.w.lock().unwrap();
+            w.alive = false;
+            w.stderr = "lua: zapret-auto.lua:12: attempt to index nil".into();
+        }
+        e.sup.tick(at(&e, 20)).await;
+        assert!(log(&e).contains("attempt to index nil"), "{}", log(&e));
     }
 
     #[tokio::test]
