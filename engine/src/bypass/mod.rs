@@ -12,6 +12,7 @@ pub mod ports;
 pub mod preset;
 pub mod rules;
 pub mod settings;
+pub mod store;
 
 /// Каталог модуля на телефоне.
 pub const MODULE_DIR: &str = "/data/adb/modules/bcw";
