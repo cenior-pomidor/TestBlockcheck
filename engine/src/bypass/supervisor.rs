@@ -619,7 +619,13 @@ impl<E: Engine, F: Firewall, P: Probe> Supervisor<E, F, P> {
             }
             Command::HomeResume => {
                 if let State::PausedHome { ssid } = &self.state {
-                    self.resumed_ssid = Some(ssid.clone());
+                    let ssid = ssid.clone();
+                    self.log(
+                        EventKind::Resume,
+                        Level::Info,
+                        &format!("включено здесь: Wi-Fi «{ssid}»"),
+                    );
+                    self.resumed_ssid = Some(ssid);
                     self.state = State::Stopped;
                     self.decide_and_act(now).await?;
                 }
@@ -972,6 +978,11 @@ mod tests {
         assert_eq!(e.w.lock().unwrap().spawned.len(), 0);
         e.sup.command(Command::HomeResume, at(&e, 5)).await.unwrap();
         assert_eq!(e.sup.status().state, "running");
+        assert!(
+            log(&e).contains(" resume включено здесь: Wi-Fi «Home»"),
+            "кнопка видна в журнале: {}",
+            log(&e)
+        );
         // Ушёл и вернулся — снова пауза.
         e.w.lock().unwrap().network = Some(Network::Wifi {
             ssid: "Cafe".into(),
