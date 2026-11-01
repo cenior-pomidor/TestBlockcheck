@@ -23,13 +23,17 @@
 B=/data/adb/modules/bcw/bin/bcw
 ```
 
-1. **Подготовка.** В менеджере KernelSU **отключите** nfqws2-android (переключатель), затем
+1. **SSID (риск R1) — до установки.** На Wi-Fi: `su -c 'cmd wifi status'` — в выводе должна быть
+   строка `Wifi is connected to "<имя сети>"`. Пришлите вывод.
+2. **Установка.** В менеджере KernelSU **отключите** nfqws2-android (переключатель), затем
    «Установить из хранилища» → `bcw-module-v0.1.0.zip` → перезагрузка.
-2. **SSID (риск R1).** `su -c 'cmd wifi status'` на Wi-Fi — в выводе должна быть строка
-   `Wifi is connected to "<имя сети>"`. Пришлите вывод.
 3. **Служба.** `su -c "$B ctl status"` → `"state":"running"`, `"strategy":"default"`.
 4. **Обход.** rutracker.org открывается в браузере — на Wi-Fi и на мобильной сети.
-5. **Стратегии по сетям.** На Wi-Fi:
+5. **Пакеты nfqws2 не уходят в очередь повторно.** Откройте пару сайтов, затем
+   `su -c 'iptables -t mangle -L dpi_post -v -n | head -6'` — у третьего правила
+   (`mark match 0x40000000/0x40000000 … RETURN`) счётчик пакетов больше 0, и
+   `su -c 'iptables -t mangle -L dpi_unmark -v -n'` — счётчики больше 0.
+6. **Стратегии по сетям.** На Wi-Fi:
    ```
    su -c "$B ctl settings set NET_STRATEGY 1"
    su -c "$B ctl strategy apply alt --network"
@@ -37,26 +41,38 @@ B=/data/adb/modules/bcw/bin/bcw
    ```
    → `"strategy":"alt"`. Переключитесь на мобильную сеть, через ~10 с `ctl status` →
    `"strategy":"default"`; обратно на Wi-Fi → снова `alt`.
-6. **Пауза дома.** На домашнем Wi-Fi (подставьте имя сети):
+7. **Пауза дома.** На домашнем Wi-Fi (подставьте имя сети):
    ```
    su -c "$B ctl settings set HOME_WIFI 1"
    su -c "$B ctl home add 'Имя сети'"
    su -c "$B ctl status"
    ```
-   → `"state":"paused_home"`. Затем `su -c "$B ctl home resume"` → `"state":"running"`.
-7. **Сторож.** `su -c 'kill -9 $(pidof nfqws2)'`, через 10 с `ctl status` → `running`;
+   → `"state":"paused_home"`. `su -c "$B ctl home resume"` → `"state":"running"`.
+   Уйдите на мобильную сеть и вернитесь на домашний Wi-Fi → снова `paused_home`.
+8. **Стратегия с ошибкой — запасная.** Неверный ключ nfqws2 проверка отвергает, и обход
+   остаётся на рабочей стратегии:
+   ```
+   su -c "$B ctl settings set DEFAULT_STRATEGY no_such"
+   su -c "$B ctl status"
+   ```
+   → ответ `settings set` с `"warning"`, `ctl status` → `running` на `default`. Верните:
+   `su -c "$B ctl settings set DEFAULT_STRATEGY default"`. (Откат при падении nfqws2 в первые
+   10 с проверен тестами; вызвать такое падение на телефоне нарочно нечем.)
+9. **Сторож.** `su -c 'kill -9 $(pidof nfqws2)'`, через 10 с `ctl status` → `running`;
    `su -c "$B ctl logs service --tail 5"` → строка `restart сторож: …`.
-8. **Перезагрузка.** После перезагрузки `ctl status` → `running` без ваших действий.
-9. **Без дублей.** Трижды `su -c "$B ctl restart"`, затем
-   `su -c "iptables-save -t mangle | grep -c 'A POSTROUTING -j dpi_post'"` → `1`.
-   `su -c "$B ctl stop"` → `su -c "iptables-save | grep -c dpi_"` → `0`; `su -c "$B ctl start"`.
-10. **Поиск рядом с обходом.**
+10. **Перезагрузка.** После перезагрузки `ctl status` → `running` без ваших действий.
+11. **Без дублей.** `su -c "iptables-save | grep dpi_ | sort > /data/local/tmp/a"`, трижды
+    `su -c "$B ctl restart"`, `su -c "iptables-save | grep dpi_ | sort > /data/local/tmp/b"`,
+    `su -c "diff /data/local/tmp/a /data/local/tmp/b && echo без изменений"` → `без изменений`.
+    `su -c "$B ctl stop"` → `su -c "iptables-save | grep -c dpi_"` → `0`; `su -c "$B ctl start"`.
+12. **Поиск рядом с обходом.** Запомните `su -c 'pidof nfqws2'` и `ctl status`, затем
     ```
     su -c "$B -w 254 scan -d rutracker.org -p tls12 | $B check -d rutracker.org --take 3"
     ```
-    Во время прогона сайты через обход продолжают открываться; поиск находит стратегии.
-11. **Сосед.** (Необязательно.) Включите nfqws2-android и перезагрузитесь → `ctl status` →
+    Во время прогона сайты через обход открываются; поиск находит стратегии; после —
+    тот же pid обхода в `pidof nfqws2` (среди прочих) и `"state":"running"`.
+13. **Сосед.** (Необязательно.) Включите nfqws2-android и перезагрузитесь → `ctl status` →
     `"state":"blocked_neighbour"`; отключите его и перезагрузитесь снова.
 
-Что прислать: вывод шагов 2, 3, 5, 6, 7, 9 и `su -c "$B ctl logs service"`; где не так —
-что видели.
+Что прислать: вывод шагов 1, 3, 5, 6, 7, 8, 9, 11, 12 и `su -c "$B ctl logs service"`;
+где не так — что видели.
