@@ -36,4 +36,7 @@ let threw = false;
 try { editorToText({ ...get.fields, NFQWS_ARGS: 'a"b' }); } catch (_) { threw = true; }
 check(threw, 'кавычка в значении отвергается');
 check(editorToText({ NFQWS_ARGS: 'x\r\ny' }).includes('NFQWS_ARGS="x\ny"'), 'CRLF → LF');
+const { dedent } = await import('../../webroot/js/strategies.js');
+check(!/\n +--/.test(renderEditor(get)), 'отступы строк в редакторе убраны');
+check(dedent('a\n    b  ') === 'a\nb', 'dedent');
 done('test_strategies');

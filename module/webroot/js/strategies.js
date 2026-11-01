@@ -29,6 +29,11 @@ export function renderStrategies(list, status) {
   return `<div class="actions">${button('new', 'Новый')}</div><div class="list">${items.join('')}</div>`;
 }
 
+/** Отступы строк убираются: аргументы разделяются любыми пробелами, смысл не меняется. */
+export function dedent(v) {
+  return String(v || '').split('\n').map((l) => l.trim()).join('\n');
+}
+
 /** Редактор по ответу `ctl strategy get` или пустой (`null`) для новой стратегии. */
 export function renderEditor(s) {
   const isNew = !s;
@@ -37,7 +42,7 @@ export function renderEditor(s) {
     ? '<label>Имя новой стратегии<input name="name" autocomplete="off" spellcheck="false" placeholder="my-strategy"></label>'
     : `<h2>${esc(s.name)}${s.modified ? ' <span class="tag warn">изменён</span>' : ''}</h2>`;
   const areas = KEYS.map((k) => `<label>${esc(LABELS[k])} <small class="hint">${k}</small>`
-    + `<textarea name="${k}" spellcheck="false" autocapitalize="off" rows="4">${esc(fields[k] || '')}</textarea></label>`).join('');
+    + `<textarea name="${k}" spellcheck="false" autocapitalize="off" rows="4">${esc(dedent(fields[k]))}</textarea></label>`).join('');
   const acts = [button('save', 'Сохранить')];
   if (!isNew) {
     acts.push(button('apply-network', 'Для этой сети'), button('apply-default', 'По умолчанию'));
