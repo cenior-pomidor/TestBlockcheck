@@ -30,6 +30,7 @@ export function outcomeText(o) {
     if (o.rolled_back) return `Откат: ${o.rolled_back.reason ?? ''}`;
     if (o.saved_not_applied) return `Сохранено, не применено: обход ${o.saved_not_applied.state ?? ''}`;
   }
+  if (o && typeof o === 'object') return JSON.stringify(o);
   return String(o ?? '');
 }
 
@@ -137,6 +138,11 @@ export async function showSearch(root, toast) {
       ctl(cmd.searchStatus()), ctl(cmd.searchRuns()), readLists(),
     ]);
     if (!alive) return;
+    // Несохранённые правки списков переживают перерисовку (например, по окончании поиска).
+    for (const g of Object.keys(LISTS)) {
+      const ta = root.querySelector(`textarea[name="${g}"]`);
+      if (ta) lists[g] = ta.value;
+    }
     const state = st.ok && st.state ? st.state : null;
     const keepBase = root.querySelector('select[name="base"]')?.value;
     root.innerHTML = renderSearch({
@@ -150,6 +156,7 @@ export async function showSearch(root, toast) {
 
   function poll() {
     stopPoll();
+    if (!alive) return;
     timer = setInterval(async () => {
       const st = await ctl(cmd.searchStatus());
       if (!alive) return;
@@ -166,6 +173,7 @@ export async function showSearch(root, toast) {
     if (act('find')) {
       act('find').onclick = async () => {
         const r = await startSearch({ base: base(), netStrategy, confirmFn: (t) => globalThis.confirm(t) });
+        if (!alive) return;
         if (r === null) return;
         if (!r.ok) { toast(r.error || 'не удалось запустить поиск'); return; }
         await load();
@@ -175,6 +183,7 @@ export async function showSearch(root, toast) {
       act('stop').onclick = async () => {
         act('stop').disabled = true;
         const r = await ctl(cmd.searchStop(), { timeoutMs: LONG });
+        if (!alive) return;
         if (!r.ok) toast(r.error || 'не удалось остановить');
         await load();
       };
@@ -188,12 +197,14 @@ export async function showSearch(root, toast) {
           const path = await uploadText(ta.value.replace(/\r\n?/g, '\n'));
           r = await ctl(cmd.listSet(LISTS[g], path), { timeoutMs: LONG });
         } catch (e) { r = { ok: false, error: e.message }; }
+        if (!alive) return;
         toast(r.ok ? 'Сохранено' : r.error);
       };
     }
     root.querySelectorAll('[data-run]').forEach((b) => {
       b.onclick = async () => {
         const r = await ctl(cmd.searchReport(b.dataset.run));
+        if (!alive) return;
         if (!r.ok) { toast(r.error); return; }
         stopPoll();
         root.querySelector('#search-state').innerHTML = renderState(r.state);
