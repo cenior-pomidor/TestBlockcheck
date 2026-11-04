@@ -39,7 +39,38 @@ pub struct Preset {
     pub udp: String,
     pub ipset: String,
     pub custom: String,
+    /// Найденные поиском токены для групп YouTube / TLS / HTTP (сырые, необязательные).
+    pub found_youtube: String,
+    pub found_tls: String,
+    pub found_http: String,
     pub limits: PktOverrides,
+}
+
+/// Ключи пресета с найденными поиском токенами.
+pub const FOUND_KEYS: [&str; 3] = ["FOUND_YOUTUBE", "FOUND_TLS", "FOUND_HTTP"];
+
+/// Проверить значение `FOUND_*`: только токены `--…` стратегии, без служебных опций.
+pub fn check_found(value: &str) -> Result<(), String> {
+    const FORBIDDEN_EXACT: [&str; 1] = ["--new"];
+    const FORBIDDEN_PREFIX: [&str; 8] = [
+        "--filter-",
+        "--hostlist",
+        "--ipset",
+        "--qnum",
+        "--user",
+        "--debug",
+        "--lua-init",
+        "--new=",
+    ];
+    for tok in value.split_whitespace() {
+        if !tok.starts_with("--") {
+            return Err(format!("токен без «--»: {tok}"));
+        }
+        if FORBIDDEN_EXACT.contains(&tok) || FORBIDDEN_PREFIX.iter().any(|p| tok.starts_with(p)) {
+            return Err(format!("недопустимый токен в FOUND_*: {tok}"));
+        }
+    }
+    Ok(())
 }
 
 /// Ошибка разбора с номером строки (с 1).
@@ -199,6 +230,14 @@ pub fn parse_preset(text: &str) -> Result<Preset, PresetError> {
             "NFQWS_ARGS_UDP" => preset.udp = value.clone(),
             "NFQWS_ARGS_IPSET" => preset.ipset = value.clone(),
             "NFQWS_ARGS_CUSTOM" => preset.custom = value.clone(),
+            "FOUND_YOUTUBE" | "FOUND_TLS" | "FOUND_HTTP" => {
+                check_found(&value).map_err(|m| err(lineno, format!("{name}: {m}")))?;
+                match name {
+                    "FOUND_YOUTUBE" => preset.found_youtube = value.clone(),
+                    "FOUND_TLS" => preset.found_tls = value.clone(),
+                    _ => preset.found_http = value.clone(),
+                }
+            }
             _ => {}
         }
         if !KNOWN_VARS.contains(&name) {
@@ -318,5 +357,56 @@ mod tests {
         ] {
             assert_eq!(f[key].as_str().unwrap(), got, "{key}");
         }
+    }
+
+    #[test]
+    fn found_keys_parsed() {
+        let p = parse_preset(
+            "NFQWS_ARGS=\"--x\"\nFOUND_TLS=\"--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.found_tls,
+            "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls"
+        );
+        assert_eq!(p.found_youtube, "");
+        assert_eq!(p.found_http, "");
+    }
+
+    #[test]
+    fn found_absent_is_empty() {
+        let p = parse_preset(include_str!("../../../module/strategies/alt.conf")).unwrap();
+        assert_eq!(p.found_youtube, "");
+        assert_eq!(p.found_tls, "");
+        assert_eq!(p.found_http, "");
+    }
+
+    #[test]
+    fn check_found_rejects() {
+        for bad in [
+            "--new",
+            "--filter-tcp=443",
+            "--hostlist=/x",
+            "--hostlist-exclude=/x",
+            "--ipset=/x",
+            "--qnum=1",
+            "--user=root",
+            "--debug=1",
+            "--lua-init=@x",
+            "fake",
+        ] {
+            assert!(check_found(bad).is_err(), "{bad}");
+        }
+        assert!(check_found("").is_ok());
+        assert!(check_found(
+            "--payload=tls_client_hello --lua-desync=tcpseg:pos=0,midsld:ip_id=rnd:repeats=20"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_bad_found() {
+        let e = parse_preset("NFQWS_ARGS=\"--x\"\nFOUND_TLS=\"--new\"\n").unwrap_err();
+        assert_eq!(e.line, 2);
     }
 }
