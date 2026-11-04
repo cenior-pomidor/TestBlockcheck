@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Protocol;
 
 pub mod assemble;
+pub mod narrow;
 pub mod runs;
 
 /// Местное время без пояса (считает вызывающий).
@@ -25,7 +26,7 @@ pub enum Group {
     Youtube,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Proto {
     Tls13,
