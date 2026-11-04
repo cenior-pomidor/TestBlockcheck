@@ -9,6 +9,8 @@ pub mod network;
 pub mod nfqws2;
 pub mod persist;
 pub mod pipeline;
+pub mod search;
+
 pub mod strategy;
 pub mod system;
 pub mod ui;

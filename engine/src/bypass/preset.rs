@@ -161,6 +161,67 @@ fn pkt_value(line: usize, raw: &str) -> Result<u16, PresetError> {
     }
 }
 
+/// Прочитать значение в кавычках, начавшееся в строке `i` (`after` — текст после открывающей
+/// кавычки), и вернуть его вместе с номером последней строки значения. Границы присваивания
+/// для `parse_preset` и для `strip_assignments` определяются только здесь.
+fn scan_quoted(
+    lines: &[&str],
+    i: usize,
+    name: &str,
+    after: &str,
+) -> Result<(String, usize), PresetError> {
+    let mut acc = String::new();
+    let mut cur = after;
+    let mut j = i;
+    loop {
+        if let Some(pos) = cur.find('"') {
+            acc.push_str(&cur[..pos]);
+            let tail = cur[pos + 1..].trim();
+            if !tail.is_empty() && !tail.starts_with('#') {
+                return Err(err(j + 1, format!("лишнее после кавычки: {tail}")));
+            }
+            break;
+        }
+        acc.push_str(cur);
+        acc.push('\n');
+        j += 1;
+        if j >= lines.len() {
+            return Err(err(i + 1, format!("незакрытая кавычка у {name}")));
+        }
+        cur = lines[j];
+    }
+    Ok((acc, j))
+}
+
+/// Вычеркнуть присваивания ключей `keys` (включая многострочные значения), остальной текст
+/// оставить байт-в-байт. Границы присваиваний — те же, что у `parse_preset`.
+pub fn strip_assignments(text: &str, keys: &[&str]) -> Result<String, PresetError> {
+    let raw: Vec<&str> = text.split_inclusive('\n').collect();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let mut end = i;
+        let mut drop = false;
+        if !trimmed.starts_with('#') {
+            if let Some((name, rest)) = trimmed.split_once('=') {
+                if is_name(name) {
+                    if let Some(after) = rest.strip_prefix('"') {
+                        end = scan_quoted(&lines, i, name, after)?.1;
+                    }
+                    drop = keys.contains(&name);
+                }
+            }
+        }
+        if !drop {
+            raw[i..=end].iter().for_each(|l| out.push_str(l));
+        }
+        i = end + 1;
+    }
+    Ok(out)
+}
+
 /// Разобрать текст пресета.
 pub fn parse_preset(text: &str) -> Result<Preset, PresetError> {
     let mut preset = Preset::default();
@@ -197,27 +258,7 @@ pub fn parse_preset(text: &str) -> Result<Preset, PresetError> {
         }
         let (value, end_line) = if let Some(after) = rest.strip_prefix('"') {
             // Значение до закрывающей кавычки, возможно на следующих строках.
-            let mut acc = String::new();
-            let mut cur = after;
-            let mut j = i;
-            loop {
-                if let Some(pos) = cur.find('"') {
-                    acc.push_str(&cur[..pos]);
-                    let tail = cur[pos + 1..].trim();
-                    if !tail.is_empty() && !tail.starts_with('#') {
-                        return Err(err(j + 1, format!("лишнее после кавычки: {tail}")));
-                    }
-                    break;
-                }
-                acc.push_str(cur);
-                acc.push('\n');
-                j += 1;
-                if j >= lines.len() {
-                    return Err(err(lineno, format!("незакрытая кавычка у {name}")));
-                }
-                cur = lines[j];
-            }
-            (acc, j)
+            scan_quoted(&lines, i, name, after)?
         } else {
             let v = rest.split('#').next().unwrap_or("").trim();
             (v.trim_matches('\'').to_string(), i)
