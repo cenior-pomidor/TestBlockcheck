@@ -3,6 +3,7 @@
 
 use super::runs::DomainState;
 use super::{Group, Proto};
+use crate::bypass::preset::check_found;
 use crate::config::Protocol;
 use crate::strategy::generator::generate_strategies;
 use crate::strategy::rank::simplicity_key;
@@ -48,12 +49,14 @@ pub struct Corpus {
 }
 
 impl Corpus {
-    /// Набор из `strategy::generator`: строки аргументов через пробел.
+    /// Набор из `strategy::generator`: строки аргументов через пробел. Строки, которые нельзя
+    /// сохранить в `FOUND_*` (например, с `--lua-init`), отбрасываются.
     pub fn builtin() -> Self {
         let load = |p: Protocol| {
             generate_strategies(p)
                 .into_iter()
                 .map(|s| s.join(" "))
+                .filter(|s| check_found(s).is_ok())
                 .collect()
         };
         Corpus {
@@ -746,5 +749,14 @@ mod tests {
     fn builtin_corpus_nonempty() {
         let c = Corpus::builtin();
         assert!(!c.tls13.is_empty() && !c.tls12.is_empty() && !c.http.is_empty());
+    }
+
+    /// Любая стратегия набора сохраняема в `FOUND_*` (иначе её победа ломает сохранение).
+    #[test]
+    fn builtin_corpus_saveable() {
+        let c = Corpus::builtin();
+        for s in c.tls13.iter().chain(&c.tls12).chain(&c.http) {
+            assert!(crate::bypass::preset::check_found(s).is_ok(), "{s}");
+        }
     }
 }
