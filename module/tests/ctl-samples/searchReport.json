@@ -3,6 +3,44 @@
   "schema": 1,
   "state": {
     "base": "alt",
+    "check": [
+      {
+        "args": "--lua-desync=multisplit:pos=2",
+        "chain": "tls",
+        "full": 3,
+        "group": "youtube",
+        "median_pct": 91,
+        "picked": true,
+        "total": 3
+      },
+      {
+        "args": "--lua-desync=multidisorder:pos=1",
+        "chain": "tls",
+        "full": 1,
+        "group": "youtube",
+        "median_pct": null,
+        "picked": false,
+        "total": 3
+      },
+      {
+        "args": "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls",
+        "chain": "tls",
+        "full": 3,
+        "group": "general",
+        "median_pct": 100,
+        "picked": true,
+        "total": 3
+      },
+      {
+        "args": "--payload=http_req --lua-desync=fake:blob=fake_default_http",
+        "chain": "http",
+        "full": 2,
+        "group": "general",
+        "median_pct": 64,
+        "picked": true,
+        "total": 3
+      }
+    ],
     "domains": [
       {
         "block": "sni_blocked",
@@ -29,7 +67,7 @@
     "found": {
       "http": "--payload=http_req --lua-desync=fake:blob=fake_default_http",
       "tls": "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls",
-      "youtube": null
+      "youtube": "--lua-desync=multisplit:pos=2"
     },
     "id": "20261104-180000",
     "network_title": "Wi-Fi «Home»",
@@ -41,6 +79,43 @@
     "phase": "done",
     "pid": 7,
     "schema": 1,
-    "total": 12
+    "total": 12,
+    "verify": [
+      {
+        "domain": "www.youtube.com",
+        "group": "youtube",
+        "ok": false,
+        "proto": "tls13",
+        "round": 1
+      },
+      {
+        "domain": "rutracker.org",
+        "group": "general",
+        "ok": true,
+        "proto": "tls13",
+        "round": 1
+      },
+      {
+        "domain": "rutracker.org",
+        "group": "general",
+        "ok": true,
+        "proto": "http",
+        "round": 1
+      },
+      {
+        "domain": "rutracker.org",
+        "group": "general",
+        "ok": true,
+        "proto": "tls13",
+        "round": 2
+      },
+      {
+        "domain": "rutracker.org",
+        "group": "general",
+        "ok": true,
+        "proto": "http",
+        "round": 2
+      }
+    ]
   }
 }

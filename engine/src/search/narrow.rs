@@ -1,7 +1,7 @@
 //! Базовая проверка, сужение набора стратегий, `check` и выбор лучшей (спека §4, шаги 2-5).
 #![allow(async_fn_in_trait)]
 
-use super::runs::DomainState;
+use super::runs::{CheckRow, DomainState, Phase};
 use super::{Group, Proto};
 use crate::bypass::preset::check_found;
 use crate::config::Protocol;
@@ -71,6 +71,8 @@ pub trait Control {
     fn stopped(&self) -> bool;
     fn expired(&self) -> bool;
     fn report(&self, d: &[DomainState], done: u64, total: u64);
+    /// Смена шага внутри группы (сужение ↔ `check`).
+    fn phase(&self, p: Phase);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +82,8 @@ pub struct GroupResult {
     pub blocked: Vec<(String, Proto)>,
     pub tls: Option<String>,
     pub http: Option<String>,
+    /// Цифры `check` по цепочкам (`tls`, затем `http`).
+    pub check: Vec<CheckRow>,
 }
 
 impl Block {
@@ -113,19 +117,21 @@ struct Stage {
 
 enum Chain {
     Stopped,
-    Done(Option<String>),
+    Done(Option<String>, Vec<Confirmed>),
 }
 
 /// Одна цепочка: первая ступень берёт `full`, остальные - прошедших предыдущую.
 /// Затем `check` первых 10 по простоте на всех доменах цепочки и `pick`.
 async fn run_chain<P: Probe>(
     p: &P,
+    group: Group,
     ctl: &dyn Control,
     states: &mut [DomainState],
     stages: &[Stage],
     full: &[String],
 ) -> Chain {
     let mut cur: Option<Vec<String>> = None;
+    ctl.phase(Phase::Narrow { group });
     for st in stages {
         if ctl.stopped() {
             return Chain::Stopped;
@@ -145,11 +151,11 @@ async fn run_chain<P: Probe>(
         let empty = found.is_empty();
         cur = Some(found);
         if empty {
-            return Chain::Done(None);
+            return Chain::Done(None, Vec::new());
         }
     }
     let Some(mut survivors) = cur else {
-        return Chain::Done(None);
+        return Chain::Done(None, Vec::new());
     };
     if ctl.stopped() {
         return Chain::Stopped;
@@ -157,8 +163,27 @@ async fn run_chain<P: Probe>(
     survivors.sort_by_key(|s| simplicity_key(s));
     survivors.truncate(CHECK_TOP);
     let pairs: Vec<(String, Proto)> = stages.iter().map(|s| (s.domain.clone(), s.proto)).collect();
+    ctl.phase(Phase::Check { group });
     let confirmed = p.confirm(&pairs, &survivors).await;
-    Chain::Done(pick(&confirmed))
+    Chain::Done(pick(&confirmed), confirmed)
+}
+
+/// Строки `check` одной цепочки; `picked` — у выбранной.
+fn check_rows(group: Group, chain: &str, c: &[Confirmed], pick: Option<&str>) -> Vec<CheckRow> {
+    c.iter()
+        .map(|x| CheckRow {
+            group,
+            chain: chain.into(),
+            args: x.args.clone(),
+            full: x.full,
+            total: x.total,
+            median_pct: x
+                .median_share
+                .filter(|m| m.is_finite())
+                .map(|m| (m * 100.0).round().clamp(0.0, u32::MAX as f64) as u32),
+            picked: pick == Some(x.args.as_str()),
+        })
+        .collect()
 }
 
 pub async fn search_group<P: Probe>(
@@ -250,24 +275,32 @@ pub async fn search_group<P: Probe>(
         blocked,
         tls: None,
         http: None,
+        check: Vec::new(),
     };
     if !tls_stages.is_empty() {
-        match run_chain(p, ctl, &mut states, &tls_stages, tls_full).await {
+        match run_chain(p, group, ctl, &mut states, &tls_stages, tls_full).await {
             Chain::Stopped => {
                 out.domains = states;
                 return out;
             }
-            Chain::Done(r) => out.tls = r,
+            Chain::Done(r, c) => {
+                out.check.extend(check_rows(group, "tls", &c, r.as_deref()));
+                out.tls = r;
+            }
         }
     }
     if !http_stages.is_empty() {
-        match run_chain(p, ctl, &mut states, &http_stages, &corpus.http).await {
+        match run_chain(p, group, ctl, &mut states, &http_stages, &corpus.http).await {
             Chain::Stopped => {
                 out.tls = None;
                 out.domains = states;
                 return out;
             }
-            Chain::Done(r) => out.http = r,
+            Chain::Done(r, c) => {
+                out.check
+                    .extend(check_rows(group, "http", &c, r.as_deref()));
+                out.http = r;
+            }
         }
     }
     out.domains = states;
@@ -388,6 +421,7 @@ mod tests {
         stopped_calls: Cell<usize>,
         expired_calls: Cell<usize>,
         reports: RefCell<Vec<(u64, u64)>>,
+        phases: RefCell<Vec<Phase>>,
     }
 
     impl Control for FakeCtl {
@@ -403,6 +437,9 @@ mod tests {
         }
         fn report(&self, _d: &[DomainState], done: u64, total: u64) {
             self.reports.borrow_mut().push((done, total));
+        }
+        fn phase(&self, p: Phase) {
+            self.phases.borrow_mut().push(p);
         }
     }
 
@@ -743,6 +780,48 @@ mod tests {
         assert!(p.sweeps.borrow().is_empty());
         assert!(p.confirms.borrow().is_empty());
         assert_eq!(r.tls, None);
+    }
+
+    /// Цифры `check` каждой цепочки — в итоге группы, выбранная отмечена; перед `check` —
+    /// шаг «уточнение».
+    #[tokio::test]
+    async fn check_rows_reported() {
+        let c = corpus();
+        let p = FakeProbe::default()
+            .block("a", Proto::Tls13, Block::Sni)
+            .block("a", Proto::Http, Block::Sni)
+            .pass("a", Proto::Tls13, &c.tls13[..2])
+            .pass("a", Proto::Http, &c.http[..1]);
+        let ctl = FakeCtl::default();
+        let r = search_group(&p, Group::General, &doms(&["a"]), &c, &ctl).await;
+        let rows: Vec<(&str, &str, bool)> = r
+            .check
+            .iter()
+            .map(|x| (x.chain.as_str(), x.args.as_str(), x.picked))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("tls", c.tls13[0].as_str(), true),
+                ("tls", c.tls13[1].as_str(), false),
+                ("http", c.http[0].as_str(), true),
+            ]
+        );
+        let x = &r.check[0];
+        assert_eq!(
+            (x.group, x.full, x.total, x.median_pct),
+            (Group::General, 3, 3, Some(50))
+        );
+        let g = Group::General;
+        assert_eq!(
+            *ctl.phases.borrow(),
+            [
+                Phase::Narrow { group: g },
+                Phase::Check { group: g },
+                Phase::Narrow { group: g },
+                Phase::Check { group: g },
+            ]
+        );
     }
 
     #[test]

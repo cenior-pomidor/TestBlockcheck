@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Found, Group, NaiveStamp, Outcome};
+use super::{Found, Group, NaiveStamp, Outcome, Proto};
 use crate::system::atomic::write_atomic;
 
 const STATE_FILE: &str = "state.json";
@@ -33,6 +33,32 @@ pub struct DomainState {
     pub left: Option<u64>,
 }
 
+/// Строка `check` (спека §4, шаг 4): одна стратегия одной цепочки.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CheckRow {
+    pub group: Group,
+    /// `"tls"` или `"http"`.
+    pub chain: String,
+    pub args: String,
+    pub full: usize,
+    pub total: usize,
+    /// Медиана доли доставки, в процентах (целое — чтобы `State` остался `Eq`).
+    pub median_pct: Option<u32>,
+    pub picked: bool,
+}
+
+/// Строка проверки через обход (спека §6, п. 4); `round` 2 — повторная при частичном итоге.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VerifyRow {
+    pub group: Group,
+    pub domain: String,
+    pub proto: Proto,
+    pub ok: bool,
+    pub round: u8,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct State {
@@ -51,6 +77,10 @@ pub struct State {
     /// Отказ до шага 1 (например, «нет сети»); итога при этом нет.
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub check: Vec<CheckRow>,
+    #[serde(default)]
+    pub verify: Vec<VerifyRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +215,22 @@ mod tests {
             network_title: Some("wifi".into()),
             base: "default".into(),
             error: None,
+            check: vec![CheckRow {
+                group: Group::General,
+                chain: "tls".into(),
+                args: "--lua-desync=fake".into(),
+                full: 2,
+                total: 3,
+                median_pct: Some(87),
+                picked: true,
+            }],
+            verify: vec![VerifyRow {
+                group: Group::General,
+                domain: "example.org".into(),
+                proto: crate::search::Proto::Tls13,
+                ok: true,
+                round: 2,
+            }],
         }
     }
 
@@ -275,6 +321,20 @@ mod tests {
         assert_eq!(left.len(), 10);
         assert_eq!(left[0], "20261104-100002");
         assert!(d.join("junk").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Старые `state.json` без `check`/`verify` читаются.
+    #[test]
+    fn state_without_check_verify() {
+        let d = tmp("old");
+        let mut v = serde_json::to_value(state("20261104-194620")).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("check");
+        o.remove("verify");
+        fs::write(d.join("state.json"), v.to_string()).unwrap();
+        let s = read_state(&d).unwrap();
+        assert!(s.check.is_empty() && s.verify.is_empty());
         let _ = fs::remove_dir_all(&d);
     }
 

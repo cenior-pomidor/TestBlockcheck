@@ -4,6 +4,7 @@
   "schema": 1,
   "state": {
     "base": "default",
+    "check": [],
     "domains": [
       {
         "block": "sni_blocked",
@@ -30,6 +31,7 @@
     },
     "pid": 4242,
     "schema": 1,
-    "total": 480
+    "total": 480,
+    "verify": []
   }
 }

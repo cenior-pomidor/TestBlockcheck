@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::apply::{apply, rollback, Plan, SvcLink, Verifier};
 use super::assemble::{preset_name, preset_text};
 use super::narrow::{search_group, Control, Corpus, GroupResult, Probe};
-use super::runs::{write_state, DomainState, Phase, State};
+use super::runs::{write_state, DomainState, Phase, State, VerifyRow};
 use super::{Found, Group, NaiveStamp, Outcome, Proto};
 use crate::bypass::store::Store;
 
@@ -84,6 +84,8 @@ pub async fn run_job_with<P: Probe, S: SvcLink, V: Verifier>(
         network_title: None,
         base: input.base.clone(),
         error: None,
+        check: Vec::new(),
+        verify: Vec::new(),
     });
     save(&dir, &st.borrow());
 
@@ -100,12 +102,13 @@ pub async fn run_job_with<P: Probe, S: SvcLink, V: Verifier>(
     };
     st.borrow_mut().network_title = Some(prep.title.clone());
 
-    // Шаги 2–5: обе группы, общий срок.
+    // Шаги 2–5: обе группы, общий срок. YouTube — первой: это цель приёмки, и срок не
+    // должен уйти на «Общие».
     let deadline = rt.clock.now() + input.budget;
     let mut results: Vec<(Group, GroupResult)> = Vec::new();
     for (group, domains) in [
-        (Group::General, &prep.general),
         (Group::Youtube, &prep.youtube),
+        (Group::General, &prep.general),
     ] {
         if rt.stop.load(Ordering::SeqCst) {
             break;
@@ -133,6 +136,8 @@ pub async fn run_job_with<P: Probe, S: SvcLink, V: Verifier>(
             let mut s = st.borrow_mut();
             s.domains.truncate(prev);
             s.domains.extend(r.domains.iter().cloned());
+            s.check.extend(r.check.iter().cloned());
+            save(&dir, &s);
         }
         results.push((group, r));
     }
@@ -157,7 +162,12 @@ pub async fn run_job_with<P: Probe, S: SvcLink, V: Verifier>(
         let header = header(&input.now, &prep.title, &input.base);
 
         // Перед применением: сеть та же, обход запущен.
-        let Some(now) = svc.status().await else {
+        let now = svc.status().await;
+        // Стоп — до сохранения пресета в любой ветке (и при незапущенном обходе).
+        if rt.stop.load(Ordering::SeqCst) {
+            break 'out Outcome::Stopped;
+        }
+        let Some(now) = now else {
             break 'out Outcome::NetworkChanged;
         };
         if now.network_key.as_deref() != Some(prep.key.as_str()) {
@@ -171,9 +181,6 @@ pub async fn run_job_with<P: Probe, S: SvcLink, V: Verifier>(
                     reason: format!("пресет не сохранён: {e}; ничего не изменено"),
                 },
             };
-        }
-        if rt.stop.load(Ordering::SeqCst) {
-            break 'out Outcome::Stopped;
         }
 
         let checks = checks(&found, general, youtube);
@@ -201,7 +208,14 @@ pub async fn run_job_with<P: Probe, S: SvcLink, V: Verifier>(
             s.elapsed_s = elapsed(rt.clock, started);
             save(&dir, &s);
         }
-        let out = apply(store, svc, v, &plan, SERVICE_WAIT).await;
+        let on_verify = |rows: &[VerifyRow]| {
+            let mut s = st.borrow_mut();
+            s.phase = Phase::Verify;
+            s.verify = rows.to_vec();
+            s.elapsed_s = elapsed(rt.clock, started);
+            save(&dir, &s);
+        };
+        let out = apply(store, svc, v, &plan, SERVICE_WAIT, &on_verify).await;
         // Стоп во время применения (журнал уже записан) — полный откат.
         let applied = matches!(out, Outcome::Applied | Outcome::Partial { .. });
         if applied && rt.stop.load(Ordering::SeqCst) {
@@ -342,6 +356,12 @@ impl Control for JobCtl<'_> {
         s.elapsed_s = elapsed(self.clock, self.started);
         save(self.dir, &s);
     }
+    fn phase(&self, p: Phase) {
+        let mut s = self.st.borrow_mut();
+        s.phase = p;
+        s.elapsed_s = elapsed(self.clock, self.started);
+        save(self.dir, &s);
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +483,8 @@ mod tests {
         sweep_cost: Duration,
         stop_on_sweep: Option<Arc<AtomicBool>>,
         watch: Option<PathBuf>,
+        /// Снимок `state.json` в начале каждого `confirm`.
+        watch_confirm: Option<PathBuf>,
         seen: RefCell<Vec<State>>,
         sweeps: Cell<usize>,
     }
@@ -475,6 +497,7 @@ mod tests {
                 sweep_cost: Duration::from_secs(1),
                 stop_on_sweep: None,
                 watch: None,
+                watch_confirm: None,
                 seen: RefCell::new(Vec::new()),
                 sweeps: Cell::new(0),
             }
@@ -528,6 +551,9 @@ mod tests {
             cands[..cands.len().div_ceil(2)].to_vec()
         }
         async fn confirm(&self, _d: &[(String, Proto)], cands: &[String]) -> Vec<Confirmed> {
+            if let Some(s) = self.watch_confirm.as_ref().and_then(|d| read_state(d)) {
+                self.seen.borrow_mut().push(s);
+            }
             cands
                 .iter()
                 .map(|c| Confirmed {
@@ -549,6 +575,9 @@ mod tests {
         store: Store,
         reloads: Mutex<u32>,
         stop_on_reload: Option<Arc<AtomicBool>>,
+        /// Поднять стоп на этом по счёту `status`.
+        stop_on_status: Option<(Arc<AtomicBool>, u32)>,
+        statuses: Mutex<u32>,
     }
 
     impl FakeSvc {
@@ -560,6 +589,8 @@ mod tests {
                 store: Store::new(s.layout.clone()),
                 reloads: Mutex::new(0),
                 stop_on_reload: None,
+                stop_on_status: None,
+                statuses: Mutex::new(0),
             }
         }
         fn keys(self, k: &[&str]) -> Self {
@@ -573,6 +604,16 @@ mod tests {
 
     impl SvcLink for FakeSvc {
         async fn status(&self) -> Option<Status> {
+            let n = {
+                let mut c = self.statuses.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if let Some((s, at)) = &self.stop_on_status {
+                if *at == n {
+                    s.store(true, Ordering::SeqCst);
+                }
+            }
             if !self.alive {
                 return None;
             }
@@ -820,6 +861,134 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// Стоп между перебором и применением (во время сверки со службой) — пресет не
+    /// сохраняется, даже когда обход не запущен.
+    #[tokio::test(start_paused = true)]
+    async fn stop_before_save_not_applied() {
+        let (s, root) = store("stop-presave");
+        let before = nets_text(&s);
+        let stop = no_stop();
+        let clock = FakeClock::new();
+        let p = FakeProbe::both(&clock);
+        let mut svc = FakeSvc::new(&s);
+        svc.state = "paused_home".into();
+        svc.stop_on_status = Some((stop.clone(), 2));
+        let v = FakeVerifier::default();
+        let st = run(&s, &p, &svc, &v, input(), stop).await.unwrap();
+        assert_eq!(st.outcome, Some(Outcome::Stopped));
+        assert!(s.load_preset(PRESET).is_err());
+        assert_eq!(nets_text(&s), before);
+        assert_eq!(svc.reloads(), 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// В итоге — цифры `check` обеих групп и строки проверки через обход; во время проверки
+    /// шаг — «уточнение» и «проверка через обход».
+    #[tokio::test(start_paused = true)]
+    async fn check_and_verify_in_state() {
+        let (s, root) = store("check-verify");
+        let clock = FakeClock::new();
+        let p = FakeProbe::both(&clock);
+        let svc = FakeSvc::new(&s);
+        let v = FakeVerifier::default();
+        let st = run(&s, &p, &svc, &v, input(), no_stop()).await.unwrap();
+        let chains: Vec<(Group, &str)> = st
+            .check
+            .iter()
+            .filter(|r| r.picked)
+            .map(|r| (r.group, r.chain.as_str()))
+            .collect();
+        assert_eq!(
+            chains,
+            [
+                (Group::Youtube, "tls"),
+                (Group::General, "tls"),
+                (Group::General, "http")
+            ]
+        );
+        let picked: Vec<&str> = st
+            .check
+            .iter()
+            .filter(|r| r.picked)
+            .map(|r| r.args.as_str())
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                st.found.youtube.as_deref().unwrap(),
+                st.found.tls.as_deref().unwrap(),
+                st.found.http.as_deref().unwrap()
+            ]
+        );
+        assert!(st.check.iter().all(|r| r.median_pct == Some(50)));
+        let mut ver: Vec<(&str, Proto, bool, u8)> = st
+            .verify
+            .iter()
+            .map(|r| (r.domain.as_str(), r.proto, r.ok, r.round))
+            .collect();
+        ver.sort_by_key(|x| (x.0, x.1 as u8));
+        assert_eq!(
+            ver,
+            [
+                (RT, Proto::Tls13, true, 1),
+                (RT, Proto::Http, true, 1),
+                (YT, Proto::Tls13, true, 1)
+            ]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Шаги `check` и «проверка через обход» видны в `state.json`.
+    #[tokio::test(start_paused = true)]
+    async fn check_and_verify_phases() {
+        let (s, root) = store("phases");
+        let clock = FakeClock::new();
+        let mut p = FakeProbe::both(&clock);
+        p.watch_confirm = Some(run_dir(&s));
+        let svc = FakeSvc::new(&s);
+        let v = PhaseVerifier {
+            dir: run_dir(&s),
+            seen: RefCell::new(Vec::new()),
+        };
+        let c = corpus();
+        let rt = Runtime {
+            stop: no_stop(),
+            clock: &*clock,
+            corpus: &c,
+        };
+        run_job_with(&s, &p, &svc, &v, input(), rt).await.unwrap();
+        let at_confirm: Vec<Phase> = p.seen.borrow().iter().map(|s| s.phase.clone()).collect();
+        let (g, y) = (Group::General, Group::Youtube);
+        assert_eq!(
+            at_confirm,
+            [
+                Phase::Check { group: y },
+                Phase::Check { group: g },
+                Phase::Check { group: g }
+            ]
+        );
+        let seen = v.seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|p| *p == Phase::Verify), "{seen:?}");
+        drop(seen);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Проверка через обход, запоминающая шаг из `state.json`.
+    struct PhaseVerifier {
+        dir: PathBuf,
+        seen: RefCell<Vec<Phase>>,
+    }
+
+    impl Verifier for PhaseVerifier {
+        async fn through_bypass(&self, _domain: &str, _p: Proto) -> bool {
+            if let Some(s) = read_state(&self.dir) {
+                self.seen.borrow_mut().push(s.phase);
+            }
+            true
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stop_during_apply() {
         let (s, root) = store("stop-apply");
@@ -845,24 +1014,25 @@ mod tests {
     async fn budget() {
         let (s, root) = store("budget");
         let clock = FakeClock::new();
-        // «Общие»: три ступени TLS; YouTube — одна.
+        // YouTube (идёт первой): три ступени TLS; «Общие» — одна.
         let mut p = FakeProbe::new(&clock)
-            .block(RT, Proto::Tls13, Block::Sni)
-            .block(RT, Proto::Tls12, Block::Sni)
-            .block(EX, Proto::Tls13, Block::Sni)
-            .block(YT, Proto::Tls13, Block::Sni);
+            .block(YT, Proto::Tls13, Block::Sni)
+            .block(YT, Proto::Tls12, Block::Sni)
+            .block(RT, Proto::Tls13, Block::Sni);
         p.sweep_cost = Duration::from_secs(200);
         let svc = FakeSvc::new(&s);
         let v = FakeVerifier::default();
         let st = run(&s, &p, &svc, &v, input(), no_stop()).await.unwrap();
-        // 200 с < 300 с — вторая ступень идёт; 400 с — срок вышел, берётся подтверждённое.
+        // 200 с < 300 с — вторая ступень идёт; 400 с — срок вышел, берётся подтверждённое;
+        // «Общие» уже не начинаются.
         assert_eq!(p.sweeps.get(), 2);
-        assert!(st.found.tls.is_some());
-        assert_eq!(st.found.youtube, None);
+        assert!(st.found.youtube.is_some());
+        assert_eq!(st.found.tls, None);
         assert_eq!(st.outcome, Some(Outcome::Applied));
         assert!(st.elapsed_s >= 400, "{}", st.elapsed_s);
         // Проверяются только группы со стратегией.
-        assert!(v.calls.lock().unwrap().iter().all(|(d, _)| d != YT));
+        let calls = v.calls.lock().unwrap().clone();
+        assert!(!calls.is_empty() && calls.iter().all(|(d, _)| d == YT));
         fs::remove_dir_all(root).ok();
     }
 
@@ -893,12 +1063,18 @@ mod tests {
             .domains
             .iter()
             .any(|d| d.domain == RT && d.block.as_deref() == Some("sni_blocked")));
-        assert!(seen.iter().any(|s| s.phase
-            == Phase::Narrow {
+        // YouTube идёт первой (цель приёмки): при «Общих» её домены уже в состоянии.
+        assert!(gen[0].domains.iter().any(|d| d.domain == YT));
+        let first_narrow = seen
+            .iter()
+            .find(|s| matches!(s.phase, Phase::Narrow { .. }))
+            .unwrap();
+        assert_eq!(
+            first_narrow.phase,
+            Phase::Narrow {
                 group: Group::Youtube
             }
-            && s.domains.iter().any(|d| d.domain == YT)
-            && s.domains.iter().any(|d| d.domain == RT)));
+        );
         assert!(seen.iter().all(|s| s.id == ID && s.outcome.is_none()));
         fs::remove_dir_all(root).ok();
     }

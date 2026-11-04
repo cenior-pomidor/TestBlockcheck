@@ -62,6 +62,9 @@ const BUSY: &str = "поиск уже идёт";
 const NO_NETWORK: &str = "нет сети";
 const INTERRUPTED: &str = "поиск прервался";
 const INTERRUPTED_APPLY: &str = "поиск прервался посреди применения";
+const INTERRUPTED_AFTER_APPLY: &str = "поиск прервался после применения";
+const NOT_STARTED: &str = "поиск не запустился";
+const NEED_NET_STRATEGY: &str = "включите стратегии по сетям или передайте --enable-net-strategy";
 const STOP_WAIT: Duration = Duration::from_secs(30);
 const STOP_POLL: Duration = Duration::from_millis(200);
 /// Воркеров перебора и срок шагов 2–5 (спека §4).
@@ -150,6 +153,10 @@ async fn start<S: SvcLink, J: JobSys>(
             return Err(BUSY.into());
         }
     }
+    // Найденное назначается сети — без стратегий по сетям оно бы не действовало (спека §6.1).
+    if !enable_net_strategy && !store.settings().0.net_strategy {
+        return Err(NEED_NET_STRATEGY.into());
+    }
     let (key, title) = match svc.status().await {
         Some(st) => match st.network_key {
             Some(k) if k != "offline" => {
@@ -185,6 +192,8 @@ async fn start<S: SvcLink, J: JobSys>(
         network_title: Some(title),
         base: base.clone(),
         error: None,
+        check: Vec::new(),
+        verify: Vec::new(),
     };
     write_state(&dir, &st).map_err(|e| format!("state.json: {e}"))?;
     prune(&runs, KEEP_RUNS);
@@ -229,9 +238,12 @@ fn default_base(store: &Store, key: &str) -> String {
     s.default_strategy
 }
 
-/// §6.8: последнее задание мертво. Журнал отмены без отметки завершения — полный откат;
-/// итога нет и журнала нет — итог «прервался» (ничего не применялось). `None` — доводить
-/// нечего; `Some(Err)` — откат не удался, журнал так и остался без отметки.
+/// §6.8: последнее задание мертво. Журнал отмены без отметки завершения — полный откат.
+/// Итога нет: журнал завершён — итог по диску (пресет назначен сети — «применено», иначе
+/// «прервался после применения»); журнала нет — «прервался» (ничего не применялось), а
+/// `pid 0` на подготовке — «не запустился». Зовётся только под замком `search start`, так
+/// что `pid 0` — не окно запуска, а брошенный `start`. `None` — доводить нечего;
+/// `Some(Err)` — откат не удался, журнал так и остался без отметки.
 async fn recover<S: SvcLink, J: JobSys>(
     store: &Store,
     svc: &S,
@@ -239,20 +251,37 @@ async fn recover<S: SvcLink, J: JobSys>(
 ) -> Option<Result<(), String>> {
     let dir = latest(&store.layout.runs_dir())?;
     let mut st = read_state(&dir)?;
-    // pid 0 на подготовке — `start` между записью состояния и запуском задания.
-    if live(sys, &st) || (st.pid == 0 && st.phase == Phase::Prepare) {
+    if live(sys, &st) {
         return None;
     }
-    let (reason, r) = match read_undo(&dir) {
+    let rolled = |reason: String| Outcome::RolledBack { reason };
+    let (outcome, r) = match read_undo(&dir) {
         Some(u) if !u.finished => match rollback(store, svc, &dir).await {
-            Ok(()) => (INTERRUPTED_APPLY.to_string(), Ok(())),
-            Err(e) => (format!("{INTERRUPTED_APPLY}; откат: {e}"), Err(e)),
+            Ok(()) => (rolled(INTERRUPTED_APPLY.to_string()), Ok(())),
+            Err(e) => (rolled(format!("{INTERRUPTED_APPLY}; откат: {e}")), Err(e)),
         },
-        None if st.outcome.is_none() && st.error.is_none() => (INTERRUPTED.to_string(), Ok(())),
-        _ => return None,
+        _ if st.outcome.is_some() || st.error.is_some() => return None,
+        Some(u) => {
+            let on = store.preset_text(&u.preset).is_ok()
+                && store
+                    .networks()
+                    .0
+                    .iter()
+                    .any(|n| n.key == u.network_key && n.strategy == u.preset);
+            let o = if on {
+                Outcome::Applied
+            } else {
+                rolled(INTERRUPTED_AFTER_APPLY.to_string())
+            };
+            (o, Ok(()))
+        }
+        None if st.pid == 0 && st.phase == Phase::Prepare => {
+            (rolled(NOT_STARTED.to_string()), Ok(()))
+        }
+        None => (rolled(INTERRUPTED.to_string()), Ok(())),
     };
     st.phase = Phase::Done;
-    st.outcome = Some(Outcome::RolledBack { reason });
+    st.outcome = Some(outcome);
     let _ = write_state(&dir, &st);
     Some(r)
 }
@@ -464,8 +493,8 @@ pub async fn run_job_cmd(
 mod tests {
     use super::*;
     use blockcheckw::bypass::supervisor::Status;
-    use blockcheckw::search::runs::{write_undo, DomainState, Undo};
-    use blockcheckw::search::Group;
+    use blockcheckw::search::runs::{write_undo, CheckRow, DomainState, Undo, VerifyRow};
+    use blockcheckw::search::{Group, Proto};
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
 
@@ -609,6 +638,8 @@ mod tests {
             network_title: Some("Wi-Fi «Home»".into()),
             base: "default".into(),
             error: None,
+            check: Vec::new(),
+            verify: Vec::new(),
         }
     }
 
@@ -639,6 +670,13 @@ mod tests {
         }
     }
 
+    /// `NET_STRATEGY=1`: `start` без `--enable-net-strategy` допустим.
+    fn net_on(s: &Store) {
+        let (mut st, _) = s.settings();
+        st.net_strategy = true;
+        s.save_settings(&st).unwrap();
+    }
+
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -646,6 +684,7 @@ mod tests {
     #[tokio::test]
     async fn start_spawns_detached() {
         let t = t("spawn");
+        net_on(&t.store);
         for i in 0..12 {
             put(
                 &t.store,
@@ -717,9 +756,13 @@ mod tests {
             .unwrap();
         let base_of = |sys: &FakeSys| sys.spawned.borrow()[0].0[3].clone();
 
-        // NET_STRATEGY=0 — DEFAULT_STRATEGY.
+        // NET_STRATEGY=0 — DEFAULT_STRATEGY (запуск — с согласием на стратегии по сетям).
         let sys = FakeSys::default();
-        execute(&start(None), &t.store, &FakeSvc::on(), &sys)
+        let with_net = SearchAction::Start {
+            enable_net_strategy: true,
+            base: None,
+        };
+        execute(&with_net, &t.store, &FakeSvc::on(), &sys)
             .await
             .unwrap();
         let (s, _) = t.store.settings();
@@ -814,7 +857,7 @@ mod tests {
     }
 
     /// Замок `search start` занят — `status` откат не доводит; `pid 0` на подготовке
-    /// (окно запуска) — тоже не трогается.
+    /// (окно запуска под замком) — тоже не трогается.
     #[tokio::test]
     async fn status_skips_recovery_when_locked() {
         let t = t("locked");
@@ -843,11 +886,108 @@ mod tests {
         let mut st = state("20261104-110000", 0, None);
         st.phase = Phase::Prepare;
         let dir = put(&t.store, &st);
-        let v = execute(&SearchAction::Status, &t.store, &svc, &FakeSys::default())
+        let v = execute(&SearchAction::Status, &t.store, &svc, &sys)
             .await
             .unwrap();
         assert_eq!(v["recovered"], false);
         assert_eq!(read_state(&dir).unwrap().outcome, None);
+    }
+
+    /// M9: `NET_STRATEGY=0` и нет `--enable-net-strategy` — отказ, задание не запускается.
+    #[tokio::test]
+    async fn start_needs_net_strategy() {
+        let t = t("needs-net");
+        let sys = FakeSys::default();
+        let r = execute(&start(Some("default")), &t.store, &FakeSvc::on(), &sys).await;
+        assert_eq!(r, Err(NEED_NET_STRATEGY.to_string()));
+        assert_eq!(
+            NEED_NET_STRATEGY,
+            "включите стратегии по сетям или передайте --enable-net-strategy"
+        );
+        assert!(sys.spawned.borrow().is_empty());
+        assert!(!t.store.layout.runs_dir().join(ID).exists());
+    }
+
+    /// I4a: задание умерло после отметки завершения, но до записи итога — итог по диску.
+    #[tokio::test]
+    async fn status_recovers_after_finish() {
+        let t = t("after-finish");
+        let preset = "found-default-20261104-1000";
+        t.store.save_preset(preset, "NFQWS_ARGS=\"\"\n").unwrap();
+        t.store
+            .set_network_entry(KEY, "Wi-Fi «Home»", preset)
+            .unwrap();
+        let mut st = state("20261104-100000", 77, None);
+        st.phase = Phase::Verify;
+        let dir = put(&t.store, &st);
+        let mut u = undo(preset);
+        u.finished = true;
+        write_undo(&dir, &u).unwrap();
+        let svc = FakeSvc::on();
+        let sys = FakeSys::default();
+        let v = execute(&SearchAction::Status, &t.store, &svc, &sys)
+            .await
+            .unwrap();
+        assert_eq!(v["recovered"], true, "{v}");
+        let st = read_state(&dir).unwrap();
+        assert_eq!(
+            (st.phase, st.outcome),
+            (Phase::Done, Some(Outcome::Applied))
+        );
+        // Применённое не трогается.
+        assert!(t.store.preset_text(preset).is_ok());
+        assert_eq!(svc.reloads.get(), 0);
+
+        // Откат по стопу завершён, итог не записан: пресета нет — «прервался после применения».
+        let mut st = state("20261104-110000", 78, None);
+        st.phase = Phase::Rollback;
+        let dir = put(&t.store, &st);
+        let mut u = undo("found-default-20261104-1100");
+        u.finished = true;
+        write_undo(&dir, &u).unwrap();
+        let v = execute(&SearchAction::Status, &t.store, &svc, &sys)
+            .await
+            .unwrap();
+        assert_eq!(v["recovered"], true);
+        assert_eq!(
+            read_state(&dir).unwrap().outcome,
+            Some(Outcome::RolledBack {
+                reason: INTERRUPTED_AFTER_APPLY.into()
+            })
+        );
+        assert_eq!(INTERRUPTED_AFTER_APPLY, "поиск прервался после применения");
+        // Итог уже есть — не трогается.
+        let v = execute(&SearchAction::Status, &t.store, &svc, &sys)
+            .await
+            .unwrap();
+        assert_eq!(v["recovered"], false);
+    }
+
+    /// I4b: `pid 0` на подготовке при свободном замке — `start` не довёл запуск.
+    #[tokio::test]
+    async fn status_recovers_never_started() {
+        let t = t("never-started");
+        let mut st = state("20261104-110000", 0, None);
+        st.phase = Phase::Prepare;
+        let dir = put(&t.store, &st);
+        let v = execute(
+            &SearchAction::Status,
+            &t.store,
+            &FakeSvc::on(),
+            &FakeSys::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["recovered"], true);
+        let st = read_state(&dir).unwrap();
+        assert_eq!(st.phase, Phase::Done);
+        assert_eq!(
+            st.outcome,
+            Some(Outcome::RolledBack {
+                reason: NOT_STARTED.into()
+            })
+        );
+        assert_eq!(NOT_STARTED, "поиск не запустился");
     }
 
     /// Откат прерванного поиска не удался — `start` отказывает, журнал остаётся.
@@ -959,6 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn search_samples_are_current() {
         let t = t("samples");
+        net_on(&t.store);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module/tests/ctl-samples");
         let update = std::env::var_os("UPDATE_SAMPLES").is_some();
         let mut done = state(
@@ -993,10 +1134,67 @@ mod tests {
             },
         ];
         done.found = Found {
-            youtube: None,
+            youtube: Some("--lua-desync=multisplit:pos=2".into()),
             tls: Some("--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls".into()),
             http: Some("--payload=http_req --lua-desync=fake:blob=fake_default_http".into()),
         };
+        let row = |group, chain: &str, args: &str, full, median_pct, picked| CheckRow {
+            group,
+            chain: chain.into(),
+            args: args.into(),
+            full,
+            total: 3,
+            median_pct,
+            picked,
+        };
+        done.check = vec![
+            row(
+                Group::Youtube,
+                "tls",
+                "--lua-desync=multisplit:pos=2",
+                3,
+                Some(91),
+                true,
+            ),
+            row(
+                Group::Youtube,
+                "tls",
+                "--lua-desync=multidisorder:pos=1",
+                1,
+                None,
+                false,
+            ),
+            row(
+                Group::General,
+                "tls",
+                "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls",
+                3,
+                Some(100),
+                true,
+            ),
+            row(
+                Group::General,
+                "http",
+                "--payload=http_req --lua-desync=fake:blob=fake_default_http",
+                2,
+                Some(64),
+                true,
+            ),
+        ];
+        let vrow = |group, domain: &str, proto, ok, round| VerifyRow {
+            group,
+            domain: domain.into(),
+            proto,
+            ok,
+            round,
+        };
+        done.verify = vec![
+            vrow(Group::Youtube, "www.youtube.com", Proto::Tls13, false, 1),
+            vrow(Group::General, "rutracker.org", Proto::Tls13, true, 1),
+            vrow(Group::General, "rutracker.org", Proto::Http, true, 1),
+            vrow(Group::General, "rutracker.org", Proto::Tls13, true, 2),
+            vrow(Group::General, "rutracker.org", Proto::Http, true, 2),
+        ];
         put(&t.store, &done);
         put(
             &t.store,

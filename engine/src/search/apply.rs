@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::assemble::preset_text;
-use super::runs::{read_undo, write_undo, Undo};
+use std::cell::RefCell;
+
+use super::runs::{read_undo, write_undo, Undo, VerifyRow};
 use super::{Found, Group, Outcome, Proto};
 use crate::bypass::settings::{ListMode, Settings};
 use crate::bypass::store::Store;
@@ -41,12 +43,15 @@ pub struct Plan {
 /// Опрос службы при ожидании новой стратегии.
 const POLL: Duration = Duration::from_millis(500);
 
+/// `on_verify` получает строки проверки через обход: пустой список в начале проверки, затем
+/// все строки после каждой новой (повторная проверка при частичном итоге — `round` 2).
 pub async fn apply<S: SvcLink, V: Verifier>(
     store: &Store,
     svc: &S,
     v: &V,
     plan: &Plan,
     wait: Duration,
+    on_verify: &dyn Fn(&[VerifyRow]),
 ) -> Outcome {
     // п. 2: журнал отмены — до любых изменений.
     let (settings, _) = store.settings();
@@ -98,9 +103,14 @@ pub async fn apply<S: SvcLink, V: Verifier>(
             groups.push(*g);
         }
     }
+    let rows = Rows {
+        rows: RefCell::new(Vec::new()),
+        on: on_verify,
+    };
+    on_verify(&[]);
     let mut failed = Vec::new();
     for g in &groups {
-        if !group_ok(v, plan, *g).await {
+        if !group_ok(v, plan, *g, &rows, 1).await {
             failed.push(*g);
         }
     }
@@ -137,7 +147,7 @@ pub async fn apply<S: SvcLink, V: Verifier>(
             if let Err(e) = restart(svc, &plan.preset, wait).await {
                 return fail(store, svc, &plan.dir, e).await;
             }
-            let ok = group_ok(v, plan, passed).await;
+            let ok = group_ok(v, plan, passed, &rows, 2).await;
             if let Err(e) = still_on(svc, &plan.preset).await {
                 return fail(store, svc, &plan.dir, e).await;
             }
@@ -168,8 +178,9 @@ pub async fn apply<S: SvcLink, V: Verifier>(
     }
 }
 
-/// Полный откат по `undo.json` (п. 6). Повторный вызов ничего не меняет. При ошибке отметка
-/// завершения не ставится — откат можно довести позже.
+/// Полный откат по `undo.json` (п. 6). Повторный вызов ничего не меняет. Перед изменениями
+/// отметка завершения снимается; ставится только после уведомления службы — при ошибке или
+/// обрыве откат доводит восстановление.
 pub async fn rollback<S: SvcLink>(store: &Store, svc: &S, dir: &Path) -> Result<(), String> {
     let u = read_undo(dir).ok_or_else(|| "нет журнала отмены undo.json".to_string())?;
     rollback_with(store, svc, dir, u).await
@@ -182,6 +193,11 @@ async fn rollback_with<S: SvcLink>(
     dir: &Path,
     mut u: Undo,
 ) -> Result<(), String> {
+    // Журнал снова «не завершён» до любых изменений: обрыв посреди отката (например, по стопу
+    // после «применено») доведёт восстановление. Не записать — всё равно откатываем
+    // (`finish` зовёт сюда как раз когда `undo.json` не пишется).
+    u.finished = false;
+    let _ = write_undo(dir, &u);
     let mut errs: Vec<String> = Vec::new();
 
     let (nets, _) = store.networks();
@@ -227,11 +243,13 @@ async fn rollback_with<S: SvcLink>(
     if !errs.is_empty() {
         return Err(errs.join("; "));
     }
+    // Отметка — только после уведомления службы: иначе служба осталась бы на удалённом
+    // пресете, а восстановление уже не повторило бы откат.
+    svc.reload()
+        .await
+        .map_err(|e| format!("служба не уведомлена: {e}"))?;
     u.finished = true;
-    // Файлы уже прежние — службу уведомляем, даже если отметку не записать.
-    let w = write_undo(dir, &u).map_err(|e| format!("undo.json: {e}"));
-    let r = svc.reload().await;
-    w.and(r)
+    write_undo(dir, &u).map_err(|e| format!("undo.json: {e}"))
 }
 
 fn nothing_changed(reason: String) -> Outcome {
@@ -286,10 +304,28 @@ async fn restart<S: SvcLink>(svc: &S, preset: &str, wait: Duration) -> Result<()
     }
 }
 
+/// Накопленные строки проверки и кому о них сообщать.
+struct Rows<'a> {
+    rows: RefCell<Vec<VerifyRow>>,
+    on: &'a dyn Fn(&[VerifyRow]),
+}
+
 /// Группа прошла, если прошли все её проверки.
-async fn group_ok<V: Verifier>(v: &V, plan: &Plan, g: Group) -> bool {
+async fn group_ok<V: Verifier>(v: &V, plan: &Plan, g: Group, rows: &Rows<'_>, round: u8) -> bool {
     for (cg, domain, p) in &plan.checks {
-        if *cg == g && !v.through_bypass(domain, *p).await {
+        if *cg != g {
+            continue;
+        }
+        let ok = v.through_bypass(domain, *p).await;
+        rows.rows.borrow_mut().push(VerifyRow {
+            group: g,
+            domain: domain.clone(),
+            proto: *p,
+            ok,
+            round,
+        });
+        (rows.on)(&rows.rows.borrow());
+        if !ok {
             return false;
         }
     }
@@ -404,6 +440,7 @@ fn remove_lines(list: &str, added: &[String], no_eol: bool) -> String {
 mod tests {
     use super::*;
     use crate::bypass::layout::Layout;
+    use crate::search::runs::VerifyRow;
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::sync::Mutex;
@@ -486,6 +523,8 @@ mod tests {
         seen: Mutex<Vec<Seen>>,
         /// На этом по счёту `reload` подменить `undo.json` каталогом (запись станет невозможна).
         break_undo_at: Option<u32>,
+        /// Этот по счёту `reload` — ошибка.
+        fail_reload_at: Option<u32>,
     }
 
     impl FakeSvc {
@@ -497,6 +536,7 @@ mod tests {
                 nets: store.layout.networks_file(),
                 seen: Mutex::new(Vec::new()),
                 break_undo_at: None,
+                fail_reload_at: None,
             }
         }
         fn reloads(&self) -> u32 {
@@ -528,6 +568,9 @@ mod tests {
                 read_undo(&self.dir),
                 fs::read_to_string(&self.nets).unwrap_or_default(),
             ));
+            if self.fail_reload_at == Some(n) {
+                return Err("служба не ответила".into());
+            }
             Ok(())
         }
     }
@@ -593,7 +636,7 @@ mod tests {
         let mut p = plan(&root);
         // rutracker.org уже есть в списке по умолчанию — добавится только второй.
         p.general_blocked = vec!["rutracker.org".into(), "Example-Blocked.test".into()];
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert_eq!(out, Outcome::Applied);
         let seen = svc.seen.lock().unwrap();
         let (u, nets) = &seen[0];
@@ -617,7 +660,7 @@ mod tests {
         let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
         let mut p = plan(&root);
         p.dir = root.join("no").join("such");
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert!(matches!(out, Outcome::RolledBack { .. }), "{out:?}");
         assert_eq!(nets_text(&s), before);
         assert_eq!(s.read_list("user").unwrap(), user);
@@ -636,7 +679,7 @@ mod tests {
             vec![None, st("starting", "alt"), st("running", PRESET)],
         );
         let p = plan(&root);
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert_eq!(out, Outcome::Applied);
         assert_eq!(strategy_of(&s, KEY).as_deref(), Some(PRESET));
         let pr = s.load_preset(PRESET).unwrap();
@@ -661,7 +704,7 @@ mod tests {
             "rutracker.org".into(),
             " RuTracker.org ".into(),
         ];
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert_eq!(out, Outcome::Applied);
         assert_eq!(s.read_list("user").unwrap(), "a.com\nrutracker.org\n");
         assert_eq!(
@@ -678,7 +721,7 @@ mod tests {
         let svc = FakeSvc::new(&s, &root2, vec![st("running", PRESET)]);
         let mut p = plan(&root2);
         p.general_blocked = vec!["A.com".into(), "rutracker.org".into()];
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert_eq!(out, Outcome::Applied);
         assert_eq!(s.read_list("user").unwrap(), "a.com");
         assert!(read_undo(&p.dir).unwrap().added_user_lines.is_empty());
@@ -695,7 +738,7 @@ mod tests {
         let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
         let mut p = plan(&root);
         p.enable_net_strategy = true;
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert_eq!(out, Outcome::Applied);
         assert!(s.settings().0.net_strategy);
         rollback(&s, &svc, &p.dir).await.unwrap();
@@ -712,7 +755,7 @@ mod tests {
         let svc = FakeSvc::new(&s, &root, vec![st("running", "default")]);
         let p = plan(&root);
         let t0 = tokio::time::Instant::now();
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert!(matches!(out, Outcome::RolledBack { .. }), "{out:?}");
         assert!(t0.elapsed() >= WAIT);
         assert_eq!(strategy_of(&s, KEY).as_deref(), Some("alt"));
@@ -735,7 +778,7 @@ mod tests {
             vec![st("running", PRESET), st("running", "default")],
         );
         let p = plan(&root);
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         match &out {
             Outcome::RolledBack { reason } => assert!(reason.contains("запасн"), "{reason}"),
             o => panic!("{o:?}"),
@@ -764,7 +807,7 @@ mod tests {
         );
         let v = FakeVerifier::with(&[("rutracker.org", Proto::Tls13, &[false])]);
         let p = plan(&root);
-        let out = apply(&s, &svc, &v, &p, WAIT).await;
+        let out = apply(&s, &svc, &v, &p, WAIT, &|_| {}).await;
         match &out {
             Outcome::RolledBack { reason } => assert!(reason.contains("запасн"), "{reason}"),
             o => panic!("{o:?}"),
@@ -786,7 +829,7 @@ mod tests {
         let mut svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
         svc.break_undo_at = Some(1);
         let p = plan(&root);
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         match &out {
             Outcome::RolledBack { reason } => assert!(reason.contains("undo.json"), "{reason}"),
             o => panic!("{o:?}"),
@@ -808,7 +851,7 @@ mod tests {
             ("www.youtube.com", Proto::Tls13, &[true]),
         ]);
         let p = plan(&root);
-        let out = apply(&s, &svc, &v, &p, WAIT).await;
+        let out = apply(&s, &svc, &v, &p, WAIT, &|_| {}).await;
         assert_eq!(
             out,
             Outcome::Partial {
@@ -832,7 +875,7 @@ mod tests {
         let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
         let v = FakeVerifier::with(&[("www.youtube.com", Proto::Tls13, &[false])]);
         let p = plan(&root);
-        let out = apply(&s, &svc, &v, &p, WAIT).await;
+        let out = apply(&s, &svc, &v, &p, WAIT, &|_| {}).await;
         assert_eq!(
             out,
             Outcome::Partial {
@@ -855,7 +898,7 @@ mod tests {
             ("www.youtube.com", Proto::Tls13, &[true, false]),
         ]);
         let p = plan(&root);
-        let out = apply(&s, &svc, &v, &p, WAIT).await;
+        let out = apply(&s, &svc, &v, &p, WAIT, &|_| {}).await;
         assert!(matches!(out, Outcome::RolledBack { .. }), "{out:?}");
         assert_eq!(strategy_of(&s, KEY).as_deref(), Some("alt"));
         assert!(s.load_preset(PRESET).is_err());
@@ -870,7 +913,7 @@ mod tests {
         let v = FakeVerifier::with(&[("rutracker.org", Proto::Tls13, &[false])]);
         let mut p = plan(&root);
         p.checks.retain(|c| c.0 == Group::General);
-        let out = apply(&s, &svc, &v, &p, WAIT).await;
+        let out = apply(&s, &svc, &v, &p, WAIT, &|_| {}).await;
         assert!(matches!(out, Outcome::RolledBack { .. }), "{out:?}");
         assert_eq!(strategy_of(&s, KEY), None);
         fs::remove_dir_all(root).ok();
@@ -894,7 +937,7 @@ mod tests {
             "b.ORG ".into(),
             "New.net".into(),
         ];
-        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         assert_eq!(out, Outcome::Applied);
         assert_eq!(
             s.read_list("user").unwrap(),
@@ -925,7 +968,7 @@ mod tests {
         let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
         let p = plan(&root);
         assert_eq!(
-            apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await,
+            apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await,
             Outcome::Applied
         );
         assert_eq!(s.read_list("user").unwrap(), "rutracker.org\n");
@@ -945,11 +988,91 @@ mod tests {
         s.write_list("user", "a.com\n").unwrap();
         let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
         let p = plan(&root);
-        apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
         let t = s.read_list("user").unwrap();
         s.write_list("user", &format!("{t}mine.org\n")).unwrap();
         rollback(&s, &svc, &p.dir).await.unwrap();
         assert_eq!(s.read_list("user").unwrap(), "a.com\nmine.org\n");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Строки проверки через обход: по каждой проверке, повторная — `round` 2; на время
+    /// проверки сообщается начало (пустой список).
+    #[tokio::test(start_paused = true)]
+    async fn verify_rows_reported() {
+        let (s, root) = store("verify-rows");
+        let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
+        let v = FakeVerifier::with(&[("rutracker.org", Proto::Tls13, &[false])]);
+        let p = plan(&root);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let out = apply(&s, &svc, &v, &p, WAIT, &|r: &[VerifyRow]| {
+            seen.borrow_mut().push(r.to_vec())
+        })
+        .await;
+        assert_eq!(
+            out,
+            Outcome::Partial {
+                failed: Group::General
+            }
+        );
+        let seen = seen.into_inner();
+        assert!(seen[0].is_empty());
+        let last: Vec<(&str, Proto, bool, u8)> = seen
+            .last()
+            .unwrap()
+            .iter()
+            .map(|r| (r.domain.as_str(), r.proto, r.ok, r.round))
+            .collect();
+        assert_eq!(
+            last,
+            [
+                ("rutracker.org", Proto::Tls13, false, 1),
+                ("www.youtube.com", Proto::Tls13, true, 1),
+                ("www.youtube.com", Proto::Tls13, true, 2),
+            ]
+        );
+        assert_eq!(seen.last().unwrap()[0].group, Group::General);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Откат по завершённому журналу (стоп после «применено») сначала снимает отметку:
+    /// обрыв посреди отката доведёт восстановление.
+    #[tokio::test(start_paused = true)]
+    async fn rollback_rearms_journal() {
+        let (s, root) = store("rearm");
+        s.set_network_entry(KEY, "Home", "alt").unwrap();
+        let svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
+        let p = plan(&root);
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
+        assert_eq!(out, Outcome::Applied);
+        assert!(read_undo(&p.dir).unwrap().finished);
+        // Обрыв посреди отката: networks.tsv не записать — пресет уже удалён.
+        let nets = s.layout.networks_file();
+        let _ = fs::remove_file(&nets);
+        fs::create_dir_all(&nets).unwrap();
+        assert!(rollback(&s, &svc, &p.dir).await.is_err());
+        assert!(s.load_preset(PRESET).is_err());
+        assert!(!read_undo(&p.dir).unwrap().finished);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Служба не уведомлена при откате — отметки нет, повторный откат её ставит.
+    #[tokio::test(start_paused = true)]
+    async fn rollback_reload_fail_keeps_unfinished() {
+        let (s, root) = store("rb-reload");
+        s.set_network_entry(KEY, "Home", "alt").unwrap();
+        let mut svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
+        svc.fail_reload_at = Some(2);
+        let p = plan(&root);
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT, &|_| {}).await;
+        assert_eq!(out, Outcome::Applied);
+        assert!(rollback(&s, &svc, &p.dir).await.is_err());
+        assert!(!read_undo(&p.dir).unwrap().finished);
+        assert_eq!(strategy_of(&s, KEY).as_deref(), Some("alt"));
+        rollback(&s, &svc, &p.dir).await.unwrap();
+        assert!(read_undo(&p.dir).unwrap().finished);
+        assert_eq!(strategy_of(&s, KEY).as_deref(), Some("alt"));
+        assert_eq!(svc.reloads(), 3);
         fs::remove_dir_all(root).ok();
     }
 
