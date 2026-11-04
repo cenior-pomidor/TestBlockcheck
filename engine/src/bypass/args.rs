@@ -121,6 +121,15 @@ pub fn build(input: &ArgsInput) -> Result<Vec<String>, String> {
             calls_args(input.calls_conf)
         ));
     }
+    // `FOUND_*` — отдельные профили: `--out-range`/`--payload=` найденного не задевают основу.
+    let found_youtube = x(&p.found_youtube);
+    if !found_youtube.is_empty() {
+        let excl = x("--hostlist-exclude=$LISTS_DIR/exclude.list");
+        let yt = x("--hostlist=$LISTS_DIR/youtube.list");
+        push(&format!(
+            "--filter-tcp=443 --filter-l7=tls {yt} {excl} {found_youtube} --new"
+        ));
+    }
     if !custom.is_empty() {
         push(&format!("{custom} --new"));
     }
@@ -132,6 +141,20 @@ pub fn build(input: &ArgsInput) -> Result<Vec<String>, String> {
             push(&format!("{quic} {ipset} --ipset-ip=0.0.0.0 --new"));
         }
         push(&format!("{quic} {extra} --new"));
+    }
+    for (filter, found) in [
+        ("--filter-tcp=443 --filter-l7=tls", x(&p.found_tls)),
+        ("--filter-tcp=80 --filter-l7=http", x(&p.found_http)),
+    ] {
+        if found.is_empty() {
+            continue;
+        }
+        if !ipset.is_empty() {
+            push(&format!(
+                "{filter} {found} {ipset} --ipset-ip=0.0.0.0 --new"
+            ));
+        }
+        push(&format!("{filter} {found} {extra} --new"));
     }
     if !ipset.is_empty() {
         push(&format!("{tcp} {ipset} --ipset-ip=0.0.0.0 --new"));
@@ -206,6 +229,114 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 672);
+    }
+
+    /// Профили `--new`-разделённого списка аргументов.
+    fn profiles(args: &[String]) -> Vec<Vec<String>> {
+        args.split(|a| a == "--new")
+            .map(<[String]>::to_vec)
+            .collect()
+    }
+
+    /// Сборка `alt` с заданными `FOUND_*` (youtube, tls, http), раскладка `/m`, `/d`.
+    fn found_build(found: (&str, &str, &str), ipset: bool, mode: &str) -> Vec<Vec<String>> {
+        let layout = Layout {
+            module_dir: "/m".into(),
+            data_dir: "/d".into(),
+        };
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../module");
+        let text = std::fs::read_to_string(format!("{root}/strategies/alt.conf")).unwrap();
+        let mut preset = parse_preset(&text).unwrap();
+        preset.found_youtube = found.0.into();
+        preset.found_tls = found.1.into();
+        preset.found_http = found.2.into();
+        let mut s = Settings::default();
+        s.set("MODE", mode).unwrap();
+        let a = build(&ArgsInput {
+            preset: &preset,
+            settings: &s,
+            layout: &layout,
+            ipset_nonempty: ipset,
+            calls_conf: "",
+        })
+        .unwrap();
+        profiles(&a)
+    }
+
+    fn has(p: &[String], tok: &str) -> bool {
+        p.iter().any(|a| a == tok)
+    }
+
+    const IPSET: &str = "--ipset-ip=0.0.0.0";
+    const USER: &str = "--hostlist=/m/lists/user.list";
+
+    #[test]
+    fn found_order() {
+        let p = found_build(
+            ("--lua-desync=Y", "--lua-desync=T", "--lua-desync=H"),
+            true,
+            "list",
+        );
+        // YouTube: в первом профиле, сразу после базы.
+        assert!(has(&p[0], "--lua-init=@/m/lua/zapret-lib.lua"));
+        assert_eq!(p[0].last().unwrap(), "--lua-desync=Y");
+        // Хвост: UDP, QUIC x2, T x2, H x2, NFQWS_ARGS x2 (последний без `--new`).
+        let n = p.len();
+        let tail = &p[n - 9..];
+        assert!(has(&tail[0], "--filter-udp=19294-19344,50000-50032"));
+        assert!(has(&tail[1], "--filter-udp=443") && has(&tail[1], IPSET));
+        assert!(has(&tail[2], "--filter-udp=443") && has(&tail[2], USER));
+        assert!(has(&tail[3], "--lua-desync=T") && has(&tail[3], IPSET));
+        assert!(has(&tail[4], "--lua-desync=T") && has(&tail[4], USER));
+        assert!(has(&tail[5], "--lua-desync=H") && has(&tail[5], IPSET));
+        assert!(has(&tail[6], "--lua-desync=H") && has(&tail[6], USER));
+        assert!(has(&tail[7], "--filter-tcp=80,443") && has(&tail[7], IPSET));
+        assert!(has(&tail[8], "--filter-tcp=80,443") && !has(&tail[8], IPSET));
+        // Между YouTube и UDP: только профили CUSTOM, без найденного.
+        for mid in &p[1..n - 9] {
+            assert!(!has(mid, "--lua-desync=T") && !has(mid, "--lua-desync=H"));
+            assert!(!has(mid, "--lua-desync=Y"));
+        }
+        // Без ipset ipset-вариантов нет.
+        let q = found_build(("", "--lua-desync=T", "--lua-desync=H"), false, "list");
+        assert!(q.iter().all(|x| !has(x, IPSET)));
+    }
+
+    #[test]
+    fn found_youtube_profile() {
+        let p = found_build(("--lua-desync=Y", "", ""), false, "list");
+        let want: Vec<String> = [
+            "--filter-tcp=443",
+            "--filter-l7=tls",
+            "--hostlist=/m/lists/youtube.list",
+            "--hostlist-exclude=/m/lists/exclude.list",
+            "--lua-desync=Y",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(p[0][p[0].len() - want.len()..], want[..]);
+    }
+
+    #[test]
+    fn found_tls_http_profiles() {
+        let p = found_build(("", "--lua-desync=T", "--lua-desync=H"), false, "auto");
+        let n = p.len();
+        // ... T, H, NFQWS_ARGS
+        let (t, h) = (&p[n - 3], &p[n - 2]);
+        assert_eq!(t[..2], ["--filter-tcp=443", "--filter-l7=tls"]);
+        assert_eq!(h[..2], ["--filter-tcp=80", "--filter-l7=http"]);
+        for prof in [t, h] {
+            assert!(prof.last().unwrap().starts_with("--hostlist-exclude="));
+            assert!(has(prof, "--hostlist-auto=/m/lists/auto.list"));
+        }
+    }
+
+    #[test]
+    fn found_empty_no_profile() {
+        let p = found_build(("--lua-desync=Y", "--lua-desync=T", ""), true, "list");
+        assert!(!p
+            .iter()
+            .any(|x| has(x, "--filter-tcp=80") && has(x, "--filter-l7=http")));
     }
 
     #[test]
