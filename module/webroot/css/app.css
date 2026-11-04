@@ -41,6 +41,10 @@ textarea, input, select {
 }
 textarea { min-height: 40vh; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.4 ui-monospace, monospace; }
+table.grid { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+.grid th, .grid td { text-align: left; padding: 4px 6px 4px 0; border-top: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.grid code { font: 12px/1.4 ui-monospace, monospace; }
+.grid td.ok { color: var(--good); } .grid td.fail { color: var(--bad); }
 #toast {
   position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
   background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 10px;

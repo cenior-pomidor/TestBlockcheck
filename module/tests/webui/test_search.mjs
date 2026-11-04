@@ -36,6 +36,43 @@ check(/<pre[^>]*>[^<]*fake_default_tls/.test(r) && r.includes('fake_default_http
 const ok = S.renderState({ ...rep, outcome: 'applied' });
 check(ok.includes('Откройте видео в YouTube'), 'просьба открыть видео');
 check(!S.renderState({ ...rep, outcome: 'not_found' }).includes('Откройте видео'), 'просьбы нет при not_found');
+
+// Цифры check (спека §7.2)
+check(rep.check.length === 4 && rep.verify.length === 5, 'образец: check и verify');
+check(r.includes('Проверка check'), 'таблица check');
+check(r.includes('3/3') && r.includes('91 %') && r.includes('2/3') && r.includes('64 %'), 'full/total и медиана');
+check(r.includes('multidisorder:pos=1') && r.includes('1/3'), 'невыбранная строка check');
+check((r.match(/выбрана/g) || []).length === 3, 'отметка «выбрана» у трёх выбранных');
+const chk = S.renderState({ ...rep, check: [{ group: 'general', chain: 'tls', args: '<img src=x>', full: 1, total: '<b>', median_pct: null, picked: false }] });
+check(!chk.includes('<img') && !chk.includes('<b>') && chk.includes('&lt;img'), 'экранирование check');
+check(chk.includes('—') && !chk.includes('выбрана'), 'медиана без значения, не выбрана');
+// Проверка через обход
+check(r.includes('Проверка через обход'), 'таблица проверки через обход');
+check(r.includes('www.youtube.com') && r.includes('TLS 1.3') && r.includes('HTTP'), 'домен и протокол');
+check(r.includes('ok') && r.includes('сбой'), 'ok/сбой');
+check(/<td>2<\/td>/.test(r) && /<td>1<\/td>/.test(r), 'номер круга');
+const ver = S.renderState({ ...rep, verify: [{ group: 'general', domain: '<script>', proto: '<i>', ok: true, round: '<u>' }] });
+check(!ver.includes('<script>') && !ver.includes('<i>') && !ver.includes('<u>'), 'экранирование проверки через обход');
+check(!S.renderState({ ...rep, check: [], verify: [] }).includes('Проверка check'), 'без check — без таблицы');
+check(!S.renderState({ ...rep, check: undefined, verify: undefined }).includes('Проверка через обход'), 'старый state без полей');
+
+// Типы блокировки и шаги
+for (const [b, t] of [['ip_blocked', 'блок по IP'], ['dns_failed', 'нет DNS'], ['deadline', 'срок истёк'], ['stopped', 'остановлено']]) {
+  check(S.renderState({ ...st, domains: [{ group: 'general', domain: 'a.org', block: b, left: null }] }).includes(t), `тип блокировки ${b}`);
+}
+check(S.renderState({ ...st, phase: { check: { group: 'youtube' } } }).includes('YouTube'), 'шаг check');
+check(S.renderState({ ...st, phase: 'verify' }).includes('Проверка через обход'), 'шаг verify');
+
+// Partial: строки провалившейся группы помечены
+const pre = (h) => (h.match(/<pre[^>]*>([^<]*)<\/pre>/) || [])[1] || '';
+const pY = pre(r).split('\n');
+check(pY.some((l) => l.startsWith('youtube:') && l.includes('убрано после проверки')), 'youtube помечен при partial youtube');
+check(pY.filter((l) => l.includes('убрано после проверки')).length === 1, 'tls/http не помечены при partial youtube');
+const pG = pre(S.renderState({ ...rep, outcome: { partial: { failed: 'general' } } })).split('\n');
+check(pG.filter((l) => l.includes('убрано после проверки')).length === 2
+  && pG.some((l) => l.startsWith('tls:') && l.includes('убрано')) && pG.some((l) => l.startsWith('http:') && l.includes('убрано')), 'tls и http помечены при partial general');
+check(!S.renderState({ ...rep, outcome: 'applied' }).includes('убрано после проверки'), 'applied без пометок');
+
 const er = S.renderState({ ...st, outcome: null, error: 'нет сети <x>' });
 check(er.includes('нет сети &lt;x&gt;'), 'ошибка до шага 1');
 

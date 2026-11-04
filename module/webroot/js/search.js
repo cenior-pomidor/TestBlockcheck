@@ -5,7 +5,14 @@ import { cmd } from './commands.js';
 
 const GROUPS = { general: 'Общие', youtube: 'YouTube' };
 const LISTS = { general: 'search-general', youtube: 'search-youtube' };
-const BLOCKS = { sni_blocked: 'блок по SNI', not_blocked: 'не заблокирован', throttled: 'замедление' };
+const BLOCKS = {
+  sni_blocked: 'блок по SNI', not_blocked: 'не заблокирован', throttled: 'замедление',
+  ip_blocked: 'блок по IP', dns_failed: 'нет DNS', deadline: 'срок истёк', stopped: 'остановлено',
+};
+const PROTOS = { tls13: 'TLS 1.3', tls12: 'TLS 1.2', http: 'HTTP' };
+const CHAINS = { tls: 'TLS', http: 'HTTP' };
+/** Группа строки `found`. */
+const FOUND_GROUP = { youtube: 'youtube', tls: 'general', http: 'general' };
 const STEPS = {
   prepare: 'Подготовка', baseline: 'Проверка доменов', apply: 'Применение', verify: 'Проверка через обход',
   rollback: 'Откат', done: 'Готово',
@@ -64,8 +71,25 @@ export function renderState(s) {
     + `<span class="hint">${esc(BLOCKS[d.block] || d.block || '—')}${d.left == null ? '' : ` · осталось ${esc(d.left)}`}</span></div>`).join('');
   if (rows) out.push(`<div class="card">${rows}</div>`);
   const f = s.found || {};
-  const lines = ['tls', 'http', 'youtube'].filter((k) => f[k]).map((k) => `${k}: ${f[k]}`);
+  // «Применено частично»: строки провалившейся группы убраны из пресета.
+  const dropped = s.outcome && s.outcome.partial ? s.outcome.partial.failed : null;
+  const lines = ['tls', 'http', 'youtube'].filter((k) => f[k])
+    .map((k) => `${k}: ${f[k]}${FOUND_GROUP[k] === dropped ? ' — убрано после проверки' : ''}`);
   if (lines.length) out.push(`<h2>Найдено</h2><pre>${esc(lines.join('\n'))}</pre>`);
+  const check = (s.check || []).map((c) => `<tr><td>${esc(group(c.group))} · ${esc(CHAINS[c.chain] || c.chain)}</td>`
+    + `<td><code>${esc(c.args)}</code></td><td>${esc(c.full)}/${esc(c.total)}</td>`
+    + `<td>${c.median_pct == null ? '—' : `${esc(c.median_pct)} %`}</td><td>${c.picked ? 'выбрана' : ''}</td></tr>`).join('');
+  if (check) {
+    out.push('<h2>Проверка check</h2><table class="grid"><tr><th>Цепочка</th><th>Стратегия</th>'
+      + `<th>Полная доставка</th><th>Медиана</th><th></th></tr>${check}</table>`);
+  }
+  const verify = (s.verify || []).map((v) => `<tr><td>${esc(group(v.group))} · ${esc(v.domain)}</td>`
+    + `<td>${esc(PROTOS[v.proto] || v.proto)}</td><td class="${v.ok ? 'ok' : 'fail'}">${v.ok ? 'ok' : 'сбой'}</td>`
+    + `<td>${esc(v.round)}</td></tr>`).join('');
+  if (verify) {
+    out.push('<h2>Проверка через обход</h2><table class="grid"><tr><th>Домен</th><th>Протокол</th>'
+      + `<th>Итог</th><th>Круг</th></tr>${verify}</table>`);
+  }
   return out.join('');
 }
 
