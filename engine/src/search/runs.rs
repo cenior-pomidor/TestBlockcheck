@@ -76,7 +76,7 @@ pub fn new_id(at: &NaiveStamp) -> String {
     )
 }
 
-fn is_id(name: &str) -> bool {
+pub fn is_id(name: &str) -> bool {
     let b = name.as_bytes();
     b.len() == 15
         && b[8] == b'-'

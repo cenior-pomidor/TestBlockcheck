@@ -9,6 +9,7 @@ pub mod assemble;
 pub mod job;
 pub mod narrow;
 pub mod runs;
+pub mod system;
 
 /// Местное время без пояса (считает вызывающий).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
