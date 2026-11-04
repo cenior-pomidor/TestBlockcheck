@@ -16,6 +16,10 @@ use blockcheckw::bypass::logs;
 use blockcheckw::bypass::preset::parse_preset;
 use blockcheckw::bypass::settings::KEYS;
 use blockcheckw::bypass::store::{Store, LIST_NAMES};
+use blockcheckw::bypass::supervisor::Status;
+use blockcheckw::search::apply::SvcLink;
+
+use super::search::{self, SearchAction};
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum CtlCmd {
@@ -75,6 +79,11 @@ pub enum CtlCmd {
     Upload {
         #[command(subcommand)]
         action: UploadAction,
+    },
+    /// Поиск стратегий: start | status | stop | runs | report.
+    Search {
+        #[command(subcommand)]
+        action: SearchAction,
     },
 }
 
@@ -163,6 +172,29 @@ impl CtlEnv for SystemEnv {
             .await
     }
 }
+
+/// Служба через окружение команд — для отката, который доводит `search status`/`start`.
+struct EnvSvc<'a, E>(&'a E);
+
+impl<E: CtlEnv> SvcLink for EnvSvc<'_, E> {
+    async fn status(&self) -> Option<Status> {
+        self.0
+            .call(Request::Status)
+            .await
+            .ok()
+            .and_then(|r| r.status)
+    }
+    async fn reload(&self) -> Result<(), String> {
+        match self.0.call(Request::Reload).await {
+            Ok(r) if r.ok => Ok(()),
+            Ok(r) => Err(r.error.unwrap_or_else(|| "служба отказала".into())),
+            Err(e) => Err(call_error(e)),
+        }
+    }
+}
+
+/// Замок `search start`: два одновременных запуска не порождают двух заданий.
+const SEARCH_START_LOCK: &str = "bcw.search.start";
 
 type Out = Result<Value, String>;
 
@@ -489,6 +521,21 @@ pub async fn execute<E: CtlEnv>(cmd: &CtlCmd, store: &Store, env: &E) -> Out {
             "bcw": env!("CARGO_PKG_VERSION"),
             "module": module_version(layout),
         })),
+        CtlCmd::Search { action } => {
+            let _lock = match action {
+                SearchAction::Start { .. } => {
+                    Some(super::bind_instance_lock(SEARCH_START_LOCK).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::AddrInUse {
+                            "поиск уже идёт".to_string()
+                        } else {
+                            format!("замок поиска: {e}")
+                        }
+                    })?)
+                }
+                _ => None,
+            };
+            search::execute(action, store, &EnvSvc(env), &search::SystemSys).await
+        }
         CtlCmd::Upload { action } => match action {
             UploadAction::Begin => {
                 std::fs::create_dir_all(layout.tmp_dir()).map_err(|e| e.to_string())?;
@@ -835,6 +882,33 @@ mod tests {
         assert!(matches!(&parsed["logsClear"], CtlCmd::Logs { file, .. } if file == "clear"));
         assert!(
             matches!(&parsed["listSet"], CtlCmd::List { action: ListAction::Set { name, .. } } if name == "user")
+        );
+        assert!(
+            matches!(&parsed["searchStart"], CtlCmd::Search { action: SearchAction::Start { enable_net_strategy: false, base: Some(b) } } if b == "-x")
+        );
+        assert!(
+            matches!(&parsed["searchStartNet"], CtlCmd::Search { action: SearchAction::Start { enable_net_strategy: true, base: Some(b) } } if b == "-x")
+        );
+        assert!(matches!(
+            &parsed["searchStatus"],
+            CtlCmd::Search {
+                action: SearchAction::Status
+            }
+        ));
+        assert!(matches!(
+            &parsed["searchStop"],
+            CtlCmd::Search {
+                action: SearchAction::Stop
+            }
+        ));
+        assert!(matches!(
+            &parsed["searchRuns"],
+            CtlCmd::Search {
+                action: SearchAction::Runs
+            }
+        ));
+        assert!(
+            matches!(&parsed["searchReport"], CtlCmd::Search { action: SearchAction::Report { id } } if id == "20261104-194620")
         );
     }
 

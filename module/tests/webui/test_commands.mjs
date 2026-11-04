@@ -13,6 +13,8 @@ const calls = {
   strategyApplyNetwork: [N], strategyApplyDefault: [N], settingsGet: [], settingsSet: ['TCP_MSS_CLAMP', V],
   lists: [], listGet: ['user'], listSet: ['user', P], logs: ['service', 500, true], logsClear: [],
   stats: [], version: [], uploadBegin: [], uploadChunk: [P, '+/AA'], uploadEnd: [P],
+  searchStart: [N], searchStartNet: [N], searchStatus: [], searchStop: [], searchRuns: [],
+  searchReport: ['20261104-194620'],
 };
 check(Object.keys(calls).sort().join() === Object.keys(cmd).sort().join(), 'не все команды перечислены');
 const argv = Object.fromEntries(Object.entries(calls).map(([k, a]) => [k, cmd[k](...a)]));

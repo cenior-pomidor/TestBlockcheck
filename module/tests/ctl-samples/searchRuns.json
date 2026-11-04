@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "runs": [
+    {
+      "error": null,
+      "id": "20261104-194620",
+      "network_title": "Wi-Fi «Home»",
+      "outcome": null,
+      "time": "2026-11-04 19:46:20"
+    },
+    {
+      "error": null,
+      "id": "20261104-180000",
+      "network_title": "Wi-Fi «Home»",
+      "outcome": {
+        "partial": {
+          "failed": "youtube"
+        }
+      },
+      "time": "2026-11-04 18:00:00"
+    },
+    {
+      "error": null,
+      "id": "20261104-170000",
+      "network_title": "Wi-Fi «Home»",
+      "outcome": {
+        "rolled_back": {
+          "reason": "проверка через обход не прошла"
+        }
+      },
+      "time": "2026-11-04 17:00:00"
+    }
+  ],
+  "schema": 1
+}

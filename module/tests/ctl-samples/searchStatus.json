@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "recovered": false,
+  "schema": 1,
+  "state": {
+    "base": "default",
+    "domains": [
+      {
+        "block": "sni_blocked",
+        "domain": "rutracker.org",
+        "group": "general",
+        "left": 37
+      }
+    ],
+    "done": 120,
+    "elapsed_s": 63,
+    "error": null,
+    "found": {
+      "http": null,
+      "tls": null,
+      "youtube": null
+    },
+    "id": "20261104-194620",
+    "network_title": "Wi-Fi «Home»",
+    "outcome": null,
+    "phase": {
+      "narrow": {
+        "group": "general"
+      }
+    },
+    "pid": 4242,
+    "schema": 1,
+    "total": 480
+  }
+}

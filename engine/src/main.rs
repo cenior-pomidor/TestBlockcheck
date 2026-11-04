@@ -127,7 +127,26 @@ enum SvcAction {
 }
 
 #[derive(Subcommand)]
+enum SearchCmd {
+    /// Одно задание поиска (запускает `bcw ctl search start`).
+    Run {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        enable_net_strategy: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Задание поиска стратегий (внутренняя, для `bcw ctl search`).
+    #[command(hide = true)]
+    Search {
+        #[command(subcommand)]
+        action: SearchCmd,
+    },
     /// Run parallel scaling benchmark to find optimal worker count
     Benchmark {
         /// Seconds to run per worker-count level
@@ -923,6 +942,24 @@ async fn main() {
                     output: output.as_deref(),
                     via: None,
                 })
+                .await;
+            }
+            Some(Command::Search {
+                action:
+                    SearchCmd::Run {
+                        id,
+                        base,
+                        enable_net_strategy,
+                    },
+            }) => {
+                cmd::search::run_job_cmd(
+                    id,
+                    base,
+                    enable_net_strategy,
+                    prereq
+                        .as_ref()
+                        .expect("search requires prerequisites (skipped only for `status`)"),
+                )
                 .await;
             }
             Some(Command::Doctor) => unreachable!("doctor обрабатывается до elevation"),

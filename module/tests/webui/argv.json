@@ -140,5 +140,36 @@
   "upload",
   "end",
   "/data/adb/bcw/tmp/upload-1-2"
+ ],
+ "searchStart": [
+  "search",
+  "start",
+  "--",
+  "-x"
+ ],
+ "searchStartNet": [
+  "search",
+  "start",
+  "--enable-net-strategy",
+  "--",
+  "-x"
+ ],
+ "searchStatus": [
+  "search",
+  "status"
+ ],
+ "searchStop": [
+  "search",
+  "stop"
+ ],
+ "searchRuns": [
+  "search",
+  "runs"
+ ],
+ "searchReport": [
+  "search",
+  "report",
+  "--",
+  "20261104-194620"
  ]
 }

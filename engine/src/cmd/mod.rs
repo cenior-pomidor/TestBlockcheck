@@ -3,6 +3,7 @@ pub mod check;
 pub mod ctl;
 pub mod doctor;
 pub mod scan;
+pub mod search;
 pub mod status;
 pub mod svc;
 pub mod universal;

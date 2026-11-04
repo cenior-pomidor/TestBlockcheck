@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "schema": 1,
+  "state": {
+    "base": "alt",
+    "domains": [
+      {
+        "block": "sni_blocked",
+        "domain": "rutracker.org",
+        "group": "general",
+        "left": 3
+      },
+      {
+        "block": "not_blocked",
+        "domain": "example.com",
+        "group": "general",
+        "left": null
+      },
+      {
+        "block": "throttled",
+        "domain": "www.youtube.com",
+        "group": "youtube",
+        "left": 0
+      }
+    ],
+    "done": 12,
+    "elapsed_s": 187,
+    "error": null,
+    "found": {
+      "http": "--payload=http_req --lua-desync=fake:blob=fake_default_http",
+      "tls": "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls",
+      "youtube": null
+    },
+    "id": "20261104-180000",
+    "network_title": "Wi-Fi «Home»",
+    "outcome": {
+      "partial": {
+        "failed": "youtube"
+      }
+    },
+    "phase": "done",
+    "pid": 7,
+    "schema": 1,
+    "total": 12
+  }
+}

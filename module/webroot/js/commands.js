@@ -31,4 +31,10 @@ export const cmd = {
   uploadBegin: () => ['upload', 'begin'],
   uploadChunk: (path, data) => ['upload', 'chunk', path, data],
   uploadEnd: (path) => ['upload', 'end', path],
+  searchStart: (base) => ['search', 'start', '--', base],
+  searchStartNet: (base) => ['search', 'start', '--enable-net-strategy', '--', base],
+  searchStatus: () => ['search', 'status'],
+  searchStop: () => ['search', 'stop'],
+  searchRuns: () => ['search', 'runs'],
+  searchReport: (id) => ['search', 'report', '--', id],
 };
