@@ -3,7 +3,11 @@ import { LONG, ctl, uploadText } from './bridge.js';
 import { esc, button } from './util.js';
 import { cmd } from './commands.js';
 
-export const KEYS = ['NFQWS_BASE_ARGS', 'NFQWS_ARGS', 'NFQWS_ARGS_QUIC', 'NFQWS_ARGS_UDP', 'NFQWS_ARGS_IPSET', 'NFQWS_ARGS_CUSTOM'];
+export const KEYS = ['NFQWS_BASE_ARGS', 'NFQWS_ARGS', 'NFQWS_ARGS_QUIC', 'NFQWS_ARGS_UDP', 'NFQWS_ARGS_IPSET', 'NFQWS_ARGS_CUSTOM', 'FOUND_YOUTUBE', 'FOUND_TLS', 'FOUND_HTTP'];
+const FOUND = KEYS.slice(6);
+const BASE = KEYS.slice(0, 6);
+/** Поля `FOUND_*` нужны, только если в пресете хотя бы одно непустое. */
+const hasFound = (fields) => FOUND.some((k) => String(fields?.[k] ?? '').trim() !== '');
 const LABELS = {
   NFQWS_BASE_ARGS: 'Общие аргументы (lua, blob)',
   NFQWS_ARGS: 'TCP',
@@ -11,6 +15,9 @@ const LABELS = {
   NFQWS_ARGS_UDP: 'UDP',
   NFQWS_ARGS_IPSET: 'Списки IP',
   NFQWS_ARGS_CUSTOM: 'Дополнительно',
+  FOUND_YOUTUBE: 'Найдено: YouTube',
+  FOUND_TLS: 'Найдено: TLS',
+  FOUND_HTTP: 'Найдено: HTTP',
 };
 
 /** Список стратегий; текущая берётся из `ctl status`. */
@@ -42,7 +49,7 @@ export function renderEditor(s) {
   const head = isNew
     ? '<label>Имя новой стратегии<input name="name" autocomplete="off" spellcheck="false" placeholder="my-strategy"></label>'
     : `<h2>${esc(s.name)}${s.modified ? ' <span class="tag warn">изменён</span>' : ''}</h2>`;
-  const areas = KEYS.map((k) => `<label>${esc(LABELS[k])} <small class="hint">${k}</small>`
+  const areas = (hasFound(fields) ? KEYS : BASE).map((k) => `<label>${esc(LABELS[k])} <small class="hint">${k}</small>`
     + `<textarea name="${k}" spellcheck="false" autocapitalize="off" rows="4">${esc(dedent(fields[k]))}</textarea></label>`).join('');
   const acts = [button('save', 'Сохранить')];
   if (!isNew) {
@@ -63,7 +70,7 @@ export function pktLines(text) {
 /** Поля редактора → текст пресета: по ключу на строку, значение в двойных кавычках.
  *  Лимиты пакетов из исходного текста (`original`) переносятся без изменений. */
 export function editorToText(fields, original = '') {
-  const keys = KEYS.map((k) => {
+  const keys = (hasFound(fields) ? KEYS : BASE).map((k) => {
     const v = String(fields[k] ?? '').replace(/\r\n?/g, '\n').trim();
     if (v.includes('"')) throw new Error(`${k}: двойная кавычка в значении не поддерживается`);
     return `${k}="${v}"\n`;
@@ -74,7 +81,7 @@ export function editorToText(fields, original = '') {
 
 function readFields(form) {
   const f = {};
-  for (const k of KEYS) f[k] = form.elements[k].value;
+  for (const k of KEYS) if (form.elements[k]) f[k] = form.elements[k].value;
   return f;
 }
 

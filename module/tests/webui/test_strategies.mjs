@@ -41,4 +41,16 @@ check(!/\n +--/.test(renderEditor(get)), 'отступы строк в реда�
 check(dedent('a\n    b  ') === 'a\nb', 'dedent');
 const withPkt = editorToText(get.fields, 'X=1\nNFQWS2_TCP_PKT_OUT=20\n# NFQWS2_UDP_PKT_IN=5\n');
 check(withPkt.includes('\nNFQWS2_TCP_PKT_OUT=20\n# NFQWS2_UDP_PKT_IN=5\n') && !withPkt.includes('X=1'), 'лимиты пакетов переносятся');
+// FOUND_*: показываются только при непустом значении; значение сохраняется при сборке.
+check(!/FOUND_/.test(e) && !/FOUND_/.test(text), 'found_hidden: без FOUND_* поля и ключи не выводятся');
+const foundFields = { ...get.fields, FOUND_TLS: '--lua-desync=T' };
+const fe = renderEditor({ ...get, fields: foundFields });
+check(fe.includes('name="FOUND_TLS"') && fe.includes('name="FOUND_YOUTUBE"') && fe.includes('name="FOUND_HTTP"'), 'found: три поля при непустом FOUND_*');
+check(fe.includes('Найдено: YouTube') && fe.includes('Найдено: TLS') && fe.includes('Найдено: HTTP'), 'found: подписи');
+check(fe.includes('--lua-desync=T</textarea>'), 'found: значение в поле');
+const ft = editorToText(foundFields);
+check(ft.includes('FOUND_TLS="--lua-desync=T"\n') && ft.includes('FOUND_YOUTUBE=""\n') && ft.includes('FOUND_HTTP=""\n'), 'roundtrip_found: все три ключа');
+let thr = false;
+try { editorToText({ ...foundFields, FOUND_TLS: 'a"b' }); } catch (_) { thr = true; }
+check(thr, 'found: кавычка отвергается');
 done('test_strategies');
