@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Protocol;
 
+pub mod apply;
 pub mod assemble;
 pub mod narrow;
 pub mod runs;

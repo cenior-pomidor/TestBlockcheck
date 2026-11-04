@@ -295,6 +295,24 @@ impl Store {
         self.save_networks(&nets)
     }
 
+    /// Как `set_network_entry`, но существующая запись меняется на своём месте (порядок
+    /// строк сохраняется — для применения найденного и точного отката).
+    pub fn put_network_entry(&self, key: &str, title: &str, strategy: &str) -> io::Result<()> {
+        let (mut nets, _) = self.networks();
+        match nets.iter_mut().find(|n| n.key == key) {
+            Some(n) => {
+                n.title = title.into();
+                n.strategy = strategy.into();
+            }
+            None => nets.push(SavedNetwork {
+                key: key.into(),
+                title: title.into(),
+                strategy: strategy.into(),
+            }),
+        }
+        self.save_networks(&nets)
+    }
+
     pub fn delete_network(&self, key: &str) -> io::Result<()> {
         let (mut nets, _) = self.networks();
         nets.retain(|n| n.key != key);
@@ -506,6 +524,27 @@ mod tests {
         );
         s.delete_network(&cafe.key()).unwrap();
         assert_eq!(s.networks().0.len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn put_network_keeps_order() {
+        let (s, root) = store("put");
+        s.set_network_entry("a", "A", "alt").unwrap();
+        s.set_network_entry("b", "B", "alt4").unwrap();
+        let before = std::fs::read_to_string(s.layout.networks_file()).unwrap();
+        s.put_network_entry("a", "A", "default").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(s.layout.networks_file()).unwrap(),
+            "a\tA\tdefault\nb\tB\talt4\n"
+        );
+        s.put_network_entry("a", "A", "alt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(s.layout.networks_file()).unwrap(),
+            before
+        );
+        s.put_network_entry("c", "C", "alt").unwrap();
+        assert_eq!(s.networks().0.last().unwrap().key, "c");
         std::fs::remove_dir_all(root).ok();
     }
 

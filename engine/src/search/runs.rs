@@ -59,6 +59,9 @@ pub struct Undo {
     pub prev_net_strategy: bool,
     pub preset: String,
     pub added_user_lines: Vec<String>,
+    /// В `user.list` до добавления не было завершающего перевода строки.
+    #[serde(default)]
+    pub user_list_no_eol: bool,
     pub finished: bool,
 }
 
@@ -222,6 +225,7 @@ mod tests {
             prev_net_strategy: true,
             preset: "found-default-20261104-1946".into(),
             added_user_lines: vec!["a.org".into()],
+            user_list_no_eol: false,
             finished: false,
         };
         write_undo(&d, &u).unwrap();

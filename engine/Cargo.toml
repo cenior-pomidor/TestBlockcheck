@@ -56,6 +56,7 @@ otel = [
 ]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [[test]]
 name = "parallel_benchmark"
