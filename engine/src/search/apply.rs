@@ -66,7 +66,7 @@ pub async fn apply<S: SvcLink, V: Verifier>(
     } else {
         Vec::new()
     };
-    let mut undo = Undo {
+    let undo = Undo {
         network_key: plan.network_key.clone(),
         prev_strategy: prev.map(|n| n.strategy.clone()),
         network_title: prev
@@ -104,11 +104,11 @@ pub async fn apply<S: SvcLink, V: Verifier>(
             failed.push(*g);
         }
     }
+    if let Err(e) = still_on(svc, &plan.preset).await {
+        return fail(store, svc, &plan.dir, e).await;
+    }
     match (groups.as_slice(), failed.as_slice()) {
-        (_, []) => {
-            finish(&plan.dir, &mut undo);
-            Outcome::Applied
-        }
+        (_, []) => finish(store, svc, &plan.dir, undo, Outcome::Applied).await,
         ([_, _], [f]) => {
             let f = *f;
             let passed = if f == Group::General {
@@ -137,9 +137,12 @@ pub async fn apply<S: SvcLink, V: Verifier>(
             if let Err(e) = restart(svc, &plan.preset, wait).await {
                 return fail(store, svc, &plan.dir, e).await;
             }
-            if group_ok(v, plan, passed).await {
-                finish(&plan.dir, &mut undo);
-                Outcome::Partial { failed: f }
+            let ok = group_ok(v, plan, passed).await;
+            if let Err(e) = still_on(svc, &plan.preset).await {
+                return fail(store, svc, &plan.dir, e).await;
+            }
+            if ok {
+                finish(store, svc, &plan.dir, undo, Outcome::Partial { failed: f }).await
             } else {
                 fail(
                     store,
@@ -168,7 +171,17 @@ pub async fn apply<S: SvcLink, V: Verifier>(
 /// Полный откат по `undo.json` (п. 6). Повторный вызов ничего не меняет. При ошибке отметка
 /// завершения не ставится — откат можно довести позже.
 pub async fn rollback<S: SvcLink>(store: &Store, svc: &S, dir: &Path) -> Result<(), String> {
-    let mut u = read_undo(dir).ok_or_else(|| "нет журнала отмены undo.json".to_string())?;
+    let u = read_undo(dir).ok_or_else(|| "нет журнала отмены undo.json".to_string())?;
+    rollback_with(store, svc, dir, u).await
+}
+
+/// Откат по журналу в памяти (нужен, когда сам `undo.json` больше не записывается).
+async fn rollback_with<S: SvcLink>(
+    store: &Store,
+    svc: &S,
+    dir: &Path,
+    mut u: Undo,
+) -> Result<(), String> {
     let mut errs: Vec<String> = Vec::new();
 
     let (nets, _) = store.networks();
@@ -215,8 +228,10 @@ pub async fn rollback<S: SvcLink>(store: &Store, svc: &S, dir: &Path) -> Result<
         return Err(errs.join("; "));
     }
     u.finished = true;
-    write_undo(dir, &u).map_err(|e| format!("undo.json: {e}"))?;
-    svc.reload().await
+    // Файлы уже прежние — службу уведомляем, даже если отметку не записать.
+    let w = write_undo(dir, &u).map_err(|e| format!("undo.json: {e}"));
+    let r = svc.reload().await;
+    w.and(r)
 }
 
 fn nothing_changed(reason: String) -> Outcome {
@@ -288,8 +303,24 @@ fn group_title(g: Group) -> &'static str {
     }
 }
 
-async fn fail<S: SvcLink>(store: &Store, svc: &S, dir: &Path, reason: String) -> Outcome {
-    match rollback(store, svc, dir).await {
+/// После проверки служба всё ещё на пресете: nfqws2 мог упасть после первого опроса, и
+/// тогда проверки шли через запасную стратегию.
+async fn still_on<S: SvcLink>(svc: &S, preset: &str) -> Result<(), String> {
+    match svc.status().await {
+        Some(st) if st.state == "running" && st.strategy.as_deref() == Some(preset) => Ok(()),
+        Some(st) => Err(format!(
+            "во время проверки служба ушла с «{preset}» на запасную стратегию ({}, {})",
+            st.state,
+            st.strategy.as_deref().unwrap_or("—")
+        )),
+        None => Err(format!(
+            "во время проверки служба перестала отвечать; возможен переход с «{preset}» на запасную стратегию"
+        )),
+    }
+}
+
+fn rolled_back(reason: String, r: Result<(), String>) -> Outcome {
+    match r {
         Ok(()) => Outcome::RolledBack { reason },
         Err(e) => Outcome::RolledBack {
             reason: format!("{reason}; откат: {e}"),
@@ -297,11 +328,28 @@ async fn fail<S: SvcLink>(store: &Store, svc: &S, dir: &Path, reason: String) ->
     }
 }
 
-fn finish(dir: &Path, undo: &mut Undo) {
+async fn fail<S: SvcLink>(store: &Store, svc: &S, dir: &Path, reason: String) -> Outcome {
+    rolled_back(reason, rollback(store, svc, dir).await)
+}
+
+/// Отметить завершение. Если `undo.json` не записать (и со второй попытки), итог «применено»
+/// разошёлся бы с диском — восстановление откатило бы проверенный результат. Поэтому
+/// откатываем сразу, по журналу в памяти.
+async fn finish<S: SvcLink>(
+    store: &Store,
+    svc: &S,
+    dir: &Path,
+    mut undo: Undo,
+    ok: Outcome,
+) -> Outcome {
     undo.finished = true;
-    if let Err(e) = write_undo(dir, undo) {
-        tracing::warn!("undo.json: отметка завершения не записана: {e}");
-    }
+    let e = match write_undo(dir, &undo).or_else(|_| write_undo(dir, &undo)) {
+        Ok(()) => return ok,
+        Err(e) => e,
+    };
+    undo.finished = false;
+    let reason = format!("не записана отметка завершения в undo.json: {e}");
+    rolled_back(reason, rollback_with(store, svc, dir, undo).await)
 }
 
 /// Сравнение строк `user.list`: без регистра и окружающих пробелов.
@@ -436,6 +484,8 @@ mod tests {
         dir: PathBuf,
         nets: PathBuf,
         seen: Mutex<Vec<Seen>>,
+        /// На этом по счёту `reload` подменить `undo.json` каталогом (запись станет невозможна).
+        break_undo_at: Option<u32>,
     }
 
     impl FakeSvc {
@@ -446,6 +496,7 @@ mod tests {
                 dir: root.join("run"),
                 nets: store.layout.networks_file(),
                 seen: Mutex::new(Vec::new()),
+                break_undo_at: None,
             }
         }
         fn reloads(&self) -> u32 {
@@ -463,7 +514,16 @@ mod tests {
             }
         }
         async fn reload(&self) -> Result<(), String> {
-            *self.reloads.lock().unwrap() += 1;
+            let n = {
+                let mut r = self.reloads.lock().unwrap();
+                *r += 1;
+                *r
+            };
+            if self.break_undo_at == Some(n) {
+                let u = self.dir.join("undo.json");
+                fs::remove_file(&u).unwrap();
+                fs::create_dir_all(u.join("x")).unwrap();
+            }
             self.seen.lock().unwrap().push((
                 read_undo(&self.dir),
                 fs::read_to_string(&self.nets).unwrap_or_default(),
@@ -646,8 +706,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn svc_fallback_is_failure() {
-        let (s, root) = store("fallback");
+    async fn svc_timeout_is_failure() {
+        let (s, root) = store("timeout");
         s.set_network_entry(KEY, "Home", "alt").unwrap();
         let svc = FakeSvc::new(&s, &root, vec![st("running", "default")]);
         let p = plan(&root);
@@ -660,6 +720,80 @@ mod tests {
         // Уведомление при применении и после отката.
         assert_eq!(svc.reloads(), 2);
         assert!(read_undo(&p.dir).unwrap().finished);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Как в службе: сначала новый пресет запущен, затем nfqws2 падает и служба
+    /// переходит на запасную (`last_good`) — проверки при этом могли пройти через неё.
+    #[tokio::test(start_paused = true)]
+    async fn svc_fallback_is_failure() {
+        let (s, root) = store("fallback");
+        s.set_network_entry(KEY, "Home", "alt").unwrap();
+        let svc = FakeSvc::new(
+            &s,
+            &root,
+            vec![st("running", PRESET), st("running", "default")],
+        );
+        let p = plan(&root);
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        match &out {
+            Outcome::RolledBack { reason } => assert!(reason.contains("запасн"), "{reason}"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(strategy_of(&s, KEY).as_deref(), Some("alt"));
+        assert!(s.load_preset(PRESET).is_err());
+        assert_eq!(svc.reloads(), 2);
+        assert!(read_undo(&p.dir).unwrap().finished);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_fallback_is_failure() {
+        let (s, root) = store("partial-fallback");
+        s.set_network_entry(KEY, "Home", "alt").unwrap();
+        // Ожидание 1, после проверки 1, ожидание 2 — пресет; после проверки 2 — запасная.
+        let svc = FakeSvc::new(
+            &s,
+            &root,
+            vec![
+                st("running", PRESET),
+                st("running", PRESET),
+                st("running", PRESET),
+                st("running", "default"),
+            ],
+        );
+        let v = FakeVerifier::with(&[("rutracker.org", Proto::Tls13, &[false])]);
+        let p = plan(&root);
+        let out = apply(&s, &svc, &v, &p, WAIT).await;
+        match &out {
+            Outcome::RolledBack { reason } => assert!(reason.contains("запасн"), "{reason}"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(v.calls("www.youtube.com", Proto::Tls13), 2);
+        assert_eq!(strategy_of(&s, KEY).as_deref(), Some("alt"));
+        assert!(s.load_preset(PRESET).is_err());
+        assert_eq!(svc.reloads(), 3);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Отметку завершения не записать — итог не «применено»: выполнен откат, и
+    /// состояние на диске совпадает с итогом (восстановление не откатит потом «хорошее»).
+    #[tokio::test(start_paused = true)]
+    async fn finish_write_fail_rolls_back() {
+        let (s, root) = store("finish-fail");
+        s.set_network_entry(KEY, "Home", "alt").unwrap();
+        let nets0 = nets_text(&s);
+        let mut svc = FakeSvc::new(&s, &root, vec![st("running", PRESET)]);
+        svc.break_undo_at = Some(1);
+        let p = plan(&root);
+        let out = apply(&s, &svc, &FakeVerifier::default(), &p, WAIT).await;
+        match &out {
+            Outcome::RolledBack { reason } => assert!(reason.contains("undo.json"), "{reason}"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(nets_text(&s), nets0);
+        assert!(s.load_preset(PRESET).is_err());
+        assert_eq!(svc.reloads(), 2);
         fs::remove_dir_all(root).ok();
     }
 
