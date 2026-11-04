@@ -73,6 +73,8 @@ pub trait Control {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupResult {
     pub domains: Vec<DomainState>,
+    /// Заблокированные (`Sni`/`Throttled`) пары базовой проверки, по доменам по порядку.
+    pub blocked: Vec<(String, Proto)>,
     pub tls: Option<String>,
     pub http: Option<String>,
 }
@@ -228,8 +230,21 @@ pub async fn search_group<P: Probe>(
         }
     }
 
+    let mut blocked = Vec::new();
+    for (d, c) in domains.iter().zip(&cls) {
+        for (p, b) in [
+            (Proto::Tls13, Some(&c.tls13)),
+            (Proto::Tls12, Some(&c.tls12)),
+            (Proto::Http, c.http.as_ref()),
+        ] {
+            if b.is_some_and(Block::blocked) {
+                blocked.push((d.clone(), p));
+            }
+        }
+    }
     let mut out = GroupResult {
         domains: Vec::new(),
+        blocked,
         tls: None,
         http: None,
     };
@@ -467,6 +482,14 @@ mod tests {
         assert_eq!(r.domains[0].left, Some(6));
         assert_eq!(r.domains[1].left, Some(3));
         assert!(r.tls.is_some());
+        assert_eq!(
+            r.blocked,
+            vec![
+                ("a".to_string(), Proto::Tls13),
+                ("a".to_string(), Proto::Tls12),
+                ("b".to_string(), Proto::Tls13)
+            ]
+        );
         // прогресс: done/total внутри ступени
         assert_eq!(ctl.reports.borrow()[0], (40, 40));
     }
@@ -618,6 +641,13 @@ mod tests {
         assert_eq!(sw[1].cands, c.http[..5].to_vec());
         assert_eq!(r.tls, None);
         assert!(r.http.is_some());
+        assert_eq!(
+            r.blocked,
+            vec![
+                ("b".to_string(), Proto::Http),
+                ("c".to_string(), Proto::Http)
+            ]
+        );
         let cf = p.confirms.borrow();
         assert_eq!(
             cf[0].0,

@@ -48,6 +48,9 @@ pub struct State {
     pub found: Found,
     pub network_title: Option<String>,
     pub base: String,
+    /// Отказ до шага 1 (например, «нет сети»); итога при этом нет.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +184,7 @@ mod tests {
             found: Found::default(),
             network_title: Some("wifi".into()),
             base: "default".into(),
+            error: None,
         }
     }
 

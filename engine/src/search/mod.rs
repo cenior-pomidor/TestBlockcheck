@@ -6,6 +6,7 @@ use crate::config::Protocol;
 
 pub mod apply;
 pub mod assemble;
+pub mod job;
 pub mod narrow;
 pub mod runs;
 
