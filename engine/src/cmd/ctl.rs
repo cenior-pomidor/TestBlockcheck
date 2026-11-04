@@ -575,6 +575,9 @@ async fn strategy<E: CtlEnv>(action: &StrategyAction, store: &Store, env: &E) ->
                     "NFQWS_ARGS_UDP": p.udp,
                     "NFQWS_ARGS_IPSET": p.ipset,
                     "NFQWS_ARGS_CUSTOM": p.custom,
+                    "FOUND_YOUTUBE": p.found_youtube,
+                    "FOUND_TLS": p.found_tls,
+                    "FOUND_HTTP": p.found_http,
                 },
                 "builtin": info.as_ref().is_some_and(|i| i.builtin),
                 "modified": info.as_ref().is_some_and(|i| i.modified),
@@ -1127,6 +1130,30 @@ mod tests {
         assert_eq!(v["count"], 20_000);
         assert_eq!(t.store.read_list("user").unwrap(), text);
         assert!(!path.exists(), "файл передачи удалён после чтения");
+    }
+
+    #[tokio::test]
+    async fn strategy_get_returns_found_fields() {
+        let t = t("get-found");
+        t.store
+            .save_preset(
+                "found-x",
+                "NFQWS_ARGS=\"--x\"\nFOUND_TLS=\"--lua-desync=T\"\n",
+            )
+            .unwrap();
+        let v = run_json(
+            CtlCmd::Strategy {
+                action: StrategyAction::Get {
+                    name: "found-x".into(),
+                },
+            },
+            &t.store,
+            &Fake::down(),
+        )
+        .await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["fields"]["FOUND_TLS"], "--lua-desync=T");
+        assert_eq!(v["fields"]["FOUND_HTTP"], "");
     }
 
     #[tokio::test]

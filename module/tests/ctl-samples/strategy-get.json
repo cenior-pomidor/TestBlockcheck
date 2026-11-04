@@ -1,6 +1,9 @@
 {
   "builtin": true,
   "fields": {
+    "FOUND_HTTP": "",
+    "FOUND_TLS": "",
+    "FOUND_YOUTUBE": "",
     "NFQWS_ARGS": "--filter-tcp=80,443 --filter-l7=http,tls\n            --payload=tls_client_hello\n            --lua-desync=fake:blob=stun_fake:repeats=6:tcp_ts=-600000:tcp_ts_up\n            --lua-desync=fake:blob=tls_google:repeats=6:tcp_ts=-600000:tcp_ts_up\n            --lua-desync=fakedsplit:pattern=0x00:repeats=6:tcp_ts=-600000:tcp_ts_up\n            --payload=http_req\n            --lua-desync=fake:blob=tls_max:repeats=6:tcp_ts=-600000:tcp_ts_up\n            --lua-desync=fakedsplit:pattern=0x00:repeats=6:tcp_ts=-600000:tcp_ts_up",
     "NFQWS_ARGS_CUSTOM": "--filter-tcp=2053,2083,2087,2096,8443 --filter-l7=tls --hostlist-domains=discord.media\n                   --payload=tls_client_hello\n                   --lua-desync=fake:blob=tls_google:repeats=6:tcp_ts=-600000:tcp_ts_up\n                   --lua-desync=fakedsplit:pattern=0x00:repeats=6:tcp_ts=-600000:tcp_ts_up\n                   --new\n                   --filter-tcp=443 --filter-l7=tls --hostlist=$LISTS_DIR/google.list\n                   --payload=tls_client_hello\n                   --lua-desync=fake:blob=tls_google:repeats=6:ip_id=zero:tcp_ts=-600000:tcp_ts_up\n                   --lua-desync=fakedsplit:pattern=0x00:repeats=6:ip_id=zero:tcp_ts=-600000:tcp_ts_up",
     "NFQWS_ARGS_IPSET": "--ipset=$LISTS_DIR/ipset.list --ipset-exclude=$LISTS_DIR/ipset_exclude.list",

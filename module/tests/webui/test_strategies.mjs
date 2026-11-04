@@ -53,4 +53,10 @@ check(ft.includes('FOUND_TLS="--lua-desync=T"\n') && ft.includes('FOUND_YOUTUBE=
 let thr = false;
 try { editorToText({ ...foundFields, FOUND_TLS: 'a"b' }); } catch (_) { thr = true; }
 check(thr, 'found: кавычка отвергается');
+// Форма ответа `ctl strategy get` для found-пресета: FOUND_* возвращаются и не теряются при сохранении.
+const loaded = { ...get, fields: { ...get.fields, FOUND_YOUTUBE: '', FOUND_TLS: '--lua-desync=T', FOUND_HTTP: '' } };
+check(renderEditor(loaded).includes('name="FOUND_TLS"'), 'found из ctl: поля показаны');
+check(editorToText(loaded.fields).includes('FOUND_TLS="--lua-desync=T"'), 'found из ctl: сохраняется');
+const hiddenShape = { ...get.fields, FOUND_YOUTUBE: '', FOUND_TLS: '', FOUND_HTTP: '' };
+check(!/FOUND_/.test(renderEditor({ ...get, fields: hiddenShape })) , 'found из ctl: пустые скрыты');
 done('test_strategies');
