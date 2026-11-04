@@ -50,7 +50,12 @@ pub trait JobSys {
     fn term_group(&self, pid: u32) -> io::Result<()>;
     fn now(&self) -> NaiveStamp;
     async fn sleep(&self, d: Duration);
+    /// Замок `search start` (и доведения отката): `None` — занят другим `bcw ctl`.
+    fn lock(&self) -> Option<Box<dyn std::any::Any>>;
 }
+
+/// Имя замка `search start` в абстрактном пространстве unix-сокетов.
+const START_LOCK: &str = "bcw.search.start";
 
 const KEEP_RUNS: usize = 10;
 const BUSY: &str = "поиск уже идёт";
@@ -76,9 +81,19 @@ pub async fn execute<S: SvcLink, J: JobSys>(
         SearchAction::Start {
             enable_net_strategy,
             base,
-        } => start(store, svc, sys, *enable_net_strategy, base.as_deref()).await,
+        } => {
+            // Два одновременных `start` не порождают двух заданий.
+            let Some(_lock) = sys.lock() else {
+                return Err(BUSY.into());
+            };
+            start(store, svc, sys, *enable_net_strategy, base.as_deref()).await
+        }
         SearchAction::Status => {
-            let recovered = recover(store, svc, sys).await;
+            // Замок занят — идёт `start`, он сам доводит откат; здесь не мешаем.
+            let recovered = match sys.lock() {
+                Some(_lock) => recover(store, svc, sys).await.is_some(),
+                None => false,
+            };
             let st = latest(&runs).and_then(|d| read_state(&d));
             Ok(json!({ "state": st, "recovered": recovered }))
         }
@@ -126,7 +141,10 @@ async fn start<S: SvcLink, J: JobSys>(
     base: Option<&str>,
 ) -> Out {
     let runs = store.layout.runs_dir();
-    recover(store, svc, sys).await;
+    if let Some(Err(e)) = recover(store, svc, sys).await {
+        // Журнал прерванного поиска не доведён — новый поиск затёр бы последний прогон.
+        return Err(format!("не удалось откатить прерванный поиск: {e}"));
+    }
     if let Some(st) = latest(&runs).and_then(|d| read_state(&d)) {
         if running(sys, &st) {
             return Err(BUSY.into());
@@ -171,10 +189,13 @@ async fn start<S: SvcLink, J: JobSys>(
     write_state(&dir, &st).map_err(|e| format!("state.json: {e}"))?;
     prune(&runs, KEEP_RUNS);
 
-    let mut args: Vec<String> = ["search", "run", "--id", &id, "--base", &base]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // Значения слитно с ключом: имя основы может начинаться с «-».
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        "run".into(),
+        format!("--id={id}"),
+        format!("--base={base}"),
+    ];
     if enable_net_strategy {
         args.push("--enable-net-strategy".into());
     }
@@ -209,30 +230,31 @@ fn default_base(store: &Store, key: &str) -> String {
 }
 
 /// §6.8: последнее задание мертво. Журнал отмены без отметки завершения — полный откат;
-/// итога нет и журнала нет — итог «прервался» (ничего не применялось).
-async fn recover<S: SvcLink, J: JobSys>(store: &Store, svc: &S, sys: &J) -> bool {
-    let Some(dir) = latest(&store.layout.runs_dir()) else {
-        return false;
-    };
-    let Some(mut st) = read_state(&dir) else {
-        return false;
-    };
-    if live(sys, &st) {
-        return false;
+/// итога нет и журнала нет — итог «прервался» (ничего не применялось). `None` — доводить
+/// нечего; `Some(Err)` — откат не удался, журнал так и остался без отметки.
+async fn recover<S: SvcLink, J: JobSys>(
+    store: &Store,
+    svc: &S,
+    sys: &J,
+) -> Option<Result<(), String>> {
+    let dir = latest(&store.layout.runs_dir())?;
+    let mut st = read_state(&dir)?;
+    // pid 0 на подготовке — `start` между записью состояния и запуском задания.
+    if live(sys, &st) || (st.pid == 0 && st.phase == Phase::Prepare) {
+        return None;
     }
-    let undo = read_undo(&dir);
-    let reason = match &undo {
+    let (reason, r) = match read_undo(&dir) {
         Some(u) if !u.finished => match rollback(store, svc, &dir).await {
-            Ok(()) => INTERRUPTED_APPLY.to_string(),
-            Err(e) => format!("{INTERRUPTED_APPLY}; откат: {e}"),
+            Ok(()) => (INTERRUPTED_APPLY.to_string(), Ok(())),
+            Err(e) => (format!("{INTERRUPTED_APPLY}; откат: {e}"), Err(e)),
         },
-        None if st.outcome.is_none() && st.error.is_none() => INTERRUPTED.to_string(),
-        _ => return false,
+        None if st.outcome.is_none() && st.error.is_none() => (INTERRUPTED.to_string(), Ok(())),
+        _ => return None,
     };
     st.phase = Phase::Done;
     st.outcome = Some(Outcome::RolledBack { reason });
     let _ = write_state(&dir, &st);
-    true
+    Some(r)
 }
 
 async fn stop<J: JobSys>(runs: &Path, sys: &J) -> Out {
@@ -320,14 +342,18 @@ impl JobSys for SystemSys {
         if p <= 0 || unsafe { libc::kill(p, 0) } != 0 {
             return false;
         }
-        match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(c) => c.windows(10).any(|w| w == b"search\0run"),
-            Err(_) => true,
-        }
+        ours(std::fs::read(format!("/proc/{pid}/cmdline")))
     }
 
     fn term_group(&self, pid: u32) -> io::Result<()> {
         let p = i32::try_from(pid).map_err(io::Error::other)?;
+        // kill(-1) бьёт по всем процессам, kill(-0) — по своей группе (по нам самим).
+        if p <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("недопустимый pid задания {pid}"),
+            ));
+        }
         // SAFETY: обычный kill(2) группе задания.
         if unsafe { libc::kill(-p, libc::SIGTERM) } != 0 {
             return Err(io::Error::last_os_error());
@@ -342,6 +368,18 @@ impl JobSys for SystemSys {
     async fn sleep(&self, d: Duration) {
         tokio::time::sleep(d).await;
     }
+
+    fn lock(&self) -> Option<Box<dyn std::any::Any>> {
+        super::bind_instance_lock(START_LOCK)
+            .ok()
+            .map(|l| Box::new(l) as Box<dyn std::any::Any>)
+    }
+}
+
+/// Командная строка процесса — наше задание. Нечитаемая — не наше: иначе чужой процесс с
+/// тем же pid навсегда держал бы «поиск уже идёт».
+fn ours(cmdline: io::Result<Vec<u8>>) -> bool {
+    cmdline.is_ok_and(|c| c.windows(10).any(|w| w == b"search\0run"))
 }
 
 /// `bcw search run`: одно задание поиска. `SIGTERM`/`SIGINT` поднимают `stop` — задание
@@ -472,6 +510,8 @@ mod tests {
         t: Cell<Duration>,
         spawned: RefCell<Vec<(Vec<String>, PathBuf)>>,
         killed: RefCell<Vec<u32>>,
+        /// Замок `search start` держит другой `bcw ctl`.
+        locked: bool,
     }
 
     impl JobSys for FakeSys {
@@ -500,6 +540,9 @@ mod tests {
         }
         async fn sleep(&self, d: Duration) {
             self.t.set(self.t.get() + d);
+        }
+        fn lock(&self) -> Option<Box<dyn std::any::Any>> {
+            (!self.locked).then(|| Box::new(()) as Box<dyn std::any::Any>)
         }
     }
 
@@ -619,7 +662,7 @@ mod tests {
         assert_eq!(sp.len(), 1);
         assert_eq!(
             sp[0].0,
-            args(&["search", "run", "--id", ID, "--base", "default"])
+            args(&["search", "run", "--id=20261104-194620", "--base=default"])
         );
         assert_eq!(sp[0].1, dir.join("job.log"));
         let st = read_state(&dir).unwrap();
@@ -641,10 +684,8 @@ mod tests {
             args(&[
                 "search",
                 "run",
-                "--id",
-                ID,
-                "--base",
-                "alt",
+                "--id=20261104-194620",
+                "--base=alt",
                 "--enable-net-strategy"
             ])
         );
@@ -674,7 +715,7 @@ mod tests {
         t.store
             .set_network_entry(KEY, "Wi-Fi «Home»", "alt")
             .unwrap();
-        let base_of = |sys: &FakeSys| sys.spawned.borrow()[0].0[5].clone();
+        let base_of = |sys: &FakeSys| sys.spawned.borrow()[0].0[3].clone();
 
         // NET_STRATEGY=0 — DEFAULT_STRATEGY.
         let sys = FakeSys::default();
@@ -682,7 +723,7 @@ mod tests {
             .await
             .unwrap();
         let (s, _) = t.store.settings();
-        assert_eq!(base_of(&sys), s.default_strategy);
+        assert_eq!(base_of(&sys), format!("--base={}", s.default_strategy));
         std::fs::remove_dir_all(t.store.layout.runs_dir().join(ID)).unwrap();
 
         // NET_STRATEGY=1 — стратегия сети; пустая основа из WebUI — то же умолчание.
@@ -693,7 +734,7 @@ mod tests {
         execute(&start(Some("")), &t.store, &FakeSvc::on(), &sys)
             .await
             .unwrap();
-        assert_eq!(base_of(&sys), "alt");
+        assert_eq!(base_of(&sys), "--base=alt");
 
         let sys = FakeSys::default();
         let r = execute(&start(Some("nope")), &t.store, &FakeSvc::on(), &sys).await;
@@ -770,6 +811,83 @@ mod tests {
             .unwrap();
         assert_eq!(v["recovered"], false);
         assert_eq!(read_state(&dir).unwrap().outcome, None);
+    }
+
+    /// Замок `search start` занят — `status` откат не доводит; `pid 0` на подготовке
+    /// (окно запуска) — тоже не трогается.
+    #[tokio::test]
+    async fn status_skips_recovery_when_locked() {
+        let t = t("locked");
+        let preset = "found-default-20261104-1000";
+        t.store.save_preset(preset, "NFQWS_ARGS=\"\"\n").unwrap();
+        let dir = put(&t.store, &state("20261104-100000", 77, None));
+        write_undo(&dir, &undo(preset)).unwrap();
+        let svc = FakeSvc::on();
+        let sys = FakeSys {
+            locked: true,
+            ..Default::default()
+        };
+        let v = execute(&SearchAction::Status, &t.store, &svc, &sys)
+            .await
+            .unwrap();
+        assert_eq!(v["recovered"], false);
+        assert!(!read_undo(&dir).unwrap().finished);
+        assert!(t.store.preset_text(preset).is_ok());
+        assert_eq!(read_state(&dir).unwrap().outcome, None);
+        assert_eq!(svc.reloads.get(), 0);
+        // Тот же замок — у `start`: отказ, задание не запускается.
+        let r = execute(&start(Some("default")), &t.store, &svc, &sys).await;
+        assert_eq!(r, Err(BUSY.to_string()));
+        assert!(sys.spawned.borrow().is_empty());
+
+        let mut st = state("20261104-110000", 0, None);
+        st.phase = Phase::Prepare;
+        let dir = put(&t.store, &st);
+        let v = execute(&SearchAction::Status, &t.store, &svc, &FakeSys::default())
+            .await
+            .unwrap();
+        assert_eq!(v["recovered"], false);
+        assert_eq!(read_state(&dir).unwrap().outcome, None);
+    }
+
+    /// Откат прерванного поиска не удался — `start` отказывает, журнал остаётся.
+    #[tokio::test]
+    async fn start_refuses_when_rollback_fails() {
+        let t = t("rbfail");
+        let dir = put(&t.store, &state("20261104-100000", 77, None));
+        let mut u = undo("found-default-20261104-1000");
+        u.prev_strategy = Some("alt".into());
+        write_undo(&dir, &u).unwrap();
+        // networks.tsv не записать: на его месте каталог.
+        let nets = t.store.layout.networks_file();
+        let _ = std::fs::remove_file(&nets);
+        std::fs::create_dir_all(&nets).unwrap();
+        let sys = FakeSys::default();
+        let r = execute(&start(Some("default")), &t.store, &FakeSvc::on(), &sys).await;
+        let e = r.unwrap_err();
+        assert!(
+            e.starts_with("не удалось откатить прерванный поиск: "),
+            "{e}"
+        );
+        assert!(sys.spawned.borrow().is_empty());
+        assert!(!read_undo(&dir).unwrap().finished);
+        assert!(!t.store.layout.runs_dir().join(ID).exists());
+    }
+
+    #[test]
+    fn signals_and_liveness_are_guarded() {
+        for pid in [0, 1] {
+            assert!(SystemSys.term_group(pid).is_err(), "{pid}");
+        }
+        assert!(!ours(Err(io::Error::from(io::ErrorKind::PermissionDenied))));
+        assert!(!ours(Ok(b"/system/bin/sh\0-c\0".to_vec())));
+        assert!(ours(Ok(
+            b"/data/adb/modules/bcw/bin/bcw\0search\0run\0--id=x\0".to_vec()
+        )));
+        assert!(!SystemSys.alive(0));
+        assert!(!SystemSys.alive(u32::MAX));
+        // Сам тестовый процесс жив, но это не задание поиска.
+        assert!(!SystemSys.alive(std::process::id()));
     }
 
     #[tokio::test]

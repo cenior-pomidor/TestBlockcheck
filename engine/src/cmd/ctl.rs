@@ -193,9 +193,6 @@ impl<E: CtlEnv> SvcLink for EnvSvc<'_, E> {
     }
 }
 
-/// Замок `search start`: два одновременных запуска не порождают двух заданий.
-const SEARCH_START_LOCK: &str = "bcw.search.start";
-
 type Out = Result<Value, String>;
 
 fn ok(v: Value) -> Out {
@@ -522,18 +519,6 @@ pub async fn execute<E: CtlEnv>(cmd: &CtlCmd, store: &Store, env: &E) -> Out {
             "module": module_version(layout),
         })),
         CtlCmd::Search { action } => {
-            let _lock = match action {
-                SearchAction::Start { .. } => {
-                    Some(super::bind_instance_lock(SEARCH_START_LOCK).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::AddrInUse {
-                            "поиск уже идёт".to_string()
-                        } else {
-                            format!("замок поиска: {e}")
-                        }
-                    })?)
-                }
-                _ => None,
-            };
             search::execute(action, store, &EnvSvc(env), &search::SystemSys).await
         }
         CtlCmd::Upload { action } => match action {

@@ -626,7 +626,11 @@ async fn main() {
             blockcheckw::system::group::terminal_foreground_group(),
             blockcheckw::system::group::own_group(),
         );
-        if detach {
+        // Лидер сессии (`bcw search run`, запущенный `setsid`) уже в своей группе, а
+        // `setpgid` ему отказал бы (EPERM) — ложное предупреждение в job.log.
+        // SAFETY: getsid/getpid только читают свойства этого процесса.
+        let session_leader = unsafe { libc::getsid(0) == libc::getpid() };
+        if detach && !session_leader {
             if let Err(e) = blockcheckw::system::group::detach_into_own_group() {
                 eprintln!(
                     "{}не удалось уйти в свою группу процессов ({e}): оркестратору придётся бить \
@@ -980,6 +984,34 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Аргументы, которые шлёт `bcw ctl search start`: основа с «-» доходит значением.
+    #[test]
+    fn search_run_args_parse() {
+        let cli = Cli::try_parse_from([
+            "bcw",
+            "search",
+            "run",
+            "--id=20261104-194620",
+            "--base=-x",
+            "--enable-net-strategy",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Search {
+                action:
+                    SearchCmd::Run {
+                        id,
+                        base,
+                        enable_net_strategy,
+                    },
+            }) => {
+                assert_eq!((id.as_str(), base.as_str()), ("20261104-194620", "-x"));
+                assert!(enable_net_strategy);
+            }
+            _ => panic!("expected search run"),
+        }
+    }
 
     /// `--doh` повторяемый и глобальный: свои резолверы задаются там, где умолчания
     /// недоступны, и порядок их задания — порядок опроса.

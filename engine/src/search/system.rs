@@ -18,8 +18,8 @@ use crate::dto::VerifiedStrategy;
 use crate::error::TaskResult;
 use crate::firewall::rules::OwnedChains;
 use crate::network::http_client::{
-    http_test_data, interpret_data_transfer_result, BodyMode, HttpVerdict, DATA_TRANSFER_MIN_BYTES,
-    ROOT_PATH,
+    http_test, http_test_data, interpret_data_transfer_result, interpret_http_result, BodyMode,
+    HttpVerdict, DATA_TRANSFER_MIN_BYTES, ROOT_PATH,
 };
 use crate::network::patience::Patience;
 use crate::network::{dns, reachability};
@@ -253,44 +253,45 @@ impl Probe for SystemProbe<'_> {
     }
 }
 
-/// Итог `check` по всем доменам цепочки. Стратегия без полной доставки хотя бы в одном
-/// проходе на каком-либо домене получает `full = 0` (её отбросит `pick`).
+/// Итог `check` по всем доменам цепочки — по ХУДШЕМУ домену: `full`/`total` того домена,
+/// где доля полной доставки ниже всех, `median_share` — наименьшая (`None`, если на каком-либо
+/// домене доли нет). Нет полной доставки хотя бы в одном проходе на каком-либо домене (или
+/// строки нет вовсе) — `full = 0`, её отбросит `pick`.
 fn aggregate(cands: &[String], per: &[Vec<VerifiedStrategy>]) -> Vec<Confirmed> {
+    let rate = |s: &VerifiedStrategy| {
+        if s.passes_total == 0 {
+            0.0
+        } else {
+            s.passes_ok as f64 / s.passes_total as f64
+        }
+    };
     cands
         .iter()
         .map(|c| {
-            let rows: Vec<Option<&VerifiedStrategy>> = per
+            let rows: Option<Vec<&VerifiedStrategy>> = per
                 .iter()
                 .map(|v| v.iter().find(|s| s.args == *c))
                 .collect();
-            let all = !rows.is_empty() && rows.iter().all(|r| r.is_some_and(|s| s.passes_ok > 0));
-            let (full, total) = rows
+            let rows = rows.filter(|r| !r.is_empty()).unwrap_or_default();
+            let worst = rows
                 .iter()
-                .flatten()
-                .fold((0, 0), |(f, t), s| (f + s.passes_ok, t + s.passes_total));
-            let shares: Option<Vec<f64>> = rows
+                .copied()
+                .min_by(|a, b| rate(a).total_cmp(&rate(b)));
+            let (full, total) = worst.map_or((0, 0), |w| (w.passes_ok, w.passes_total));
+            let share = rows
                 .iter()
-                .map(|r| r.and_then(|s| s.median_share))
-                .collect();
+                .map(|s| s.median_share)
+                .collect::<Option<Vec<f64>>>()
+                .and_then(|v| v.into_iter().min_by(f64::total_cmp));
             Confirmed {
                 args: c.clone(),
-                full: if all { full } else { 0 },
+                full,
                 total,
-                median_share: shares.and_then(|s| median(&s)),
+                median_share: if rows.is_empty() { None } else { share },
                 simplicity: simplicity_key(c),
             }
         })
         .collect()
-}
-
-fn median(v: &[f64]) -> Option<f64> {
-    let mut v = v.to_vec();
-    v.sort_by(f64::total_cmp);
-    match v.len() {
-        0 => None,
-        n if n % 2 == 1 => Some(v[n / 2]),
-        n => Some((v[n / 2 - 1] + v[n / 2]) / 2.0),
-    }
 }
 
 /// Служба `bcw svc` через сокет.
@@ -332,8 +333,29 @@ impl Verifier for SystemVerifier {
             return false;
         };
         for _ in 0..2 {
+            if passes(p, domain, ip).await {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Одна попытка через обход. Мера — та же, что у базовой проверки
+/// (`pipeline/baseline.rs`, `interpret_baseline`): TLS — получено не меньше
+/// `DATA_TRANSFER_MIN_BYTES`; HTTP — проба заголовков (`interpret_http_result` →
+/// `Available`): перенаправление на HTTPS законно приходит без тела, порог байтов к нему
+/// неприменим.
+async fn passes(p: Proto, domain: &str, ip: &str) -> bool {
+    let proto = p.to_protocol();
+    let v = match p {
+        Proto::Http => {
+            let res = http_test(proto, domain, ip, 0, DATA_PROBE_SECS, None).await;
+            interpret_http_result(&res, domain)
+        }
+        Proto::Tls13 | Proto::Tls12 => {
             let res = http_test_data(
-                p.to_protocol(),
+                proto,
                 domain,
                 ip,
                 0,
@@ -343,13 +365,10 @@ impl Verifier for SystemVerifier {
                 ROOT_PATH,
             )
             .await;
-            let v = interpret_data_transfer_result(&res, domain, DATA_TRANSFER_MIN_BYTES);
-            if matches!(v, HttpVerdict::Available) {
-                return true;
-            }
+            interpret_data_transfer_result(&res, domain, DATA_TRANSFER_MIN_BYTES)
         }
-        false
-    }
+    };
+    matches!(v, HttpVerdict::Available)
 }
 
 /// Местное время телефона: смещение из `date +%z` (статический musl не видит базу
@@ -384,6 +403,7 @@ fn stamp_of(s: &str) -> NaiveStamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::narrow::pick;
 
     fn row(args: &str, ok: usize, share: Option<f64>) -> VerifiedStrategy {
         VerifiedStrategy {
@@ -411,18 +431,36 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_needs_every_domain() {
+    fn aggregate_takes_worst_domain() {
         let a = "--a".to_string();
         let b = "--b".to_string();
+        let c = "--c".to_string();
         let per = vec![
-            vec![row("--a", 3, Some(0.9)), row("--b", 2, Some(0.5))],
-            vec![row("--a", 1, Some(0.7)), row("--b", 0, None)],
+            vec![
+                row("--a", 3, Some(0.9)),
+                row("--b", 2, Some(0.5)),
+                row("--c", 2, Some(0.6)),
+            ],
+            vec![
+                row("--a", 1, Some(0.7)),
+                row("--b", 2, Some(0.8)),
+                row("--c", 0, None),
+            ],
         ];
-        let c = aggregate(&[a, b], &per);
-        assert_eq!((c[0].full, c[0].total), (4, 6));
-        assert_eq!(c[0].median_share, Some(0.8));
-        assert_eq!(c[1].full, 0);
-        assert_eq!(c[1].median_share, None);
+        let r = aggregate(&[a, b, c], &per);
+        // Худший домен, а не сумма: 3/3 + 1/3 → 1/3, доля — наименьшая.
+        assert_eq!((r[0].full, r[0].total), (1, 3));
+        assert_eq!(r[0].median_share, Some(0.7));
+        assert_eq!((r[1].full, r[1].total), (2, 3));
+        assert_eq!(r[1].median_share, Some(0.5));
+        // Нет полной доставки на одном домене — 0, доли нет.
+        assert_eq!(r[2].full, 0);
+        assert_eq!(r[2].median_share, None);
+        // 2/3 + 2/3 устойчивее, чем 3/3 + 1/3.
+        assert_eq!(pick(&r).as_deref(), Some("--b"));
+        // Строки нет на домене — 0.
         assert_eq!(aggregate(&["--z".into()], &per)[0].full, 0);
+        let half = vec![vec![row("--y", 3, None)], vec![]];
+        assert_eq!(aggregate(&["--y".into()], &half)[0].full, 0);
     }
 }
