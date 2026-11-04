@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Protocol;
 
 pub mod assemble;
+pub mod runs;
 
 /// Местное время без пояса (считает вызывающий).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

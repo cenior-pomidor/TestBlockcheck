@@ -70,6 +70,9 @@ impl Layout {
     pub fn state_dir(&self) -> PathBuf {
         self.data_dir.join("state")
     }
+    pub fn runs_dir(&self) -> PathBuf {
+        self.data_dir.join("runs")
+    }
     pub fn tmp_dir(&self) -> PathBuf {
         self.data_dir.join("tmp")
     }
