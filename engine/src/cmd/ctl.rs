@@ -909,6 +909,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lists_hides_search() {
+        let t = t("lists-hides-search");
+        let v = run_json(CtlCmd::Lists, &t.store, &Fake::down()).await;
+        let names: Vec<&str> = v["lists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["user", "auto", "exclude", "ipset", "ipset_exclude"]);
+        assert!(!v.to_string().contains("search-general"));
+    }
+
+    #[tokio::test]
     async fn start_without_service_says_not_running() {
         let t = t("start");
         let v = run_json(CtlCmd::Start, &t.store, &Fake::down()).await;

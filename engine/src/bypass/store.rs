@@ -13,6 +13,9 @@ use crate::system::atomic::write_atomic;
 /// Списки, которые правит владелец.
 pub const LIST_NAMES: [&str; 5] = ["user", "auto", "exclude", "ipset", "ipset_exclude"];
 
+/// Списки доменов для поиска стратегии; в `ctl lists` не показываются.
+pub const SEARCH_LIST_NAMES: [&str; 2] = ["search-general", "search-youtube"];
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StrategyInfo {
     pub name: String,
@@ -50,7 +53,7 @@ impl Store {
         ] {
             std::fs::create_dir_all(d)?;
         }
-        for name in LIST_NAMES {
+        for name in LIST_NAMES.into_iter().chain(SEARCH_LIST_NAMES) {
             let to = l.data_lists().join(format!("{name}.list"));
             if !to.exists() {
                 let from = l.defaults_dir().join("lists").join(format!("{name}.list"));
@@ -203,7 +206,7 @@ impl Store {
     }
 
     pub fn list_path(&self, name: &str) -> Result<PathBuf, String> {
-        if LIST_NAMES.contains(&name) {
+        if LIST_NAMES.contains(&name) || SEARCH_LIST_NAMES.contains(&name) {
             Ok(self.layout.data_lists().join(format!("{name}.list")))
         } else {
             Err(format!(
@@ -362,6 +365,32 @@ mod tests {
         });
         s.init_data_dir().unwrap();
         (s, root)
+    }
+
+    #[test]
+    fn search_lists_seeded() {
+        let (s, root) = store("search-seed");
+        assert_eq!(
+            s.read_list("search-general").unwrap(),
+            "rutracker.org\ndiscord.com\nx.com\ninstagram.com\n"
+        );
+        assert_eq!(
+            s.read_list("search-youtube").unwrap(),
+            "www.youtube.com\ni.ytimg.com\nredirector.googlevideo.com\n"
+        );
+        s.write_list("search-general", "mine.org\n").unwrap();
+        s.init_data_dir().unwrap();
+        assert_eq!(s.read_list("search-general").unwrap(), "mine.org\n");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn search_list_rw() {
+        let (s, root) = store("search-rw");
+        s.write_list("search-youtube", "a.com\n").unwrap();
+        assert_eq!(s.read_list("search-youtube").unwrap(), "a.com\n");
+        assert!(s.list_path("nope").is_err());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

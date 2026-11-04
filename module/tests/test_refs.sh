@@ -22,7 +22,7 @@ for f in "$M"/strategies/*.conf; do
 done
 for b in stun.bin tls_clienthello.bin; do [ -f "$M/blobs/$b" ] || err "нет blobs/$b для обхода звонков"; done
 [ -f "$M/defaults/calls-bypass.conf" ] || err "нет defaults/calls-bypass.conf"
-for l in user auto exclude ipset ipset_exclude; do
+for l in user auto exclude ipset ipset_exclude search-general search-youtube; do
   [ -f "$M/defaults/lists/$l.list" ] || err "нет defaults/lists/$l.list"
 done
 [ -f "$M/NOTICE.md" ] || err "нет NOTICE.md"
