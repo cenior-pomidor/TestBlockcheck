@@ -1,5 +1,6 @@
 // Вкладки и общий каркас WebUI.
 import { showStatus } from './status.js';
+import { showSearch } from './search.js';
 import { showStrategies } from './strategies.js';
 import { showNetworks } from './networks.js';
 import { showLists } from './lists.js';
@@ -21,13 +22,21 @@ function toast(msg) {
   toast.timer = setTimeout(() => { t.hidden = true; }, 6000);
 }
 
+let cleanup = null; // освобождение ресурсов открытой вкладки (например, опроса)
+let opening = 0;
+
 async function open(id) {
+  const my = ++opening;
+  if (cleanup) { try { cleanup(); } catch (_) { /* ничего */ } cleanup = null; }
   const tab = tabs.find((t) => t.id === id) || tabs[0];
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab.id));
   const root = document.getElementById('content');
   root.innerHTML = '<p class="hint">Загрузка…</p>';
   try {
-    await tab.show(root, toast);
+    const c = await tab.show(root, toast);
+    if (typeof c === 'function') {
+      if (my === opening) cleanup = c; else c();
+    }
   } catch (e) {
     root.innerHTML = '';
     toast(String(e.message || e));
@@ -35,6 +44,7 @@ async function open(id) {
 }
 
 registerTab('status', 'Состояние', showStatus);
+registerTab('search', 'Поиск', showSearch);
 registerTab('strategies', 'Стратегии', showStrategies);
 registerTab('networks', 'Сети', showNetworks);
 registerTab('lists', 'Списки', showLists);
